@@ -1,0 +1,41 @@
+name: Bug report
+description: Report incorrect behavior or an indexing problem
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include private source code, credentials or exploit details.
+  - type: input
+    id: version
+    attributes:
+      label: Extension version
+      placeholder: 0.5.0
+    validations:
+      required: true
+  - type: dropdown
+    id: language
+    attributes:
+      label: Language
+      options: [Java, PHP, JavaScript, TypeScript, Python, C#, Go, Other]
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the behavior using a minimal, non-sensitive example when possible.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: input
+    id: vscode
+    attributes:
+      label: VS Code and operating-system version
+    validations:
+      required: true

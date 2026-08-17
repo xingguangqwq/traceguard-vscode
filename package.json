@@ -1,0 +1,358 @@
+{
+  "name": "traceguard-vscode",
+  "displayName": "TraceGuard Code Audit Helper",
+  "description": "A lightweight VS Code helper for reviewing Java, PHP, JavaScript/TypeScript, Python, C# and Go code.",
+  "version": "0.5.0",
+  "publisher": "traceguard",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xingguangqwq/traceguard-vscode.git"
+  },
+  "homepage": "https://github.com/xingguangqwq/traceguard-vscode#readme",
+  "bugs": {
+    "url": "https://github.com/xingguangqwq/traceguard-vscode/issues"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Other"
+  ],
+  "keywords": [
+    "code audit",
+    "security review",
+    "java",
+    "php",
+    "javascript",
+    "typescript",
+    "python",
+    "csharp",
+    "go",
+    "code navigation"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onLanguage:java",
+    "onLanguage:php",
+    "onLanguage:javascript",
+    "onLanguage:javascriptreact",
+    "onLanguage:typescript",
+    "onLanguage:typescriptreact",
+    "onLanguage:python",
+    "onLanguage:csharp",
+    "onLanguage:go"
+  ],
+  "main": "./extension.js",
+  "extensionKind": [
+    "workspace"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "TraceGuard reads workspace source files to build local code-review navigation."
+    },
+    "virtualWorkspaces": false
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "traceguard.startAudit",
+        "title": "TraceGuard: Start Code Review",
+        "category": "TraceGuard",
+        "icon": "$(search)"
+      },
+      {
+        "command": "traceguard.refreshAudit",
+        "title": "TraceGuard: Refresh Code Review Index",
+        "category": "TraceGuard",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "traceguard.openAuditView",
+        "title": "TraceGuard: Open Code Audit Sidebar",
+        "category": "TraceGuard",
+        "icon": "$(list-tree)"
+      },
+      {
+        "command": "traceguard.auditCurrentFunction",
+        "title": "TraceGuard: Review Current Function",
+        "category": "TraceGuard",
+        "icon": "$(checklist)"
+      },
+      {
+        "command": "traceguard.showCurrentFileTargets",
+        "title": "TraceGuard: Show Review Targets in Current File",
+        "category": "TraceGuard",
+        "icon": "$(list-selection)"
+      },
+      {
+        "command": "traceguard.showCurrentFunctionSignals",
+        "title": "TraceGuard: Show Security Clues Here",
+        "category": "TraceGuard",
+        "icon": "$(references)"
+      },
+      {
+        "command": "traceguard.traceSelectedSymbol",
+        "title": "TraceGuard: Trace Selected Variable",
+        "category": "TraceGuard",
+        "icon": "$(symbol-variable)"
+      },
+      {
+        "command": "traceguard.clearSymbolTrace",
+        "title": "TraceGuard: Clear Variable Trace",
+        "category": "TraceGuard",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "traceguard.nextAuditTarget",
+        "title": "TraceGuard: Go to Next Review Target",
+        "category": "TraceGuard",
+        "icon": "$(arrow-down)"
+      },
+      {
+        "command": "traceguard.previousAuditTarget",
+        "title": "TraceGuard: Go to Previous Review Target",
+        "category": "TraceGuard",
+        "icon": "$(arrow-up)"
+      },
+      {
+        "command": "traceguard.markCurrentReviewed",
+        "title": "TraceGuard: Mark Current Target Reviewed",
+        "category": "TraceGuard",
+        "icon": "$(check)"
+      },
+      {
+        "command": "traceguard.addEvidence",
+        "title": "TraceGuard: Add Selection to Audit Notes",
+        "category": "TraceGuard",
+        "icon": "$(bookmark)"
+      },
+      {
+        "command": "traceguard.generateAuditReport",
+        "title": "TraceGuard: Export Audit Notes",
+        "category": "TraceGuard",
+        "icon": "$(export)"
+      },
+      {
+        "command": "traceguard.exportReviewSession",
+        "title": "TraceGuard: Export Review Session",
+        "category": "TraceGuard",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "traceguard.importReviewSession",
+        "title": "TraceGuard: Import Review Session",
+        "category": "TraceGuard",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "traceguard.focusAuditItem",
+        "title": "Open Review Target",
+        "category": "TraceGuard"
+      },
+      {
+        "command": "traceguard.markReviewed",
+        "title": "Mark Review Complete",
+        "category": "TraceGuard",
+        "icon": "$(pass-filled)"
+      },
+      {
+        "command": "traceguard.markInReview",
+        "title": "Mark In Review",
+        "category": "TraceGuard"
+      },
+      {
+        "command": "traceguard.markNeedsContext",
+        "title": "Mark as Needs Context",
+        "category": "TraceGuard"
+      },
+      {
+        "command": "traceguard.resetReviewStatus",
+        "title": "Reset Review Status",
+        "category": "TraceGuard"
+      },
+      {
+        "command": "traceguard.openEvidence",
+        "title": "Open Audit Note",
+        "category": "TraceGuard"
+      },
+      {
+        "command": "traceguard.removeEvidence",
+        "title": "Remove Audit Note",
+        "category": "TraceGuard",
+        "icon": "$(trash)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "traceguard",
+          "title": "TraceGuard",
+          "icon": "resources/code-trace.svg"
+        }
+      ]
+    },
+    "views": {
+      "traceguard": [
+        {
+          "id": "traceguard.summary",
+          "name": "Review Progress"
+        },
+        {
+          "id": "traceguard.findings",
+          "name": "Code Review Queue"
+        },
+        {
+          "id": "traceguard.evidence",
+          "name": "Audit Notes"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "traceguard.findings",
+        "contents": "TraceGuard helps you decide which supported code to read first. It does not replace manual review.\n[Build Review Queue](command:traceguard.startAudit)"
+      },
+      {
+        "view": "traceguard.evidence",
+        "contents": "Select relevant code and record why it matters.\n[Add Selection to Audit Notes](command:traceguard.addEvidence)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "traceguard.refreshAudit",
+          "when": "view == traceguard.findings",
+          "group": "navigation@1"
+        },
+        {
+          "command": "traceguard.previousAuditTarget",
+          "when": "view == traceguard.findings && traceguard.hasAuditTargets",
+          "group": "navigation@2"
+        },
+        {
+          "command": "traceguard.nextAuditTarget",
+          "when": "view == traceguard.findings && traceguard.hasAuditTargets",
+          "group": "navigation@3"
+        },
+        {
+          "command": "traceguard.generateAuditReport",
+          "when": "view == traceguard.evidence && traceguard.hasAuditTargets",
+          "group": "navigation@1"
+        },
+        {
+          "command": "traceguard.exportReviewSession",
+          "when": "view == traceguard.evidence",
+          "group": "navigation@2"
+        },
+        {
+          "command": "traceguard.importReviewSession",
+          "when": "view == traceguard.evidence",
+          "group": "navigation@3"
+        },
+        {
+          "command": "traceguard.addEvidence",
+          "when": "view == traceguard.evidence",
+          "group": "navigation@4"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "traceguard.markReviewed",
+          "when": "view == traceguard.findings && viewItem == traceguard.auditItem",
+          "group": "inline"
+        },
+        {
+          "command": "traceguard.markInReview",
+          "when": "view == traceguard.findings && viewItem == traceguard.auditItem",
+          "group": "traceguard@1"
+        },
+        {
+          "command": "traceguard.markNeedsContext",
+          "when": "view == traceguard.findings && viewItem == traceguard.auditItem",
+          "group": "traceguard@2"
+        },
+        {
+          "command": "traceguard.resetReviewStatus",
+          "when": "view == traceguard.findings && viewItem == traceguard.auditItem",
+          "group": "traceguard@3"
+        },
+        {
+          "command": "traceguard.removeEvidence",
+          "when": "view == traceguard.evidence && viewItem == traceguard.evidence",
+          "group": "inline"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "traceguard.traceSelectedSymbol",
+          "when": "editorLangId == java || editorLangId == php || editorLangId == javascript || editorLangId == javascriptreact || editorLangId == typescript || editorLangId == typescriptreact || editorLangId == python || editorLangId == csharp || editorLangId == go",
+          "group": "traceguard@1"
+        },
+        {
+          "command": "traceguard.auditCurrentFunction",
+          "when": "editorLangId == java || editorLangId == php || editorLangId == javascript || editorLangId == javascriptreact || editorLangId == typescript || editorLangId == typescriptreact || editorLangId == python || editorLangId == csharp || editorLangId == go",
+          "group": "traceguard@2"
+        },
+        {
+          "command": "traceguard.showCurrentFunctionSignals",
+          "when": "editorLangId == java || editorLangId == php || editorLangId == javascript || editorLangId == javascriptreact || editorLangId == typescript || editorLangId == typescriptreact || editorLangId == python || editorLangId == csharp || editorLangId == go",
+          "group": "traceguard@3"
+        },
+        {
+          "command": "traceguard.showCurrentFileTargets",
+          "when": "editorLangId == java || editorLangId == php || editorLangId == javascript || editorLangId == javascriptreact || editorLangId == typescript || editorLangId == typescriptreact || editorLangId == python || editorLangId == csharp || editorLangId == go",
+          "group": "traceguard@4"
+        },
+        {
+          "command": "traceguard.addEvidence",
+          "when": "editorLangId == java || editorLangId == php || editorLangId == javascript || editorLangId == javascriptreact || editorLangId == typescript || editorLangId == typescriptreact || editorLangId == python || editorLangId == csharp || editorLangId == go",
+          "group": "traceguard@5"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "traceguard.focusAuditItem",
+          "when": "false"
+        },
+        {
+          "command": "traceguard.openEvidence",
+          "when": "false"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "TraceGuard",
+      "properties": {
+        "traceguard.showAuditSignals": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "description": "Show lightweight input, sensitive-operation, authorization and validation clues beside supported code."
+        },
+        "traceguard.liveIndex": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "description": "Refresh review clues in the current file shortly after edits, without waiting for save."
+        },
+        "traceguard.hideReviewedTargets": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "Hide completed targets from the Code Review Queue while keeping coverage totals unchanged."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check": "node scripts/check.js",
+    "package": "vsce package --out traceguard-code-audit-helper-0.5.0.vsix"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.6.0"
+  }
+}
