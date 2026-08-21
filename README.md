@@ -10,7 +10,7 @@ It does not report confirmed vulnerabilities. You still read the code and make t
 
 ## Start in three minutes
 
-1. Download `traceguard-code-audit-helper-0.5.0.vsix` from the [latest release](https://github.com/xingguangqwq/traceguard-vscode/releases/latest).
+1. Download `traceguard-vscode-0.6.0.vsix` from the [latest release](https://github.com/xingguangqwq/traceguard-vscode/releases/latest).
 2. In VS Code, run **Extensions: Install from VSIX** and select the downloaded file.
 3. Open a trusted source-code folder.
 4. Click the TraceGuard code-trace icon in the Activity Bar.
@@ -19,7 +19,7 @@ It does not report confirmed vulnerabilities. You still read the code and make t
 You can also install from PowerShell:
 
 ```powershell
-code --install-extension .\traceguard-code-audit-helper-0.5.0.vsix
+code --install-extension .\traceguard-vscode-0.6.0.vsix
 ```
 
 ## What should I read first?
@@ -59,11 +59,16 @@ TraceGuard can point out the input and file operation. Deciding whether the comp
 
 ## Useful actions while reading
 
+- **Trace Source → Sink across files** follows selected input through direct project calls and opens every step in the chain.
 - **Trace Selected Variable** shows input, assignments, conditions, checks and sensitive uses in source order.
 - **Show Security Clues Here** lists the clues found in the current function.
 - **Add Selection to Audit Notes** saves a relevant code fragment with your reason.
 - **Mark Current Target Reviewed** keeps the queue moving.
 - **Export Audit Notes** creates a Markdown record of the review.
+
+For a cross-file trace, click the action above an indexed function, choose a possible path, then choose any step to open that exact line. `No control seen` means the path has no recognized validation or authorization clue; `Check call target` means a same-named call still needs manual confirmation.
+
+Large projects can adjust `traceguard.flowMaxDepth`, `traceguard.flowMaxPaths` and `traceguard.showFlowCodeLens` in VS Code settings. Full-workspace indexing starts explicitly from the sidebar by default; enable `traceguard.indexOnStartup` only if the startup cost is acceptable. Unsaved live indexing is also opt-in through `traceguard.liveIndex`; saved files still refresh automatically.
 
 ## Supported languages
 
@@ -83,18 +88,31 @@ The analysis is based on source text and common framework patterns. Generated co
 - It has no Python or web-service dependency.
 - A highlighted line is a review clue, not proof of a vulnerability.
 - A clean queue is not proof that a project is secure.
+- Files larger than 2 MB are skipped, and workspace discovery is capped at 8,000 supported files. TraceGuard marks the audit map as partial when either limit affects coverage.
+- When Source-to-Sink candidates exceed the configured display limit, TraceGuard keeps higher-impact paths first and labels the result as a prioritized subset.
 
 Review-session JSON may contain snippets that you saved in audit notes. Check the file before sharing or committing it.
 
 ## Development
 
+The analysis pipeline has one boundary between language-specific source parsing and shared analysis:
+
+```text
+source → language frontend → traceguard-ir → dataflow engine → rules / review projection
+```
+
+Language syntax and operation extraction live under `src/frontends/`. Shared call resolution, IR adaptation and path analysis live under `src/dataflow/`; dataflow and rule evaluation run in a worker thread. `src/audit-analyzer.js` is the compatibility-facing orchestration entry and does not parse source itself.
+
+Review targets and IR functions use line-independent best-effort IDs. `src/analysis/incremental-cache.js` and `src/dataflow/function-summary.js` define the version, summary, dependency and invalidation contract for incremental analysis. The current pattern frontend remains a fallback; a future AST frontend can dual-run and emit the same IR without changing the dataflow or rule layers.
+
 ```powershell
 npm install
 npm test
 npm run check
+npm run benchmark
 npm run package
 ```
 
-Open the extension folder in VS Code and press `F5` to launch an Extension Development Host.
+CI also runs `npm run test:extension-host` against the minimum supported VS Code release. Open the extension folder in VS Code and press `F5` for interactive Extension Development Host testing.
 
 [Report a bug](https://github.com/xingguangqwq/traceguard-vscode/issues) · [Contributing](CONTRIBUTING.md) · MIT License
