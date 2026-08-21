@@ -38,7 +38,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          asset="./traceguard-code-audit-helper-0.5.0.vsix"
+          asset=$(ls ./traceguard-*.vsix)
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" "$asset" --clobber
           else

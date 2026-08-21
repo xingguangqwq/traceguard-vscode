@@ -29,6 +29,12 @@ jobs:
       - name: Check JavaScript syntax
         run: npm run check
 
+      - name: Record lightweight analysis baseline
+        run: npm run benchmark -- --files=200
+
+      - name: Run Extension Host smoke test
+        run: xvfb-run -a npm run test:extension-host
+
       - name: Package VSIX
         run: npm run package
 
@@ -36,5 +42,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: traceguard-vsix
-          path: traceguard-code-audit-helper-*.vsix
+          path: traceguard-*.vsix
           if-no-files-found: error

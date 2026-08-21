@@ -1,6 +1,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const { analyzeText, buildAuditModel, traceIdentifier } = require("../src/audit-analyzer");
+const { buildReviewTargets } = require("../src/review/targets");
 const { languageForPath } = require("../src/language-support");
 
 test("Java Spring endpoint becomes an audit target with local controls and sinks", () => {
@@ -17,11 +18,12 @@ class UserController {
   const analysis = analyzeText(source, "java", "C:\\src\\UserController.java", "src/UserController.java");
   assert.equal(analysis.entries.length, 1);
   assert.equal(analysis.entries[0].title, "GET /users/{id}");
-  assert.equal(analysis.items[0].kind, "endpoint");
-  assert.ok(analysis.items[0].counts.sources >= 1);
-  assert.ok(analysis.items[0].counts.auth >= 1);
-  assert.ok(analysis.items[0].counts.sanitizers >= 1);
-  assert.ok(analysis.items[0].counts.sinks >= 1);
+  const items = buildReviewTargets(analysis);
+  assert.equal(items[0].kind, "endpoint");
+  assert.ok(items[0].counts.sources >= 1);
+  assert.ok(items[0].counts.auth >= 1);
+  assert.ok(items[0].counts.sanitizers >= 1);
+  assert.ok(items[0].counts.sinks >= 1);
 });
 
 test("PHP route with request data and a command is prioritized for review", () => {
@@ -32,9 +34,10 @@ Route::post('/tools/ping', function () {
 });`;
   const analysis = analyzeText(source, "php", "C:\\public\\routes.php", "public/routes.php");
   assert.equal(analysis.entries.length, 1);
-  assert.equal(analysis.items[0].priority, "P0");
-  assert.match(analysis.items[0].reasons.join(" "), /sensitive operation/i);
-  assert.equal(analysis.items[0].categories[0], "command");
+  const items = buildReviewTargets(analysis);
+  assert.equal(items[0].priority, "P0");
+  assert.match(items[0].reasons.join(" "), /sensitive operation/i);
+  assert.equal(items[0].categories[0], "command");
 });
 
 test("workspace audit model orders priority and records indexed coverage surface", () => {
@@ -58,8 +61,9 @@ class SearchController {
 }`;
   const analysis = analyzeText(source, "typescript", "C:\\src\\search.controller.ts", "src/search.controller.ts");
   assert.equal(analysis.entries[0].title, "POST /search");
-  assert.ok(analysis.items[0].counts.sources >= 1);
-  assert.ok(analysis.items[0].counts.sinks >= 1);
+  const items = buildReviewTargets(analysis);
+  assert.ok(items[0].counts.sources >= 1);
+  assert.ok(items[0].counts.sinks >= 1);
 });
 
 test("Python Flask route records request input and outbound request", () => {
@@ -71,8 +75,9 @@ def fetch_url():
 `;
   const analysis = analyzeText(source, "python", "C:\\app\\views.py", "app/views.py");
   assert.equal(analysis.entries[0].title, "POST /fetch");
-  assert.equal(analysis.items[0].categories[0], "network");
-  assert.ok(analysis.items[0].counts.sources >= 1);
+  const items = buildReviewTargets(analysis);
+  assert.equal(items[0].categories[0], "network");
+  assert.ok(items[0].counts.sources >= 1);
 });
 
 test("C# ASP.NET action includes authorization and process execution", () => {
@@ -87,8 +92,9 @@ class ToolController {
 }`;
   const analysis = analyzeText(source, "csharp", "C:\\Controllers\\ToolController.cs", "Controllers/ToolController.cs");
   assert.equal(analysis.entries[0].title, "POST run");
-  assert.ok(analysis.items[0].counts.auth >= 1);
-  assert.equal(analysis.items[0].categories[0], "command");
+  const items = buildReviewTargets(analysis);
+  assert.ok(items[0].counts.auth >= 1);
+  assert.equal(items[0].categories[0], "command");
 });
 
 test("Go HTTP handler becomes a navigable review target", () => {
@@ -104,7 +110,7 @@ func routes() {
 }`;
   const analysis = analyzeText(source, "go", "C:\\cmd\\server.go", "cmd/server.go");
   assert.ok(analysis.entries.some(item => item.route === "/proxy"));
-  const target = analysis.items.find(item => item.functionName === "proxy");
+  const target = buildReviewTargets(analysis).find(item => item.functionName === "proxy");
   assert.ok(target.counts.sources >= 1);
   assert.ok(target.counts.sinks >= 1);
 });
@@ -131,4 +137,98 @@ function run(req) {
   const trace = traceIdentifier(source, "command", analysis.signals);
   assert.deepEqual(trace.map(item => item.role), ["input", "condition", "sensitive-use"]);
   assert.deepEqual(trace.map(item => item.line), [3, 4, 5]);
+});
+
+test("parser output stays free of review priority; the review-target layer adds it", () => {
+  const analysis = analyzeText(`<?php $id = $_GET['id']; system('ping ' . $id);`, "php", "C:\\tools.php", "tools.php");
+  assert.equal(analysis.items, undefined);
+  assert.ok(analysis.signals.some(signal => signal.kind === "source"));
+  assert.ok(analysis.signals.some(signal => signal.kind === "sink"));
+  const items = buildReviewTargets(analysis);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].priority, "P0");
+  assert.ok(items[0].id);
+});
+
+test("plain helpers without sensitive flows stay out of the review queue", () => {
+  const analysis = analyzeText(`
+function add(left, right) {
+  return left + right;
+}`, "javascript", "C:\\src\\util.js", "src/util.js");
+  assert.deepEqual(buildReviewTargets(analysis), []);
+});
+
+test("commented braces do not truncate function ranges", () => {
+  const source = `
+function run(req) {
+  // } fake close
+  /* } another fake */
+  /*
+    multi } line } comment
+  */
+  exec(req.body.cmd);
+  return "ok }";
+}`;
+  const analysis = analyzeText(source, "javascript", "C:\\src\\run.js", "src/run.js");
+  assert.equal(analysis.functions.length, 1);
+  assert.equal(analysis.functions[0].endLine, 10);
+});
+
+test("strings and comments do not create audit signals or findings", () => {
+  const samples = [
+    `function stringOnly() { console.log("req.body.cmd; exec(req.body.cmd)"); }`,
+    `function lineComment() { const safe = 1; // exec(req.body.cmd)\nreturn safe; }`,
+    `function blockComment() { /* exec(req.body.cmd) */ return 1; }`,
+    `function multilineComment() {\n/* req.body.cmd\nexec(req.body.cmd) */\nreturn 1;\n}`,
+  ];
+  for (const [index, source] of samples.entries()) {
+    const analysis = analyzeText(source, "javascript", `C:\\src\\safe-${index}.js`, `src/safe-${index}.js`);
+    assert.deepEqual(analysis.signals, []);
+    assert.deepEqual(buildAuditModel([analysis]).items, []);
+  }
+});
+
+test("Python signals do not leak from the previous function and nested projections are deduplicated", () => {
+  const analysis = analyzeText(`
+def save_history(value):
+    cursor.execute("INSERT INTO history (value) VALUES (?)", (value,))
+
+def handler():
+    value = request.args.get("value")
+    def nested():
+        return value
+    return nested()
+`, "python", "C:\\repo\\app.py", "app.py");
+
+  const handler = analysis.ir.functions.find(fn => fn.name === "handler");
+  assert.ok(handler);
+  assert.ok(!handler.operations.some(operation => operation.kind === "sink"));
+  assert.equal(analysis.signals.filter(signal => signal.kind === "source").length, 1);
+});
+
+test("empty PHP curl handles are not network sinks", () => {
+  const analysis = analyzeText(`<?php
+function proxy($url) {
+  $ch = curl_init();
+  curl_setopt($ch, CURLOPT_URL, $url);
+}
+`, "php", "C:\\repo\\proxy.php", "proxy.php");
+
+  assert.deepEqual(analysis.signals.filter(signal => signal.kind === "sink").map(signal => signal.line), [4]);
+});
+
+test("review target IDs survive unrelated lines inserted above a function", () => {
+  const before = analyzeText(`
+export function run(req) {
+  exec(req.body.command);
+}`, "javascript", "C:\\repo\\run.js", "run.js");
+  const after = analyzeText(`
+const banner = "unchanged behavior";
+
+export function run(req) {
+  exec(req.body.command);
+}`, "javascript", "C:\\repo\\run.js", "run.js");
+
+  assert.equal(buildReviewTargets(before)[0].id, buildReviewTargets(after)[0].id);
+  assert.notEqual(buildReviewTargets(before)[0].line, buildReviewTargets(after)[0].line);
 });

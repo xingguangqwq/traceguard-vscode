@@ -1,9 +1,11 @@
 const path = require("path");
 const vscode = require("vscode");
+const { affectsAnalysisModel } = require("./analysis/configuration");
 const { traceIdentifier } = require("./audit-analyzer");
-const { AuditCodeLensProvider, AuditHoverProvider, AuditQueueProvider, AuditSummaryProvider, EvidenceProvider } = require("./audit-providers");
-const { AuditSession } = require("./audit-session");
+const { AttackSurfaceProvider, AuditCodeLensProvider, AuditHoverProvider, AuditQueueProvider, AuditSummaryProvider, EvidenceProvider, FindingProvider } = require("./audit-providers");
+const { AuditSession, workspaceRelativePath } = require("./audit-session");
 const { SUPPORTED_LABEL, SUPPORTED_SELECTORS, languageForPath } = require("./language-support");
+const { markdownFence } = require("./markdown");
 
 class AuditController {
   constructor(context, output) {
@@ -11,6 +13,8 @@ class AuditController {
     this.output = output;
     this.session = new AuditSession(context, output);
     this.queueProvider = new AuditQueueProvider(this.session);
+    this.attackSurfaceProvider = new AttackSurfaceProvider(this.session);
+    this.findingProvider = new FindingProvider(this.session);
     this.summaryProvider = new AuditSummaryProvider(this.session);
     this.evidenceProvider = new EvidenceProvider(this.session);
     this.codeLensProvider = new AuditCodeLensProvider(this.session);
@@ -34,13 +38,17 @@ class AuditController {
     this.context.subscriptions.push(
       this.session,
       this.queueProvider,
+      this.attackSurfaceProvider,
+      this.findingProvider,
       this.summaryProvider,
       this.evidenceProvider,
       this.codeLensProvider,
       this.status,
       ...Object.values(this.decorations),
       this.traceDecoration,
-      vscode.window.registerTreeDataProvider("traceguard.findings", this.queueProvider),
+      vscode.window.registerTreeDataProvider("traceguard.attackSurface", this.attackSurfaceProvider),
+      vscode.window.registerTreeDataProvider("traceguard.securityFindings", this.findingProvider),
+      vscode.window.registerTreeDataProvider("traceguard.reviewTargets", this.queueProvider),
       vscode.window.registerTreeDataProvider("traceguard.summary", this.summaryProvider),
       vscode.window.registerTreeDataProvider("traceguard.evidence", this.evidenceProvider),
       vscode.languages.registerCodeLensProvider(SUPPORTED_SELECTORS, this.codeLensProvider),
@@ -52,11 +60,13 @@ class AuditController {
       vscode.commands.registerCommand("traceguard.showCurrentFileTargets", () => this.showCurrentFileTargets()),
       vscode.commands.registerCommand("traceguard.showCurrentFunctionSignals", () => this.showCurrentFunctionSignals()),
       vscode.commands.registerCommand("traceguard.traceSelectedSymbol", () => this.traceSelectedSymbol()),
+      vscode.commands.registerCommand("traceguard.traceCrossFileFlow", item => this.traceCrossFileFlow(item)),
       vscode.commands.registerCommand("traceguard.clearSymbolTrace", () => this.clearSymbolTrace()),
       vscode.commands.registerCommand("traceguard.nextAuditTarget", () => this.navigateTarget(1)),
       vscode.commands.registerCommand("traceguard.previousAuditTarget", () => this.navigateTarget(-1)),
       vscode.commands.registerCommand("traceguard.markCurrentReviewed", () => this.markCurrentReviewed()),
       vscode.commands.registerCommand("traceguard.focusAuditItem", item => this.focusItem(item)),
+      vscode.commands.registerCommand("traceguard.openAuditLocation", item => item && openLocation(item.absolutePath, item.line, item.endLine || item.line)),
       vscode.commands.registerCommand("traceguard.markReviewed", item => item ? this.setStatus((item.auditItem || item).id, "reviewed") : this.setCurrentStatus("reviewed")),
       vscode.commands.registerCommand("traceguard.markInReview", item => item ? this.setStatus((item.auditItem || item).id, "in_review") : this.setCurrentStatus("in_review")),
       vscode.commands.registerCommand("traceguard.markNeedsContext", item => item ? this.setStatus((item.auditItem || item).id, "blocked") : this.setCurrentStatus("blocked")),
@@ -69,16 +79,25 @@ class AuditController {
       vscode.commands.registerCommand("traceguard.importReviewSession", () => this.importReviewSession()),
       vscode.workspace.onDidSaveTextDocument(document => this._onSaved(document)),
       vscode.workspace.onDidChangeTextDocument(event => this._onChanged(event.document)),
+      vscode.workspace.onDidCreateFiles(event => this._onFilesCreated(event.files)),
+      vscode.workspace.onDidDeleteFiles(event => this._onFilesDeleted(event.files)),
+      vscode.workspace.onDidRenameFiles(event => this._onFilesRenamed(event.files)),
       vscode.window.onDidChangeActiveTextEditor(editor => { this.clearSymbolTrace(); this._updateDecorations(editor); }),
       vscode.workspace.onDidChangeConfiguration(event => {
         if (event.affectsConfiguration("traceguard.showAuditSignals")) this._updateDecorations(vscode.window.activeTextEditor);
         if (event.affectsConfiguration("traceguard.hideReviewedTargets")) this.queueProvider.refresh();
+        if (event.affectsConfiguration("traceguard.showFlowCodeLens")) this.codeLensProvider.refresh();
+        if (affectsAnalysisModel(event)) void this.session.rebuildModel().catch(error => this.output.error(`Analysis model refresh failed: ${error.message}`));
       }),
     );
   }
 
   async initialize() {
     if (!vscode.workspace.isTrusted || !vscode.workspace.workspaceFolders?.length) {
+      this._updateStatus();
+      return;
+    }
+    if (!vscode.workspace.getConfiguration("traceguard").get("indexOnStartup", false)) {
       this._updateStatus();
       return;
     }
@@ -116,9 +135,18 @@ class AuditController {
         title: "TraceGuard is building the audit map",
         cancellable: true,
       }, (progress, token) => this.session.indexWorkspace(progress, token));
+      const indexStatus = this.session.indexStatus;
       if (showNotification) {
+        if (indexStatus.cancelled) {
+          vscode.window.showInformationMessage("TraceGuard indexing was cancelled. The previous audit map was kept unchanged.");
+          return;
+        }
         const data = this.session.snapshot;
-        vscode.window.showInformationMessage(`Audit map ready: ${data.entries.length} entry points, ${data.items.length} review targets, ${data.files} files indexed.`);
+        if (data.indexIncomplete) {
+          vscode.window.showWarningMessage(`Partial audit map ready: ${data.files} files indexed${data.indexTruncated ? `; the ${data.indexDiscoveredFiles - 1}+ file workspace limit was reached` : ""}${data.indexSkippedFiles ? `; ${data.indexSkippedFiles} files were skipped` : ""}.`);
+        } else {
+          vscode.window.showInformationMessage(`Audit map ready: ${data.entries.length} entry points, ${data.items.length} review targets, ${data.files} files indexed.`);
+        }
       }
     } finally {
       this._updateStatus();
@@ -205,7 +233,7 @@ class AuditController {
     }
     await this.session.reindexDocument(editor.document);
     const analysis = this.session.analysisForUri(editor.document.uri);
-    const trace = traceIdentifier(editor.document.getText(), identifier, analysis?.signals || []);
+    const trace = traceIdentifier(editor.document.getText(), identifier, analysis?.signals || [], analysis?.language);
     if (!trace.length) {
       vscode.window.showInformationMessage(`No references to “${identifier}” were found in this file.`);
       return;
@@ -227,6 +255,56 @@ class AuditController {
       matchOnDetail: true,
     });
     if (selected) revealOccurrence(editor, selected.occurrence);
+  }
+
+  async traceCrossFileFlow(item) {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || !languageForPath(editor.document.uri.fsPath)) {
+      vscode.window.showInformationMessage(`Open a ${SUPPORTED_LABEL} file first.`);
+      return;
+    }
+    const targetLine = item?.absolutePath === editor.document.uri.fsPath
+      ? Math.max(0, item.line - 1)
+      : editor.selection.active.line;
+    const selectedText = item ? "" : editor.document.getText(editor.selection).trim();
+    const identifier = /^[A-Za-z_$][\w$]*$/.test(selectedText) ? selectedText : "";
+    await this.session.reindexDocument(editor.document);
+    const safeLine = Math.min(targetLine, Math.max(0, editor.document.lineCount - 1));
+    const paths = await this.session.sourceSinkPathsFrom(
+      editor.document.uri,
+      safeLine,
+      identifier,
+      identifier ? editor.document.lineAt(safeLine).text.trim() : "",
+    );
+    if (!paths.length) {
+      const subject = identifier ? `“${identifier}”` : "this function";
+      vscode.window.showInformationMessage(`No project-internal Source → Sink path was found from ${subject}. Try selecting an input variable or refresh the workspace index.`);
+      return;
+    }
+    const selectedPath = await vscode.window.showQuickPick(paths.map(flowPath => ({
+      label: `$(git-compare) ${flowPath.finding ? `${flowPath.finding.severity.toUpperCase()} · ${flowPath.finding.title}` : `${flowPath.source.label} → ${flowPath.sink.label}`}`,
+      description: `${flowReviewLabel(flowPath)} · ${flowConfidenceLabel(flowPath.confidence)} · ${flowPath.calls} call${flowPath.calls === 1 ? "" : "s"} · ${flowPath.files.length} file${flowPath.files.length === 1 ? "" : "s"}`,
+      detail: flowPathSummary(flowPath),
+      flowPath,
+    })), {
+      placeHolder: paths.truncated
+        ? `Showing ${paths.length} prioritized paths from at least ${paths.totalCandidates}; narrow the selection or raise the path limit`
+        : `${paths.length} possible Source → Sink path${paths.length === 1 ? "" : "s"}; choose one to inspect`,
+      matchOnDescription: true,
+      matchOnDetail: true,
+    });
+    if (!selectedPath) return;
+    const selectedStep = await vscode.window.showQuickPick(selectedPath.flowPath.steps.map((step, index) => ({
+      label: `${index + 1}. $(${flowStepIcon(step.kind)}) ${step.label}`,
+      description: `${step.relativePath}:${step.line}`,
+      detail: step.kind === "call" && step.candidateReason ? `${step.code} · matched by ${step.candidateReason}` : step.code,
+      step,
+    })), {
+      placeHolder: "Select a Source → Sink step to open it",
+      matchOnDescription: true,
+      matchOnDetail: true,
+    });
+    if (selectedStep) await openLocation(selectedStep.step.absolutePath, selectedStep.step.line, selectedStep.step.line);
   }
 
   clearSymbolTrace() {
@@ -291,9 +369,7 @@ class AuditController {
     if (!type) return;
     const note = await vscode.window.showInputBox({ prompt: "Audit note (optional)", placeHolder: "Why this evidence matters, assumptions, or follow-up question" });
     if (note === undefined) return;
-    const folder = vscode.workspace.getWorkspaceFolder(editor.document.uri);
-    const relativePath = folder ? path.relative(folder.uri.fsPath, editor.document.uri.fsPath).replaceAll("\\", "/") : path.basename(editor.document.uri.fsPath);
-    await this.session.addEvidence({ type, note, code, absolutePath: editor.document.uri.fsPath, relativePath, line: selection.start.line + 1, endLine: selection.end.line + 1 });
+    await this.session.addEvidence({ type, note, code, absolutePath: editor.document.uri.fsPath, relativePath: workspaceRelativePath(editor.document.uri), line: selection.start.line + 1, endLine: selection.end.line + 1 });
     vscode.window.showInformationMessage(`Added ${type.toLowerCase()} evidence to the audit notebook.`);
   }
 
@@ -352,6 +428,7 @@ class AuditController {
     if (!selected?.[0]) return;
     try {
       const bytes = await vscode.workspace.fs.readFile(selected[0]);
+      if (bytes.byteLength > 10 * 1024 * 1024) throw new Error("Review-session files must be 10 MB or smaller.");
       const payload = JSON.parse(Buffer.from(bytes).toString("utf8"));
       const imported = await this.session.importPortableState(payload);
       vscode.window.showInformationMessage(`Merged ${imported.statuses} review states and ${imported.evidence} audit notes.`);
@@ -370,7 +447,7 @@ class AuditController {
 
   _onChanged(document) {
     if (!languageForPath(document.uri.fsPath) || !vscode.workspace.isTrusted) return;
-    if (!vscode.workspace.getConfiguration("traceguard", document.uri).get("liveIndex", true)) return;
+    if (!vscode.workspace.getConfiguration("traceguard", document.uri).get("liveIndex", false)) return;
     const key = document.uri.toString();
     clearTimeout(this.documentTimers.get(key));
     this.documentTimers.set(key, setTimeout(async () => {
@@ -378,6 +455,22 @@ class AuditController {
       await this.session.reindexDocument(document);
       if (vscode.window.activeTextEditor?.document === document) this._updateDecorations(vscode.window.activeTextEditor);
     }, 850));
+  }
+
+  async _onFilesCreated(files) {
+    if (!vscode.workspace.isTrusted) return;
+    for (const uri of files) await this.session.reindexFile(uri);
+  }
+
+  async _onFilesDeleted(files) {
+    if (!vscode.workspace.isTrusted) return;
+    await this.session.removeFiles(files);
+  }
+
+  async _onFilesRenamed(files) {
+    if (!vscode.workspace.isTrusted) return;
+    await this.session.removeFiles(files.map(item => item.oldUri));
+    for (const item of files) await this.session.reindexFile(item.newUri);
   }
 
   _onSessionChanged() {
@@ -390,8 +483,8 @@ class AuditController {
     const data = this.session.snapshot;
     if (!vscode.workspace.isTrusted) { this.status.text = "$(lock) TraceGuard: trust workspace"; this.status.tooltip = "Trust the workspace to build a local audit map"; return; }
     if (!data.indexed_at) { this.status.text = "$(references) Start code review"; this.status.tooltip = "Open the TraceGuard sidebar"; return; }
-    this.status.text = `$(references) Review ${data.coverage}% · ${data.statusCounts.unreviewed} left`;
-    this.status.tooltip = `${data.entries.length} entry points · ${data.items.length} review targets · ${data.evidence.length} evidence records`;
+    this.status.text = `$(references) Review ${data.coverage}% · ${data.statusCounts.unreviewed} left${data.indexIncomplete ? " · partial" : ""}`;
+    this.status.tooltip = `${data.indexScope === "current-files" ? "Workspace-wide indexing has not run · " : ""}${data.entries.length} entry points · ${data.findings.length} potential findings${data.findingPathsTruncated ? " (prioritized subset)" : ""} · ${data.items.length} review targets · ${data.evidence.length} evidence records`;
   }
 
   _updateDecorations(editor) {
@@ -416,6 +509,28 @@ function priorityIcon(priority) { return { P0: "flame", P1: "warning", P2: "eye"
 function signalIcon(kind) { return { source: "arrow-right", sink: "target", auth: "key", sanitizer: "verified" }[kind] || "circle-outline"; }
 function traceRoleLabel(role) { return { input: "External input", parameter: "Parameter", assignment: "Assignment", condition: "Control check", validation: "Validation", "security-decision": "Security decision", "sensitive-use": "Sensitive use", reference: "Reference" }[role] || "Reference"; }
 function traceRoleIcon(role) { return { input: "arrow-right", parameter: "symbol-parameter", assignment: "edit", condition: "git-compare", validation: "verified", "security-decision": "key", "sensitive-use": "target", reference: "references" }[role] || "references"; }
+function flowStepIcon(kind) { return { source: "arrow-right", call: "references", return: "reply", validation: "verified", authorization: "lock", sink: "target" }[kind] || "circle-outline"; }
+
+function flowPathSummary(flowPath) {
+  const functions = [];
+  for (const step of flowPath.steps) {
+    if (!functions.includes(step.functionName)) functions.push(step.functionName);
+  }
+  return `${functions.map(name => `${name}()`).join(" → ")} · ${flowPath.category}`;
+}
+
+function flowReviewLabel(flowPath) {
+  const validation = flowPath.controls?.validation || 0;
+  const authorization = flowPath.controls?.authorization || 0;
+  if (!validation && !authorization) return "No control seen";
+  if (validation && authorization) return `${validation} validation · ${authorization} authorization`;
+  if (validation) return `${validation} validation`;
+  return `${authorization} authorization`;
+}
+
+function flowConfidenceLabel(confidence) {
+  return { high: "High match", medium: "Medium match", review: "Check call target" }[confidence] || "Check match";
+}
 
 function revealOccurrence(editor, occurrence) {
   const start = new vscode.Position(occurrence.line - 1, occurrence.column - 1);
@@ -448,18 +563,24 @@ function buildReport(audit) {
     `Generated: ${new Date().toISOString()}`, "",
     "## Review coverage", "",
     `- Coverage: **${audit.coverage}%** (${audit.statusCounts.reviewed}/${audit.items.length} targets reviewed)`,
-    `- Indexed: ${audit.files} files, ${audit.functions} functions, ${audit.lines} lines`,
+    `- Indexed: ${audit.files} files, ${audit.functions} functions, ${audit.lines} lines${audit.indexIncomplete ? ` (**partial index**${audit.indexScope === "current-files" ? "; workspace-wide indexing has not run" : ""}${audit.indexSkippedFiles ? `; ${audit.indexSkippedFiles} files skipped` : ""})` : ""}`,
     `- Attack surface: ${audit.entries.length} entry points`,
+    `- Potential findings: ${audit.findings.length}${audit.findingPathsTruncated ? ` (prioritized subset of at least ${audit.findingPathCandidates} candidate paths)` : ""}`,
     `- Evidence records: ${audit.evidence.length}`, "",
     "## Attack surface", "",
     ...audit.entries.map(entry => `- \`${entry.title}\` — ${entry.relativePath}:${entry.line}`), "",
-    "## Audit queue", "",
+    "## Potential findings", "",
+    ...audit.findings.map(finding => `- **${finding.severity.toUpperCase()} impact / ${finding.confidence} confidence** · ${finding.title} (${finding.cwe}) — ${finding.relativePath}:${finding.line}`), "",
+    "## Review targets", "",
   ];
   for (const item of audit.items) {
-    lines.push(`### ${item.priority} · ${item.title}`, "", `- Location: \`${item.relativePath}:${item.line}\``, `- Status: **${item.status}**`, `- Review reasons: ${item.reasons.join("; ")}`, "", "Checklist:", ...item.checklist.map(check => `- [${item.status === "reviewed" ? "x" : " "}] ${check.label} — ${check.evidence}`), "");
+    lines.push(`### ${item.priority} · ${item.title}`, "", `- Location: \`${item.relativePath}:${item.line}\``, `- Status: **${item.status}**`, `- Review reasons: ${item.reasons.join("; ")}`, "", "Checklist:", ...item.checklist.map(check => `- [${check.state === "observed" ? "x" : " "}] ${check.label} — ${check.evidence}`), "");
   }
   lines.push("## Evidence notebook", "");
-  for (const evidence of audit.evidence) lines.push(`### ${evidence.type} · ${evidence.relativePath}:${evidence.line}`, "", evidence.note || "No note", "", "```", evidence.code, "```", "");
+  for (const evidence of audit.evidence) {
+    const fence = markdownFence(evidence.code);
+    lines.push(`### ${evidence.type} · ${evidence.relativePath}:${evidence.line}`, "", evidence.note || "No note", "", fence, evidence.code, fence, "");
+  }
   lines.push("---", "TraceGuard audit signals are reviewer aids, not proof that code is secure or vulnerable.", "");
   return lines.join("\n");
 }
