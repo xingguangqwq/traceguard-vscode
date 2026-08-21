@@ -38,11 +38,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
+          notes=".github/release-notes/$GITHUB_REF_NAME.md"
+          if [[ ! -s "$notes" ]]; then
+            echo "::error::Missing handwritten release notes: $notes"
+            exit 1
+          fi
           asset=$(ls ./traceguard-*.vsix)
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" \
+              --title "TraceGuard $GITHUB_REF_NAME" \
+              --notes-file "$notes"
             gh release upload "$GITHUB_REF_NAME" "$asset" --clobber
           else
             gh release create "$GITHUB_REF_NAME" "$asset" \
               --title "TraceGuard $GITHUB_REF_NAME" \
-              --generate-notes
+              --notes-file "$notes"
           fi
