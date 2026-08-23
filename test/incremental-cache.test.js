@@ -33,9 +33,9 @@ test("incremental cache tracks versions and transitively invalidates dependent f
     functionSummaries: [{ id: "service", sinks: ["COMMAND_EXEC"] }],
   });
   assert.deepEqual(new Set(changed.invalidatedFiles), new Set([
-    "c:\\repo\\service.js",
-    "c:\\repo\\controller.js",
-    "c:\\repo\\routes.js",
+    "c:/repo/service.js",
+    "c:/repo/controller.js",
+    "c:/repo/routes.js",
   ]));
 });
 

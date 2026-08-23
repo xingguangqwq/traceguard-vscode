@@ -30,8 +30,38 @@ jobs:
       - name: Check JavaScript syntax
         run: npm run check
 
+      - name: Enforce incremental analysis and memory baseline
+        run: npm run benchmark -- --files=1000 --max-rss-mib=512
+
+      - name: Enforce TypeScript dependency invalidation baseline
+        run: npm run benchmark -- --fixture=typescript-dependents --files=100 --max-incremental-ms=500 --max-rss-mib=512
+
+      - name: Run Extension Host smoke test
+        run: xvfb-run -a npm run test:extension-host
+
       - name: Package VSIX
         run: npm run package
+
+      - name: Verify packaged AST runtimes
+        shell: bash
+        run: |
+          package_root=$(mktemp -d)
+          unzip -q traceguard-*.vsix -d "$package_root"
+          node scripts/verify-packaged-runtime.js "$package_root/extension"
+
+      - name: Prepare reviewed release notes
+        shell: bash
+        run: |
+          notes_source=".github/release-notes/$GITHUB_REF_NAME.md"
+          if [[ ! -f "$notes_source" ]]; then
+            echo "Missing reviewed release notes: $notes_source" >&2
+            exit 1
+          fi
+
+          asset=$(ls ./traceguard-*.vsix)
+          checksum=$(sha256sum "$asset" | awk '{print $1}')
+          cp "$notes_source" release-notes.md
+          printf '\n### SHA-256\n\n`%s`\n' "$checksum" >> release-notes.md
 
       - name: Create or update GitHub release
         env:
@@ -41,8 +71,11 @@ jobs:
           asset=$(ls ./traceguard-*.vsix)
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" "$asset" --clobber
+            gh release edit "$GITHUB_REF_NAME" \
+              --title "TraceGuard $GITHUB_REF_NAME" \
+              --notes-file release-notes.md
           else
             gh release create "$GITHUB_REF_NAME" "$asset" \
               --title "TraceGuard $GITHUB_REF_NAME" \
-              --generate-notes
+              --notes-file release-notes.md
           fi

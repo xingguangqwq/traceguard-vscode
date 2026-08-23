@@ -1,7 +1,7 @@
 "use strict";
 
-const crypto = require("crypto");
 const path = require("path");
+const { legacyHash, normalizePath, stableHash } = require("../identity");
 
 // Reading-order heuristics only. This layer ranks what deserves human attention
 // first; it must not decide exploitability. Vulnerability candidates come from
@@ -28,7 +28,8 @@ function buildReviewTargets(analysis) {
       relativePath: analysis.relativePath,
       language: analysis.language,
       sensitivePath: SENSITIVE_PATH.test(analysis.relativePath),
-      stableKey: ["endpoint", entry.method, entry.route, fn?.name || entry.functionName || "request handler"].join(":"),
+      symbolKey: ["endpoint", fn?.symbolKey || entry.symbolKey || "unresolved", entry.method, entry.route].join("::"),
+      legacyStableKey: ["endpoint", entry.method, entry.route, fn?.name || entry.functionName || "request handler"].join(":"),
     }));
   }
 
@@ -48,13 +49,15 @@ function buildReviewTargets(analysis) {
       relativePath: analysis.relativePath,
       language: analysis.language,
       sensitivePath: SENSITIVE_PATH.test(`${analysis.relativePath} ${fn.name}`),
-      stableKey: ["function", fn.name, normalizeParameters(fn.parameters)].join(":"),
+      symbolKey: fn.symbolKey,
+      legacyStableKey: ["function", fn.name, normalizeParameters(fn.parameters)].join(":"),
     }));
   }
 
   const coveredLines = new Set(analysis.functions.flatMap(fn => range(fn.line, fn.endLine)));
   const globalSensitive = analysis.signals.filter(signal => signal.kind === "sink" && !coveredLines.has(signal.line));
   if (globalSensitive.length && !items.some(item => item.kind === "endpoint")) {
+    const globalFunction = analysis.ir?.functions.find(fn => fn.isGlobal);
     items.push(prioritizeTarget({
       kind: "file",
       title: `File-level execution: ${path.basename(analysis.relativePath)}`,
@@ -66,7 +69,8 @@ function buildReviewTargets(analysis) {
       relativePath: analysis.relativePath,
       language: analysis.language,
       sensitivePath: SENSITIVE_PATH.test(analysis.relativePath),
-      stableKey: "global-scope",
+      symbolKey: globalFunction?.symbolKey || [analysis.language, normalizePath(analysis.relativePath), "global"].join("::"),
+      legacyStableKey: "global-scope",
     }));
   }
 
@@ -94,8 +98,11 @@ function prioritizeTarget(input) {
   if (sources.length && sinks.length && !sanitizers.length) reasons.push("No obvious validation or encoding signal in local scope");
   if (input.sensitivePath) reasons.push("Security-sensitive file or function name");
   return {
-    id: shortHash(`${normalizePath(input.relativePath)}:${input.kind}:${input.stableKey || input.functionName}`),
-    legacyIds: [shortHash(`${input.relativePath}:${input.line}:${input.kind}:${input.functionName}`)],
+    id: `review_${stableHash(`${input.kind}:${input.symbolKey}`)}`,
+    legacyIds: [...new Set([
+      legacyHash(`${input.relativePath}:${input.line}:${input.kind}:${input.functionName}`),
+      legacyHash(`${normalizePath(input.relativePath)}:${input.kind}:${input.legacyStableKey || input.functionName}`),
+    ])],
     ...input,
     score,
     priority,
@@ -108,10 +115,6 @@ function prioritizeTarget(input) {
 
 function normalizeParameters(parameters) {
   return String(parameters || "").replace(/\s+/g, " ").trim();
-}
-
-function normalizePath(value) {
-  return String(value || "").replaceAll("\\", "/").toLowerCase();
 }
 
 function buildChecklist(groups) {
@@ -133,10 +136,6 @@ function compareTargets(left, right) {
 
 function range(start, end) {
   return Array.from({ length: Math.max(0, end - start + 1) }, (_, index) => start + index);
-}
-
-function shortHash(value) {
-  return crypto.createHash("sha1").update(value).digest("hex").slice(0, 16);
 }
 
 module.exports = { SENSITIVE_PATH, buildChecklist, buildReviewTargets, compareTargets, prioritizeTarget };

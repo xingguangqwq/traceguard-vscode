@@ -5,7 +5,12 @@ const { OperationKind } = require("../ir/schema");
 function projectAnalysis(ir) {
   const signals = dedupeSignals(ir.functions.flatMap(fn => fn.operations.map(signalFromOperation).filter(Boolean)));
   const functions = ir.functions.filter(fn => !fn.isGlobal).map(fn => ({
+    id: fn.id,
+    symbolKey: fn.symbolKey,
     name: fn.name,
+    enclosingScope: fn.enclosingScope,
+    signature: fn.signature,
+    parameterDescriptors: fn.parameters.map(parameter => ({ name: parameter.name, type: parameter.type || "?", role: parameter.role })),
     parameters: fn.parameters.map(parameter => parameter.name).join(", "),
     line: fn.location.line,
     endLine: fn.location.endLine,
@@ -22,6 +27,11 @@ function projectAnalysis(ir) {
       endLine: entry.location.endLine,
       functionLine: fn?.location.line,
       functionName: fn?.name,
+      functionId: fn?.id || entry.functionId,
+      symbolKey: fn?.symbolKey || entry.symbolKey,
+      parameterRoles: entry.parameterRoles || [],
+      framework: entry.framework,
+      handlerIndex: entry.handlerIndex,
     };
   });
   return {
@@ -29,6 +39,7 @@ function projectAnalysis(ir) {
     relativePath: ir.relativePath,
     language: ir.language,
     lines: ir.lines,
+    frontend: ir.frontend,
     signals,
     functions,
     entries,

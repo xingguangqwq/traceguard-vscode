@@ -1,6 +1,6 @@
 "use strict";
 
-const crypto = require("crypto");
+const { buildSymbolKey, parameterDescriptors, symbolId } = require("../identity");
 const { maskNonCodeLines } = require("../source-mask");
 const {
   extractAssignment,
@@ -19,13 +19,26 @@ function buildIRScopes(lines, functions, signals, language, absolutePath, relati
   const symbolOccurrences = new Map();
   const scopes = functions.map(fn => {
     const parameters = parseParameterNames(fn.parameters, language);
-    const signature = `${fn.name}(${parameters.join(",")})`;
-    const occurrence = symbolOccurrences.get(signature) || 0;
-    symbolOccurrences.set(signature, occurrence + 1);
+    const descriptors = fn.parameterDescriptors || parameterDescriptors(fn.parameters, language);
+    const baseSymbolKey = buildSymbolKey({
+      language,
+      absolutePath,
+      relativePath,
+      kind: "function",
+      enclosingScope: fn.enclosingScope,
+      name: fn.name,
+      parameterDescriptors: descriptors,
+    });
+    const occurrence = symbolOccurrences.get(baseSymbolKey) || 0;
+    symbolOccurrences.set(baseSymbolKey, occurrence + 1);
+    const symbolKey = occurrence ? `${baseSymbolKey}::duplicate:${occurrence}` : baseSymbolKey;
     return buildScope({
-      id: shortHash([normalizePath(relativePath), language, signature, occurrence].join(":")),
+      id: symbolId(symbolKey),
+      symbolKey,
       name: fn.name,
       parameters,
+      parameterDescriptors: descriptors,
+      enclosingScope: fn.enclosingScope,
       line: fn.line,
       endLine: fn.endLine,
       lineNumbers: range(fn.line, fn.endLine),
@@ -46,10 +59,14 @@ function buildIRScopes(lines, functions, signals, language, absolutePath, relati
   const globalSignals = signals.filter(signal => !covered.has(signal.line));
   const globalEntries = entries.filter(item => !item.functionLine);
   if (globalLineNumbers.length && (globalSignals.length || globalEntries.length)) {
+    const symbolKey = buildSymbolKey({ language, absolutePath, relativePath, kind: "global", name: "global scope", enclosingScope: "<file>", parameterDescriptors: [] });
     scopes.push(buildScope({
       name: "global scope",
-      id: shortHash([normalizePath(relativePath), language, "global-scope"].join(":")),
+      id: symbolId(symbolKey),
+      symbolKey,
       parameters: [],
+      parameterDescriptors: [],
+      enclosingScope: "<file>",
       line: globalLineNumbers[0],
       endLine: globalLineNumbers.at(-1),
       lineNumbers: globalLineNumbers,
@@ -107,8 +124,11 @@ function buildScope(input) {
   events.sort((left, right) => left.line - right.line || (EVENT_ORDER[left.type] ?? 9) - (EVENT_ORDER[right.type] ?? 9));
   return {
     id: input.id,
+    symbolKey: input.symbolKey,
     name: input.name,
     parameters: input.parameters,
+    parameterDescriptors: input.parameterDescriptors || [],
+    enclosingScope: input.enclosingScope || "<file>",
     line: input.line,
     endLine: input.endLine,
     language: input.language,
@@ -123,7 +143,5 @@ function buildScope(input) {
 }
 
 function range(start, end) { return Array.from({ length: Math.max(0, end - start + 1) }, (_, index) => start + index); }
-function normalizePath(value) { return String(value || "").replaceAll("\\", "/").toLowerCase(); }
-function shortHash(value) { return crypto.createHash("sha1").update(value).digest("hex").slice(0, 16); }
 
 module.exports = { buildFunctionFlows: buildIRScopes, buildIRScopes };

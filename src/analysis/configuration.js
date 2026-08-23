@@ -3,6 +3,7 @@
 const MODEL_CONFIGURATION_KEYS = Object.freeze([
   "traceguard.flowMaxDepth",
   "traceguard.flowMaxPaths",
+  "traceguard.astDifferentialMode",
 ]);
 
 function affectsAnalysisModel(event) {

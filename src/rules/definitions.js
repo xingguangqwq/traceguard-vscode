@@ -9,47 +9,61 @@ const EXTERNAL_SOURCES = Object.freeze([
   SourceKind.EXTERNAL_INPUT,
 ]);
 
+const STANDARD_PROPAGATORS = Object.freeze([
+  "assignment", "argument", "return", "property", "template", "concatenation", "collection", "alias",
+]);
+
 const RULES = Object.freeze([
   {
     id: "potential-ssrf",
     title: "Potential server-side request forgery",
     sourceKinds: EXTERNAL_SOURCES,
+    propagators: STANDARD_PROPAGATORS,
     sinkKinds: [SinkKind.HTTP_REQUEST],
     recommendedGuards: [GuardCapability.VALIDATE_SCHEME, GuardCapability.BLOCK_PRIVATE_IP, GuardCapability.URL_POLICY],
     severity: "high",
     impact: "Server-side network access",
     cwe: "CWE-918",
+    core: true,
   },
   {
     id: "potential-command-injection",
     title: "Potential command injection",
     sourceKinds: EXTERNAL_SOURCES,
+    propagators: STANDARD_PROPAGATORS,
     sinkKinds: [SinkKind.COMMAND_EXEC],
     recommendedGuards: [GuardCapability.SHELL_ESCAPE],
+    sanitizerCapabilities: [GuardCapability.SHELL_ESCAPE],
     severity: "critical",
     impact: "Operating-system command execution",
     cwe: "CWE-78",
+    core: true,
   },
   {
     id: "potential-sql-injection",
     title: "Potential SQL injection",
     sourceKinds: EXTERNAL_SOURCES,
+    propagators: STANDARD_PROPAGATORS,
     sinkKinds: [SinkKind.SQL_QUERY],
     recommendedGuards: [GuardCapability.SQL_PARAMETERIZATION],
     sanitizerCapabilities: [GuardCapability.SQL_PARAMETERIZATION],
     severity: "high",
     impact: "Database query execution",
     cwe: "CWE-89",
+    core: true,
   },
   {
     id: "potential-path-traversal",
     title: "Potential path traversal",
     sourceKinds: EXTERNAL_SOURCES,
+    propagators: STANDARD_PROPAGATORS,
     sinkKinds: [SinkKind.FILE_ACCESS],
     recommendedGuards: [GuardCapability.PATH_CONFINEMENT],
     severity: "high",
     impact: "Filesystem access",
     cwe: "CWE-22",
+    sanitizerCapabilities: [GuardCapability.PATH_CONFINEMENT],
+    core: true,
   },
   {
     id: "potential-open-redirect",
@@ -60,6 +74,7 @@ const RULES = Object.freeze([
     severity: "medium",
     impact: "Browser navigation",
     cwe: "CWE-601",
+    core: false,
   },
   {
     id: "potential-unsafe-output",
@@ -70,16 +85,20 @@ const RULES = Object.freeze([
     severity: "medium",
     impact: "Untrusted response content",
     cwe: "CWE-79",
+    core: false,
   },
   {
     id: "potential-unsafe-deserialization",
     title: "Potential unsafe deserialization",
     sourceKinds: EXTERNAL_SOURCES,
     sinkKinds: [SinkKind.DESERIALIZATION],
-    recommendedGuards: [GuardCapability.INPUT_VALIDATION],
+    recommendedGuards: [GuardCapability.DESERIALIZATION_ALLOWLIST],
+    sanitizerCapabilities: [GuardCapability.DESERIALIZATION_ALLOWLIST],
     severity: "critical",
     impact: "Object construction from untrusted data",
     cwe: "CWE-502",
+    propagators: STANDARD_PROPAGATORS,
+    core: true,
   },
   {
     id: "potential-dynamic-execution",
@@ -90,7 +109,8 @@ const RULES = Object.freeze([
     severity: "critical",
     impact: "Dynamic expression or code execution",
     cwe: "CWE-95",
+    core: false,
   },
 ]);
 
-module.exports = { EXTERNAL_SOURCES, RULES };
+module.exports = { EXTERNAL_SOURCES, RULES, STANDARD_PROPAGATORS };

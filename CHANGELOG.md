@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.8.0 - 2026-08-23
+
+- Promoted Java, PHP and Python to the Tier A backend-audit focus, moved JavaScript/TypeScript to regression-focused Tier B, and kept C#/Go as correctness-maintained Tier C languages.
+- Rebuilt the shared operation CFG around executable condition blocks, feasible branch joins, loop back-edges, `break`/`continue`, structured `try`/multiple-`catch`/`finally` edges, `throw` and early-return reachability. Findings and interactive queries now omit operations proven unreachable by the same graph.
+- Added shared control-flow sequence and propagation-fact modules so Backward/Forward queries and Source-to-Sink findings use the same Access Path rebasing, proof status and edge explanation.
+- Added AST-native Java Spring MVC, JAX-RS and Servlet entry extraction, including composition of class-level and method-level routes without line-format dependence.
+- Added Java type hierarchy facts to IR, interface-to-implementation dispatch, executable-implementation preference and overload scoring by arity and inferred argument type.
+- Added JavaBean getter Access Paths such as `body.getCommand()` → `body.command` across assignments, calls and query explanations.
+- Added syntax-verified MyBatis dynamic-substitution sinks for `${...}` while keeping bound `#{...}` placeholders out of the SQL-injection path.
+- Added Java semantic models for `ProcessBuilder`, JPA `EntityManager`, Spring `JdbcTemplate`, `RestTemplate` and `WebClient` using the existing command-injection, SQL-injection and SSRF rule families.
+- Added Tier A regression fixtures for conditional assignments, dead code after return, loop/exception control flow, Spring Controller → Service interface → ServiceImpl → Mapper flow, safe/unsafe MyBatis placeholders, overload disambiguation and Java framework sinks.
+
+## 0.7.3 - 2026-08-23
+
+- Added one canonical Access Path model for object properties, quoted keys, array indexes and dynamic collection elements across frontend, dataflow and interactive queries.
+- Added descendant rebasing for aliases and strong updates for exact overwrites, preventing stale taint and unrelated sibling-field contamination.
+- Added TypeScript Checker-backed `Map`, `Set` and array propagation effects with exact or wildcard element paths and explicit per-edge proof.
+- Added closure capture modeling through explicit synthetic call edges so outer values reach nested callbacks without guessing from names.
+- Added receiver-type method disambiguation and bounded interface implementation dispatch; ambiguous targets are retained as review candidates instead of reported as verified calls.
+- Added per-propagation `verified`, `syntax-only`, `heuristic` and `unresolved` status, reason and input/output Access Paths to findings, rules and audit-query trees.
+- Added regression coverage for container aliases, strong updates, typed collections, closure capture, same-named methods, interface ambiguity and source/call evidence preservation.
+- Fixed an idle workspace being shown as permanently indexing; the Review Progress view now distinguishes idle, file discovery, reading, analysis, cancellation, failure and ready states, and links an idle item directly to Build Review Queue.
+- Worker timeouts and analysis errors now fail once with a visible error instead of silently repeating the same request, while cancelling workspace indexing terminates the active Worker and retains the previous audit map.
+
+## 0.7.2 - 2026-08-23
+
+- Added versioned `.traceguard.json` project semantics with a bundled JSON Schema, editor validation and a command that creates or opens the configuration.
+- Added custom Source, Sink with tainted argument positions, Sanitizer/Guard capability, Propagator and Wrapper models compiled into the same symbol-backed Semantic Model Registry as built-in APIs.
+- Added TypeScript Checker support for custom module imports and aliases, plus receiver-type verification in generic Tree-sitter languages; unqualified custom names remain syntax-only and cannot act as high-confidence sanitizers.
+- Added rule enable/disable controls, severity overrides and bounded workspace-relative exclusion globs.
+- Added atomic configuration reload: invalid or oversized edits produce Problems diagnostics while the last valid analysis model remains active.
+- Split configuration fingerprints so semantic-model changes rebuild Frontend IR, while rule-only changes reuse IR and only rerun dataflow/rules.
+- Added project-configuration regression coverage for aliases, shadowing, safe same-named receivers, custom sanitizers, Worker reconfiguration, multi-root merge, exclusions and real Extension Host hot reload.
+
+## 0.7.1 - 2026-08-22
+
+- Added one shared interactive audit-query protocol for backward value tracing, forward value tracing, callers, callees, entry-point reachability, reachable sinks and local analysis explanations.
+- Added an expandable Audit Queries path tree with click-to-code navigation and explicit `verified`, `syntax-only`, `heuristic` and `unresolved` labels on every step.
+- Moved interactive queries into the persistent analysis Worker so results always use the latest incrementally updated workspace IR without copying the workspace back to the Extension Host.
+- Added Access Path-aware query propagation for nested properties and array elements without merging unrelated sibling fields.
+- Added finding search, Problems-panel diagnostics, Markdown path copying and serializable per-file Analysis Debug JSON export.
+- Extended the real Extension Host smoke test to execute an incremental Worker query, render its tree contract, serialize debug facts and verify live Problems diagnostics.
+
+## 0.7.0 - 2026-08-22
+
+- Added Tree-sitter WASM frontends for all supported languages and a persistent project-level TypeScript Program for JavaScript, TypeScript, JSX and TSX import/type resolution, with explicit parser degradation and Pattern fallback reporting.
+- Replaced line-based framework route discovery with AST call/argument extraction for JavaScript/TypeScript, PHP, C# Minimal APIs and Go routers, preserving route and handler identity across compact and multiline formatting.
+- Added precise line/column/offset spans to AST IR locations and CFG branch ranges so branch dominance no longer changes when multiple statements share one line.
+- Added TypeScript module reverse dependencies and consumer IR regeneration when imported types or contextual callback signatures change.
+- Added versioned IR symbol keys, anonymous route callback discriminators and platform-aware path identity so overloads, callbacks and case-sensitive POSIX files cannot share review state.
+- Added local CFG/def-use, property and collection propagation, branch-scoped guard dominance, function summaries and summary-based cross-function taint flow.
+- Added a symbol-backed semantic model registry for Sources, Sinks, Propagators and Guards, including TypeScript Checker alias/shadowing resolution and signature-specific taint argument positions.
+- Added cross-function Access Path rebasing for destructured parameters, nested object fields and array indexes without contaminating unrelated sibling fields.
+- Added a persistent incremental Worker protocol with file updates/removals, dependency-scoped invalidation, finding/path deltas, crash replay, queued-update coalescing and bounded retained syntax trees.
+- Focused the core rule model on command injection, SQL injection, path traversal, SSRF and unsafe deserialization with rule-specific sanitizer/guard capabilities and explainable confidence/heuristic details.
+- Downgraded regex-only security matches to review candidates and require AST/symbol or structural proof before a Guard may suppress a finding.
+- Added C# Minimal API, Go inline `HandleFunc`, PHP route closure and JavaScript/TypeScript inline route handler identity and entry binding.
+- Added sink-centered finding consolidation, reviewed/false-positive/accepted-risk/suppressed decisions, Source → Sink tree expansion and SARIF 2.1.0 export with external suppression semantics.
+- Made incomplete index coverage explicit, retained historical review state after partial scans and added configurable workspace file limits with a conservative 1,000-file default.
+- Added cross-language vulnerable/safe smoke pairs, packaged-runtime verification, real Extension Host AST/Worker/SARIF coverage, performance gates and bundled third-party license notices.
+- Added a 100-file TypeScript dependency-fanout performance gate alongside the 1,000-file independent-route baseline.
+
 ## 0.6.0
 
 - Prevented strings and line, block and multiline comments from creating fake sources, sinks, calls or security findings.

@@ -1,6 +1,7 @@
 node_modules/
 *.vsix
 .vscode-test/
+.npm-cache/
 coverage/
 *.log
 .DS_Store

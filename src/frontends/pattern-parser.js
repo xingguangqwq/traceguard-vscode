@@ -1,6 +1,7 @@
 "use strict";
 
 const { maskNonCodeLines } = require("../source-mask");
+const { parameterDescriptors } = require("../identity");
 
 const JAVASCRIPT_PATTERNS = [
   ["source", "HTTP request data", /\breq(?:uest)?\.(?:body|query|params|headers|cookies|files)\b|\b(?:searchParams|formData)\.(?:get|getAll)\s*\(/],
@@ -18,6 +19,7 @@ const JAVASCRIPT_PATTERNS = [
   ["sanitizer", "Schema or input validation", /\b(?:validate|sanitize|escape|parse|safeParse)\s*\(|\b(?:joi|zod|yup|validator)\b/i],
   ["sanitizer", "HTML sanitization", /\b(?:DOMPurify\.sanitize|sanitizeHtml|encodeURIComponent|escapeHtml)\s*\(/],
   ["sanitizer", "Canonical path check", /\bpath\.(?:normalize|resolve|basename)\s*\(/],
+  ["sanitizer", "Path confinement check", /\b(?:resolved|normalized|candidate|target|file|path)\w*\.startsWith\s*\(|\bpath\.relative\s*\(/i],
   ["sanitizer", "Parameterized SQL", /\.(?:query|execute)\s*\(\s*["'`][\s\S]*?(?:\?|\$\d+)/, undefined, true],
 ];
 
@@ -223,12 +225,55 @@ function findFunctions(lines, language) {
     functions.push({
       name: match[1] || "callback",
       parameters: match[2] || "",
+      parameterDescriptors: parameterDescriptors(match[2] || "", language),
       line: index + 1,
       endLine: language === "python" ? findIndentedBlockEnd(lines, index) : findBlockEnd(searchableLines, index),
       signals: [],
     });
   });
+  attachEnclosingScopes(functions, lines, searchableLines, language);
   return functions;
+}
+
+function attachEnclosingScopes(functions, lines, searchableLines, language) {
+  const types = findTypeScopes(lines, searchableLines, language);
+  for (const fn of functions) {
+    const containingTypes = types
+      .filter(type => type.line <= fn.line && type.endLine >= fn.endLine)
+      .sort((left, right) => (right.endLine - right.line) - (left.endLine - left.line));
+    const containingFunctions = functions
+      .filter(parent => parent !== fn && parent.line < fn.line && parent.endLine >= fn.endLine)
+      .sort((left, right) => left.line - right.line);
+    const receiver = language === "go" ? goReceiverType(searchableLines[fn.line - 1]) : undefined;
+    fn.enclosingScope = [
+      ...containingTypes.map(type => type.name),
+      ...containingFunctions.map(parent => parent.name),
+      receiver,
+    ].filter(Boolean).join(".") || "<file>";
+  }
+}
+
+function findTypeScopes(lines, searchableLines, language) {
+  const scopes = [];
+  searchableLines.forEach((code, index) => {
+    let match;
+    if (language === "python") match = code.match(/^\s*class\s+([A-Za-z_]\w*)\b/);
+    else if (["java", "javascript", "typescript", "csharp", "php"].includes(language)) {
+      match = code.match(/\b(?:class|interface|enum|record|struct|trait)\s+([A-Za-z_$][\w$]*)\b/i);
+    }
+    if (!match) return;
+    scopes.push({
+      name: match[1],
+      line: index + 1,
+      endLine: language === "python" ? findIndentedBlockEnd(lines, index) : findBlockEnd(searchableLines, index),
+    });
+  });
+  return scopes;
+}
+
+function goReceiverType(code) {
+  const receiver = String(code || "").match(/^\s*func\s*\(\s*[A-Za-z_]\w*\s+\*?([A-Za-z_]\w*)/);
+  return receiver?.[1];
 }
 
 function findBlockEnd(lines, startIndex) {
@@ -348,6 +393,12 @@ function findPythonEntries(lines, functions) {
 
 function findCsharpEntries(lines, functions) {
   const entries = [];
+  lines.forEach((code, index) => {
+    const minimal = code.match(/\b\w+\.Map(Get|Post|Put|Delete|Patch|Methods?)\s*\(\s*["']([^"']+)["']/i);
+    if (!minimal) return;
+    const fn = containingFunction(functions, index + 1);
+    entries.push(entry(minimal[1].toUpperCase().replace("METHODS", "ANY"), minimal[2], index + 1, fn));
+  });
   for (const fn of functions) {
     const context = lines.slice(Math.max(0, fn.line - 8), fn.line).join(" ");
     const methodMatch = context.match(/\[Http(Get|Post|Put|Delete|Patch|Options)(?:\s*\(\s*["']([^"']*)["'])?/i);
@@ -355,19 +406,19 @@ function findCsharpEntries(lines, functions) {
     if (!methodMatch && !routeMatch) continue;
     entries.push(entry(methodMatch ? methodMatch[1].toUpperCase() : "ANY", methodMatch?.[2] || routeMatch?.[1] || fn.name, fn.line, fn));
   }
-  return entries;
+  return dedupeEntries(entries);
 }
 
 function findGoEntries(lines, functions) {
   const entries = [];
   lines.forEach((code, index) => {
-    const direct = code.match(/\b(?:http\.)?HandleFunc\s*\(\s*["']([^"']+)["']\s*,\s*([A-Za-z_]\w*)/);
-    const router = code.match(/\b\w+\.(GET|POST|PUT|DELETE|PATCH|OPTIONS|Any|HandleFunc)\s*\(\s*["']([^"']+)["']\s*,\s*([A-Za-z_]\w*)/);
+    const direct = code.match(/\b(?:http\.)?HandleFunc\s*\(\s*["']([^"']+)["']\s*,\s*(?:func\b|([A-Za-z_]\w*))/);
+    const router = code.match(/\b\w+\.(GET|POST|PUT|DELETE|PATCH|OPTIONS|Any|HandleFunc)\s*\(\s*["']([^"']+)["']\s*,\s*(?:func\b|([A-Za-z_]\w*))/);
     if (direct) {
-      const fn = functions.find(candidate => candidate.name === direct[2]);
+      const fn = direct[2] ? functions.find(candidate => candidate.name === direct[2]) : containingFunction(functions, index + 1);
       entries.push(entry("REQUEST", direct[1], fn?.line || index + 1, fn));
     } else if (router) {
-      const fn = functions.find(candidate => candidate.name === router[3]);
+      const fn = router[3] ? functions.find(candidate => candidate.name === router[3]) : containingFunction(functions, index + 1);
       const methods = code.match(/\.Methods\s*\(\s*["'](GET|POST|PUT|DELETE|PATCH|OPTIONS)/i);
       const method = router[1].toLowerCase() === "handlefunc" ? (methods?.[1]?.toUpperCase() || "ANY") : router[1].toUpperCase();
       entries.push(entry(method, router[2], fn?.line || index + 1, fn));
@@ -382,11 +433,23 @@ function findGoEntries(lines, functions) {
 }
 
 function entry(method, route, line, fn) {
-  return { title: `${method} ${route}`, method, route, line, endLine: fn?.endLine || line, functionLine: fn?.line, functionName: fn?.name };
+  return {
+    title: `${method} ${route}`,
+    method,
+    route,
+    line,
+    endLine: fn?.endLine || line,
+    functionLine: fn?.line,
+    functionName: fn?.name,
+    functionId: fn?.id,
+    symbolKey: fn?.symbolKey,
+  };
 }
 
 function containingFunction(functions, line) {
-  return functions.find(fn => line >= fn.line && line <= fn.endLine);
+  return functions
+    .filter(fn => line >= fn.line && line <= fn.endLine)
+    .sort((left, right) => (left.endLine - left.line) - (right.endLine - right.line))[0];
 }
 
 function dedupeEntries(entries) {

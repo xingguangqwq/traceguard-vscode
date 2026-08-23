@@ -1,7 +1,7 @@
 "use strict";
 
-const crypto = require("crypto");
 const path = require("path");
+const { stableHash } = require("./identity");
 const { projectAnalysis } = require("./frontends/ir-projection");
 const {
   SIGNAL_PATTERNS,
@@ -11,7 +11,7 @@ const {
   parseSourceStructure,
   traceIdentifier,
 } = require("./frontends/pattern-parser");
-const { frontendForLanguage } = require("./frontends/registry");
+const { frontendForLanguage, parseWithBestFrontend } = require("./frontends/registry");
 const { buildReviewTargets, compareTargets } = require("./review/targets");
 
 function analyzeText(text, language, absolutePath, relativePath = path.basename(absolutePath)) {
@@ -41,17 +41,40 @@ function buildAuditModel(analyses) {
       ...counts,
       [analysis.language]: (counts[analysis.language] || 0) + 1,
     }), {}),
+    languageCapabilities: buildLanguageCapabilities(analyses),
   };
 }
 
+function buildLanguageCapabilities(analyses) {
+  const result = {};
+  for (const analysis of analyses) {
+    const current = result[analysis.language] || { files: 0, astFiles: 0, fallbackFiles: 0, degradedFiles: 0, reasons: [] };
+    current.files += 1;
+    if (analysis.frontend?.mode === "ast") current.astFiles += 1;
+    else current.fallbackFiles += 1;
+    if (analysis.frontend?.degraded) current.degradedFiles += 1;
+    if (analysis.frontend?.degradedReason && !current.reasons.includes(analysis.frontend.degradedReason)) current.reasons.push(analysis.frontend.degradedReason);
+    current.capability = analysis.frontend?.capability || "fallback";
+    result[analysis.language] = current;
+  }
+  return result;
+}
+
 function shortHash(value) {
-  return crypto.createHash("sha1").update(value).digest("hex").slice(0, 16);
+  return stableHash(value, 16);
+}
+
+async function analyzeTextAsync(text, language, absolutePath, relativePath = path.basename(absolutePath), options = {}) {
+  const ir = await parseWithBestFrontend({ text, language, absolutePath, relativePath, options });
+  return projectAnalysis(ir);
 }
 
 module.exports = {
   SIGNAL_PATTERNS,
   analyzeText,
+  analyzeTextAsync,
   buildAuditModel,
+  buildLanguageCapabilities,
   collectSignals,
   findEntries,
   findFunctions,

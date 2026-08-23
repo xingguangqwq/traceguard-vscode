@@ -1,6 +1,6 @@
 "use strict";
 
-const path = require("node:path");
+const { normalizePath } = require("../identity");
 
 class IncrementalAnalysisCache {
   constructor() {
@@ -16,7 +16,7 @@ class IncrementalAnalysisCache {
   updateFile(input) {
     const key = fileKey(input.absolutePath);
     const previous = this.files.get(key);
-    if (previous?.version === input.version) return { cacheHit: true, changedFunctionIds: [], invalidatedFiles: [] };
+    if (previous?.version === input.version && !input.force) return { cacheHit: true, changedFunctionIds: [], invalidatedFiles: [] };
 
     if (previous) this._removeReverseDependencies(key, previous.dependencyFunctionIds);
     const summaries = [...(input.functionSummaries || [])];
@@ -47,6 +47,17 @@ class IncrementalAnalysisCache {
     this._removeReverseDependencies(key, previous.dependencyFunctionIds);
     const changedFunctionIds = previous.functionSummaries.map(summary => summary.id);
     return { changedFunctionIds, invalidatedFiles: this.affectedFiles(key, changedFunctionIds) };
+  }
+
+  replaceDependencies(absolutePath, dependencyFunctionIds) {
+    const key = fileKey(absolutePath);
+    const record = this.files.get(key);
+    if (!record) return false;
+    const next = [...new Set(dependencyFunctionIds || [])];
+    this._removeReverseDependencies(key, record.dependencyFunctionIds);
+    record.dependencyFunctionIds = next;
+    this._addReverseDependencies(key, next);
+    return true;
   }
 
   affectedFiles(changedFile, changedFunctionIds) {
@@ -103,7 +114,7 @@ function changedFunctions(previous, current) {
 }
 
 function fileKey(value) {
-  return path.normalize(String(value || "")).toLowerCase();
+  return normalizePath(value);
 }
 
 function fingerprint(value) {

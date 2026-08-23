@@ -1,5 +1,7 @@
 "use strict";
 
+const { normalizePath } = require("../identity");
+
 const CALL_KEYWORDS = new Set([
   "if", "for", "while", "switch", "catch", "with", "return", "throw", "new",
   "function", "def", "func", "class", "interface", "typeof", "sizeof", "isset",
@@ -218,7 +220,6 @@ function maskStrings(code) {
 }
 
 function canonicalName(value) { return String(value || "").replace(/^\$/, "").replace(/[^A-Za-z0-9]/g, "").toLowerCase(); }
-function normalizePath(value) { return String(value || "").replaceAll("\\", "/").toLowerCase(); }
 function unique(values) { return [...new Set(values.filter(Boolean))]; }
 
 module.exports = {

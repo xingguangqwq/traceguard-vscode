@@ -27,12 +27,14 @@ const GuardCapability = Object.freeze({
   VALIDATE_IP: "VALIDATE_IP",
   BLOCK_PRIVATE_IP: "BLOCK_PRIVATE_IP",
   URL_POLICY: "URL_POLICY",
+  PATH_CANONICALIZATION: "PATH_CANONICALIZATION",
   PATH_CONFINEMENT: "PATH_CONFINEMENT",
   OUTPUT_ENCODING: "OUTPUT_ENCODING",
   SQL_PARAMETERIZATION: "SQL_PARAMETERIZATION",
   SHELL_ESCAPE: "SHELL_ESCAPE",
   AUTHENTICATION: "AUTHENTICATION",
   AUTHORIZATION: "AUTHORIZATION",
+  DESERIALIZATION_ALLOWLIST: "DESERIALIZATION_ALLOWLIST",
 });
 
 const SINK_BY_CATEGORY = Object.freeze({
@@ -46,6 +48,36 @@ const SINK_BY_CATEGORY = Object.freeze({
   deserialization: SinkKind.DESERIALIZATION,
   directory: SinkKind.DIRECTORY_LOOKUP,
 });
+
+const GUARD_SINK_KINDS = Object.freeze({
+  [GuardCapability.VALIDATE_SCHEME]: [SinkKind.HTTP_REQUEST, SinkKind.REDIRECT],
+  [GuardCapability.VALIDATE_IP]: [SinkKind.HTTP_REQUEST],
+  [GuardCapability.BLOCK_PRIVATE_IP]: [SinkKind.HTTP_REQUEST],
+  [GuardCapability.URL_POLICY]: [SinkKind.HTTP_REQUEST, SinkKind.REDIRECT],
+  [GuardCapability.PATH_CANONICALIZATION]: [SinkKind.FILE_ACCESS],
+  [GuardCapability.PATH_CONFINEMENT]: [SinkKind.FILE_ACCESS],
+  [GuardCapability.OUTPUT_ENCODING]: [SinkKind.RESPONSE_OUTPUT],
+  [GuardCapability.SQL_PARAMETERIZATION]: [SinkKind.SQL_QUERY],
+  [GuardCapability.SHELL_ESCAPE]: [SinkKind.COMMAND_EXEC],
+  [GuardCapability.DESERIALIZATION_ALLOWLIST]: [SinkKind.DESERIALIZATION],
+});
+
+const OUTPUT_SCOPED_GUARDS = new Set([
+  GuardCapability.OUTPUT_ENCODING,
+  GuardCapability.PATH_CANONICALIZATION,
+  GuardCapability.SHELL_ESCAPE,
+]);
+
+const RECEIVER_SCOPED_GUARDS = new Set([GuardCapability.SQL_PARAMETERIZATION]);
+const TRUSTED_OPERAND_GUARDS = new Set([GuardCapability.PATH_CONFINEMENT]);
+const SEMANTIC_PROOF_GUARDS = new Set([
+  GuardCapability.URL_POLICY,
+  GuardCapability.OUTPUT_ENCODING,
+  GuardCapability.SQL_PARAMETERIZATION,
+  GuardCapability.SHELL_ESCAPE,
+  GuardCapability.DESERIALIZATION_ALLOWLIST,
+]);
+const INDIRECT_SINK_GUARDS = new Set([GuardCapability.SQL_PARAMETERIZATION]);
 
 function sourceKindFor(signal) {
   const text = `${signal?.label || ""} ${signal?.code || ""}`;
@@ -67,7 +99,9 @@ function guardCapabilitiesFor(signal) {
   }
   if (/prepared|parameterized|bindParam|bindValue|prepareStatement/i.test(text)) capabilities.push(GuardCapability.SQL_PARAMETERIZATION);
   if (/shell argument|escapeshellarg|escapeshellcmd/i.test(text)) capabilities.push(GuardCapability.SHELL_ESCAPE);
-  if (/canonical|realpath|normalize|safe filename|GetFullPath|filepath\.(?:Clean|Abs|Base)/i.test(text)) capabilities.push(GuardCapability.PATH_CONFINEMENT);
+  if (/canonical|realpath|normalize|resolve|safe filename|basename|GetFullPath|filepath\.(?:Clean|Abs|Base)/i.test(text)) capabilities.push(GuardCapability.PATH_CANONICALIZATION);
+  if (/path confinement|within (?:the )?(?:root|base|directory)|startsWith\s*\(|commonpath|relative\([^)]*\)(?:\s*!==?\s*\.\.|\.startsWith)/i.test(text)) capabilities.push(GuardCapability.PATH_CONFINEMENT);
+  if (/deseriali[sz].*(?:allowlist|binder|known type)|allowed (?:class|type)/i.test(text)) capabilities.push(GuardCapability.DESERIALIZATION_ALLOWLIST);
   if (/output encoding|HTML sanit|htmlspecialchars|htmlentities|escapeHtml|EscapeString|Encode\.forHtml/i.test(text)) capabilities.push(GuardCapability.OUTPUT_ENCODING);
   if (/scheme|protocol/i.test(text)) capabilities.push(GuardCapability.VALIDATE_SCHEME);
   if (/private (?:IP|network)|loopback|link-local|127\.0\.0\.1|169\.254/i.test(text)) capabilities.push(GuardCapability.BLOCK_PRIVATE_IP);
@@ -84,11 +118,29 @@ function semanticForSignal(signal) {
   return { label: signal.label };
 }
 
+function guardAssociation(capabilities = []) {
+  return {
+    applicableSinkKinds: [...new Set(capabilities.flatMap(capability => GUARD_SINK_KINDS[capability] || []))],
+    outputScoped: capabilities.some(capability => OUTPUT_SCOPED_GUARDS.has(capability)),
+    receiverScoped: capabilities.some(capability => RECEIVER_SCOPED_GUARDS.has(capability)),
+    requiresTrustedOperand: capabilities.some(capability => TRUSTED_OPERAND_GUARDS.has(capability)),
+    capabilityScopes: Object.fromEntries(capabilities.map(capability => [capability, {
+      applicableSinkKinds: GUARD_SINK_KINDS[capability] || [],
+      outputScoped: OUTPUT_SCOPED_GUARDS.has(capability),
+      receiverScoped: RECEIVER_SCOPED_GUARDS.has(capability),
+      requiresTrustedOperand: TRUSTED_OPERAND_GUARDS.has(capability),
+      requiresSemanticProof: SEMANTIC_PROOF_GUARDS.has(capability),
+      forbidsDirectSinkInput: INDIRECT_SINK_GUARDS.has(capability),
+    }])),
+  };
+}
+
 module.exports = {
   GuardCapability,
   SinkKind,
   SourceKind,
   guardCapabilitiesFor,
+  guardAssociation,
   semanticForSignal,
   sinkKindFor,
   sourceKindFor,

@@ -136,7 +136,7 @@ export function execute(url) {
   const paths = findSourceSinkPaths(analyses, { absolutePath: "C:\\repo\\controller.js", line: 4 });
   assert.ok(paths.some(item => item.category === "command" && item.files.includes("services/shell.js")));
   assert.ok(!paths.some(item => item.files.includes("legacy/shell.js")));
-  assert.equal(paths[0].confidence, "high");
+  assert.equal(paths[0].confidence, "review");
   assert.match(paths[0].steps.find(step => step.kind === "call").candidateReason, /import/);
 });
 

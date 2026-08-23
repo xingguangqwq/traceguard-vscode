@@ -29,14 +29,24 @@ jobs:
       - name: Check JavaScript syntax
         run: npm run check
 
-      - name: Record lightweight analysis baseline
-        run: npm run benchmark -- --files=200
+      - name: Enforce incremental analysis and memory baseline
+        run: npm run benchmark -- --files=1000 --max-rss-mib=512
+
+      - name: Enforce TypeScript dependency invalidation baseline
+        run: npm run benchmark -- --fixture=typescript-dependents --files=100 --max-incremental-ms=500 --max-rss-mib=512
 
       - name: Run Extension Host smoke test
         run: xvfb-run -a npm run test:extension-host
 
       - name: Package VSIX
         run: npm run package
+
+      - name: Verify packaged AST runtimes
+        shell: bash
+        run: |
+          package_root=$(mktemp -d)
+          unzip -q traceguard-*.vsix -d "$package_root"
+          node scripts/verify-packaged-runtime.js "$package_root/extension"
 
       - name: Upload VSIX
         uses: actions/upload-artifact@v4

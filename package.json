@@ -1,8 +1,8 @@
 {
   "name": "traceguard-vscode",
-  "displayName": "TraceGuard Code Audit Helper",
-  "description": "A lightweight VS Code helper for reviewing Java, PHP, JavaScript/TypeScript, Python, C# and Go code.",
-  "version": "0.6.0",
+  "displayName": "TraceGuard Local SAST",
+  "description": "Local, incremental and explainable SAST focused on Java, PHP and Python backend code review.",
+  "version": "0.8.0",
   "publisher": "traceguard",
   "license": "MIT",
   "repository": {
@@ -17,11 +17,16 @@
     "vscode": "^1.90.0"
   },
   "categories": [
+    "Linters",
     "Programming Languages",
     "Other"
   ],
   "keywords": [
     "code audit",
+    "sast",
+    "sarif",
+    "tree-sitter",
+    "taint analysis",
     "security review",
     "java",
     "php",
@@ -94,9 +99,81 @@
       },
       {
         "command": "traceguard.traceSelectedSymbol",
-        "title": "TraceGuard: Trace Selected Variable",
+        "title": "TraceGuard: Trace Selected Variable Forward",
         "category": "TraceGuard",
         "icon": "$(symbol-variable)"
+      },
+      {
+        "command": "traceguard.traceBackward",
+        "title": "TraceGuard: Trace Backward",
+        "category": "TraceGuard",
+        "icon": "$(arrow-left)"
+      },
+      {
+        "command": "traceguard.traceForward",
+        "title": "TraceGuard: Trace Forward",
+        "category": "TraceGuard",
+        "icon": "$(arrow-right)"
+      },
+      {
+        "command": "traceguard.findCallers",
+        "title": "TraceGuard: Find Callers",
+        "category": "TraceGuard",
+        "icon": "$(call-incoming)"
+      },
+      {
+        "command": "traceguard.findCallees",
+        "title": "TraceGuard: Find Callees",
+        "category": "TraceGuard",
+        "icon": "$(call-outgoing)"
+      },
+      {
+        "command": "traceguard.traceToEntry",
+        "title": "TraceGuard: Trace to Entry Point",
+        "category": "TraceGuard",
+        "icon": "$(globe)"
+      },
+      {
+        "command": "traceguard.showReachableSinks",
+        "title": "TraceGuard: Show Reachable Sinks",
+        "category": "TraceGuard",
+        "icon": "$(target)"
+      },
+      {
+        "command": "traceguard.explainAnalysisHere",
+        "title": "TraceGuard: Explain Analysis Here",
+        "category": "TraceGuard",
+        "icon": "$(question)"
+      },
+      {
+        "command": "traceguard.copyAuditQueryMarkdown",
+        "title": "TraceGuard: Copy Analysis Path as Markdown",
+        "category": "TraceGuard",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "traceguard.exportAnalysisDebugJson",
+        "title": "TraceGuard: Export Analysis Debug JSON",
+        "category": "TraceGuard",
+        "icon": "$(json)"
+      },
+      {
+        "command": "traceguard.clearAuditQuery",
+        "title": "TraceGuard: Clear Audit Query",
+        "category": "TraceGuard",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "traceguard.searchFindings",
+        "title": "TraceGuard: Search Findings",
+        "category": "TraceGuard",
+        "icon": "$(search)"
+      },
+      {
+        "command": "traceguard.openProjectConfiguration",
+        "title": "TraceGuard: Open Project Audit Configuration",
+        "category": "TraceGuard",
+        "icon": "$(settings-gear)"
       },
       {
         "command": "traceguard.traceCrossFileFlow",
@@ -139,6 +216,37 @@
         "title": "TraceGuard: Export Audit Notes",
         "category": "TraceGuard",
         "icon": "$(export)"
+      },
+      {
+        "command": "traceguard.exportSarif",
+        "title": "TraceGuard: Export Findings as SARIF",
+        "category": "TraceGuard",
+        "icon": "$(file-code)"
+      },
+      {
+        "command": "traceguard.markFindingReviewed",
+        "title": "Mark Finding Reviewed",
+        "category": "TraceGuard"
+      },
+      {
+        "command": "traceguard.markFindingFalsePositive",
+        "title": "Mark Finding False Positive",
+        "category": "TraceGuard"
+      },
+      {
+        "command": "traceguard.acceptFindingRisk",
+        "title": "Accept Finding Risk",
+        "category": "TraceGuard"
+      },
+      {
+        "command": "traceguard.suppressFinding",
+        "title": "Suppress Finding",
+        "category": "TraceGuard"
+      },
+      {
+        "command": "traceguard.resetFindingStatus",
+        "title": "Reset Finding Status",
+        "category": "TraceGuard"
       },
       {
         "command": "traceguard.exportReviewSession",
@@ -195,6 +303,15 @@
         "icon": "$(trash)"
       }
     ],
+    "jsonValidation": [
+      {
+        "fileMatch": [
+          "/.traceguard.json",
+          "**/.traceguard.json"
+        ],
+        "url": "./resources/traceguard.schema.json"
+      }
+    ],
     "viewsContainers": {
       "activitybar": [
         {
@@ -219,6 +336,10 @@
           "name": "Potential Findings"
         },
         {
+          "id": "traceguard.auditQueries",
+          "name": "Audit Queries"
+        },
+        {
           "id": "traceguard.reviewTargets",
           "name": "Review Targets"
         },
@@ -231,23 +352,52 @@
     "viewsWelcome": [
       {
         "view": "traceguard.attackSurface",
-        "contents": "No externally reachable entry points have been indexed.\n[Refresh Code Review Index](command:traceguard.refreshAudit)"
+        "contents": "$(globe) No externally reachable entry points have been indexed.\n[Refresh Code Review Index](command:traceguard.refreshAudit)"
       },
       {
         "view": "traceguard.securityFindings",
-        "contents": "No Source to Sink path currently matches a security rule. This does not prove the workspace is secure.\n[Refresh Code Review Index](command:traceguard.refreshAudit)"
+        "contents": "$(shield) No Source to Sink path currently matches a security rule. This does not prove the workspace is secure.\n[Refresh Code Review Index](command:traceguard.refreshAudit)"
+      },
+      {
+        "view": "traceguard.auditQueries",
+        "contents": "$(question) Ask where a value came from, where it goes, or how the current function reaches entries and sinks.\n[Explain Analysis Here](command:traceguard.explainAnalysisHere)"
       },
       {
         "view": "traceguard.reviewTargets",
-        "contents": "TraceGuard helps you decide which supported code to read first. It does not replace manual review.\n[Build Review Queue](command:traceguard.startAudit)"
+        "contents": "$(checklist) TraceGuard helps you decide which supported code to read first. It does not replace manual review.\n[Build Review Queue](command:traceguard.startAudit)"
       },
       {
         "view": "traceguard.evidence",
-        "contents": "Select relevant code and record why it matters.\n[Add Selection to Audit Notes](command:traceguard.addEvidence)"
+        "contents": "$(bookmark) Select relevant code and record why it matters.\n[Add Selection to Audit Notes](command:traceguard.addEvidence)"
       }
     ],
     "menus": {
       "view/title": [
+        {
+          "command": "traceguard.copyAuditQueryMarkdown",
+          "when": "view == traceguard.auditQueries && traceguard.hasAuditQuery",
+          "group": "navigation@1"
+        },
+        {
+          "command": "traceguard.exportAnalysisDebugJson",
+          "when": "view == traceguard.auditQueries && traceguard.hasAuditQuery",
+          "group": "navigation@2"
+        },
+        {
+          "command": "traceguard.clearAuditQuery",
+          "when": "view == traceguard.auditQueries && traceguard.hasAuditQuery",
+          "group": "navigation@3"
+        },
+        {
+          "command": "traceguard.searchFindings",
+          "when": "view == traceguard.securityFindings",
+          "group": "navigation@1"
+        },
+        {
+          "command": "traceguard.exportSarif",
+          "when": "view == traceguard.securityFindings",
+          "group": "navigation@2"
+        },
         {
           "command": "traceguard.refreshAudit",
           "when": "view == traceguard.attackSurface || view == traceguard.securityFindings || view == traceguard.reviewTargets",
@@ -286,6 +436,31 @@
       ],
       "view/item/context": [
         {
+          "command": "traceguard.markFindingReviewed",
+          "when": "view == traceguard.securityFindings && viewItem == traceguard.finding",
+          "group": "traceguardFinding@1"
+        },
+        {
+          "command": "traceguard.markFindingFalsePositive",
+          "when": "view == traceguard.securityFindings && viewItem == traceguard.finding",
+          "group": "traceguardFinding@2"
+        },
+        {
+          "command": "traceguard.acceptFindingRisk",
+          "when": "view == traceguard.securityFindings && viewItem == traceguard.finding",
+          "group": "traceguardFinding@3"
+        },
+        {
+          "command": "traceguard.suppressFinding",
+          "when": "view == traceguard.securityFindings && viewItem == traceguard.finding",
+          "group": "traceguardFinding@4"
+        },
+        {
+          "command": "traceguard.resetFindingStatus",
+          "when": "view == traceguard.securityFindings && viewItem == traceguard.finding",
+          "group": "traceguardFinding@5"
+        },
+        {
           "command": "traceguard.markReviewed",
           "when": "view == traceguard.reviewTargets && viewItem == traceguard.auditItem",
           "group": "inline"
@@ -313,14 +488,39 @@
       ],
       "editor/context": [
         {
-          "command": "traceguard.traceSelectedSymbol",
+          "command": "traceguard.traceBackward",
           "when": "editorLangId == java || editorLangId == php || editorLangId == javascript || editorLangId == javascriptreact || editorLangId == typescript || editorLangId == typescriptreact || editorLangId == python || editorLangId == csharp || editorLangId == go",
-          "group": "traceguard@1"
+          "group": "traceguardQuery@1"
         },
         {
-          "command": "traceguard.traceCrossFileFlow",
+          "command": "traceguard.traceForward",
           "when": "editorLangId == java || editorLangId == php || editorLangId == javascript || editorLangId == javascriptreact || editorLangId == typescript || editorLangId == typescriptreact || editorLangId == python || editorLangId == csharp || editorLangId == go",
-          "group": "traceguard@2"
+          "group": "traceguardQuery@2"
+        },
+        {
+          "command": "traceguard.findCallers",
+          "when": "editorLangId == java || editorLangId == php || editorLangId == javascript || editorLangId == javascriptreact || editorLangId == typescript || editorLangId == typescriptreact || editorLangId == python || editorLangId == csharp || editorLangId == go",
+          "group": "traceguardQuery@3"
+        },
+        {
+          "command": "traceguard.findCallees",
+          "when": "editorLangId == java || editorLangId == php || editorLangId == javascript || editorLangId == javascriptreact || editorLangId == typescript || editorLangId == typescriptreact || editorLangId == python || editorLangId == csharp || editorLangId == go",
+          "group": "traceguardQuery@4"
+        },
+        {
+          "command": "traceguard.traceToEntry",
+          "when": "editorLangId == java || editorLangId == php || editorLangId == javascript || editorLangId == javascriptreact || editorLangId == typescript || editorLangId == typescriptreact || editorLangId == python || editorLangId == csharp || editorLangId == go",
+          "group": "traceguardQuery@5"
+        },
+        {
+          "command": "traceguard.showReachableSinks",
+          "when": "editorLangId == java || editorLangId == php || editorLangId == javascript || editorLangId == javascriptreact || editorLangId == typescript || editorLangId == typescriptreact || editorLangId == python || editorLangId == csharp || editorLangId == go",
+          "group": "traceguardQuery@6"
+        },
+        {
+          "command": "traceguard.explainAnalysisHere",
+          "when": "editorLangId == java || editorLangId == php || editorLangId == javascript || editorLangId == javascriptreact || editorLangId == typescript || editorLangId == typescriptreact || editorLangId == python || editorLangId == csharp || editorLangId == go",
+          "group": "traceguardQuery@7"
         },
         {
           "command": "traceguard.auditCurrentFunction",
@@ -406,6 +606,28 @@
           "maximum": 200,
           "scope": "resource",
           "description": "Maximum number of possible Source to Sink paths shown for one trace."
+        },
+        "traceguard.queryMaxNodes": {
+          "type": "integer",
+          "default": 250,
+          "minimum": 20,
+          "maximum": 1000,
+          "scope": "resource",
+          "description": "Maximum number of expandable steps returned by one interactive audit query. Truncated results are labeled explicitly."
+        },
+        "traceguard.astDifferentialMode": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "Run the AST and fallback pattern frontends together and record structural differences for migration diagnostics."
+        },
+        "traceguard.maxWorkspaceFiles": {
+          "type": "integer",
+          "default": 1000,
+          "minimum": 100,
+          "maximum": 8000,
+          "scope": "window",
+          "description": "Maximum source files in a full workspace index. Increase only after checking memory use on the target project; partial indexes never orphan review state."
         }
       }
     }
@@ -415,10 +637,22 @@
     "test:extension-host": "node scripts/run-extension-host-tests.js",
     "benchmark": "node scripts/performance-baseline.js",
     "check": "node scripts/check.js",
+    "verify:package": "node scripts/verify-packaged-runtime.js",
     "package": "vsce package"
   },
   "devDependencies": {
     "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^3.6.0"
+  },
+  "dependencies": {
+    "tree-sitter-c-sharp": "0.23.5",
+    "tree-sitter-go": "0.25.0",
+    "tree-sitter-java": "0.23.5",
+    "tree-sitter-javascript": "0.25.0",
+    "tree-sitter-php": "0.24.2",
+    "tree-sitter-python": "0.25.0",
+    "tree-sitter-typescript": "0.23.2",
+    "typescript": "6.0.3",
+    "web-tree-sitter": "0.26.12"
   }
 }

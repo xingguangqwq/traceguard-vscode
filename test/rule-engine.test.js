@@ -2,7 +2,7 @@
 
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { analyzeText } = require("../src/audit-analyzer");
+const { analyzeText, analyzeTextAsync } = require("../src/audit-analyzer");
 const { findSourceSinkPaths } = require("../src/flow-analyzer");
 const { evaluateFlowPaths } = require("../src/rules/rule-engine");
 const { GuardCapability } = require("../src/security/semantics");
@@ -19,13 +19,14 @@ export function proxy(req) {
   const ssrf = findings.find(item => item.ruleId === "potential-ssrf");
   assert.ok(ssrf);
   assert.equal(ssrf.severity, "high");
-  assert.equal(ssrf.confidence, "high");
+  assert.equal(ssrf.confidence, "low");
   assert.ok(ssrf.missingGuards.includes(GuardCapability.BLOCK_PRIVATE_IP));
   assert.equal(ssrf.kind, "finding");
 });
 
-test("guards are capabilities and do not erase the underlying flow", () => {
-  const analyses = [analyzeText(`
+test("guards are capabilities and do not erase the underlying flow", async () => {
+  const analyses = [await analyzeTextAsync(`
+import escapeHtml from "escape-html";
 export function render(req, res) {
   const value = req.query.value;
   const encoded = escapeHtml(value);
@@ -37,6 +38,91 @@ export function render(req, res) {
   assert.ok(finding);
   assert.ok(finding.observedGuards.includes(GuardCapability.OUTPUT_ENCODING));
   assert.ok(!finding.missingGuards.includes(GuardCapability.OUTPUT_ENCODING));
+});
+
+test("a same-named local sanitizer cannot suppress a finding", async () => {
+  const analysis = await analyzeTextAsync(`
+function escapeHtml(value) { return value; }
+export function render(req, res) {
+  const value = req.query.value;
+  const encoded = escapeHtml(value);
+  res.send(encoded);
+}`, "javascript", "C:\\repo\\fake-encoding.js", "fake-encoding.js");
+  const finding = evaluateFlowPaths(findSourceSinkPaths([analysis], {})).find(item => item.ruleId === "potential-unsafe-output");
+
+  assert.ok(finding);
+  assert.ok(!finding.observedGuards.includes(GuardCapability.OUTPUT_ENCODING));
+});
+
+test("transform guards protect only the value returned by the guard", async () => {
+  const analysis = await analyzeTextAsync(`
+import escapeHtml from "escape-html";
+export function render(req, res) {
+  const value = req.query.value;
+  escapeHtml(value);
+  res.send(value);
+}`, "javascript", "C:\\repo\\ignored-encoding.js", "ignored-encoding.js");
+  const finding = evaluateFlowPaths(findSourceSinkPaths([analysis], {})).find(item => item.ruleId === "potential-unsafe-output");
+
+  assert.ok(finding);
+  assert.ok(!finding.observedGuards.includes(GuardCapability.OUTPUT_ENCODING));
+  assert.ok(finding.missingGuards.includes(GuardCapability.OUTPUT_ENCODING));
+  assert.ok(finding.guardHints.some(hint => hint.capabilities.includes(GuardCapability.OUTPUT_ENCODING)));
+  assert.ok(finding.guardHints.some(hint => /return value|produced by the guard/.test(hint.reason)));
+});
+
+test("receiver-scoped SQL guards cannot suppress a different statement", async () => {
+  const analysis = await analyzeTextAsync(`
+class Search {
+  void run(HttpServletRequest request, PreparedStatement safe, Statement unsafe) {
+    String user = request.getParameter("user");
+    safe.setString(1, user);
+    unsafe.executeQuery("SELECT * FROM users WHERE name='" + user + "'");
+  }
+}`, "java", "C:\\repo\\Search.java", "Search.java");
+  const finding = evaluateFlowPaths(findSourceSinkPaths([analysis], {})).find(item => item.ruleId === "potential-sql-injection");
+
+  assert.ok(finding);
+  assert.ok(!finding.observedGuards.includes(GuardCapability.SQL_PARAMETERIZATION));
+  assert.ok(finding.guardHints.some(hint => /receivers/.test(hint.reason)));
+});
+
+test("parameter binding cannot sanitize SQL that still contains the raw value", async () => {
+  const analysis = await analyzeTextAsync(`
+class Search {
+  void run(HttpServletRequest request, PreparedStatement statement) {
+    String user = request.getParameter("user");
+    statement.setString(1, user);
+    statement.executeQuery("SELECT * FROM users WHERE name='" + user + "'");
+  }
+}`, "java", "C:\\repo\\RawPreparedQuery.java", "RawPreparedQuery.java");
+  const finding = evaluateFlowPaths(findSourceSinkPaths([analysis], {})).find(item => item.ruleId === "potential-sql-injection");
+
+  assert.ok(finding);
+  assert.ok(!finding.observedGuards.includes(GuardCapability.SQL_PARAMETERIZATION));
+  assert.ok(finding.guardHints.some(hint => /raw value/.test(hint.reason)));
+});
+
+test("path confinement requires a trusted root operand", async () => {
+  const untrusted = await analyzeTextAsync(`
+export function read(req) {
+  const root = req.query.root;
+  const candidate = path.resolve(root, req.query.name);
+  if (candidate.startsWith(root)) return fs.readFile(candidate);
+}`, "javascript", "C:\\repo\\untrusted-root.js", "untrusted-root.js");
+  const trusted = await analyzeTextAsync(`
+export function read(req) {
+  const root = "/srv/files";
+  const candidate = path.resolve(root, req.query.name);
+  if (candidate.startsWith(root)) return fs.readFile(candidate);
+}`, "javascript", "C:\\repo\\trusted-root.js", "trusted-root.js");
+  const unsafeFinding = evaluateFlowPaths(findSourceSinkPaths([untrusted], {})).find(item => item.ruleId === "potential-path-traversal");
+  const safeFinding = evaluateFlowPaths(findSourceSinkPaths([trusted], {})).find(item => item.ruleId === "potential-path-traversal");
+
+  assert.ok(unsafeFinding);
+  assert.ok(!unsafeFinding.observedGuards.includes(GuardCapability.PATH_CONFINEMENT));
+  assert.ok(unsafeFinding.guardHints.some(hint => /trusted/.test(hint.reason)));
+  assert.equal(safeFinding, undefined);
 });
 
 test("constant framework responses are not findings while untrusted redirects stay flagged", () => {
@@ -74,8 +160,8 @@ app.get("/health", (req, res) => {
   assert.equal(evaluateFlowPaths(findSourceSinkPaths([constant], {})).length, 0);
 });
 
-test("Python parameterized SQL keeps the flow but suppresses the injection rule", () => {
-  const analysis = analyzeText(`
+test("AST-verified Python parameterized SQL keeps the flow but suppresses the injection rule", async () => {
+  const analysis = await analyzeTextAsync(`
 @app.post("/save")
 def save():
     name = request.args.get("name")
@@ -87,6 +173,21 @@ def save():
   assert.ok(sqlPath);
   assert.ok(sqlPath.guardCapabilities.includes(GuardCapability.SQL_PARAMETERIZATION));
   assert.ok(!evaluateFlowPaths(paths).some(item => item.ruleId === "potential-sql-injection"));
+});
+
+test("regex-only parameterization evidence cannot suppress a finding", () => {
+  const analysis = analyzeText(`
+@app.post("/save")
+def save():
+    name = request.args.get("name")
+    cursor.execute("INSERT INTO users (name) VALUES (?)", (name,))
+`, "python", "C:\\repo\\fallback.py", "fallback.py");
+  const path = findSourceSinkPaths([analysis], {}).find(item => item.category === "database");
+  const finding = evaluateFlowPaths([path]).find(item => item.ruleId === "potential-sql-injection");
+
+  assert.ok(finding);
+  assert.ok(!path.guardCapabilities.includes(GuardCapability.SQL_PARAMETERIZATION));
+  assert.ok(path.guardHints.some(hint => /trusted semantic model/.test(hint.reason)));
 });
 
 test("same-rule paths ending at one sink are consolidated", () => {
@@ -115,7 +216,7 @@ def preview():
   const findings = evaluateFlowPaths(findSourceSinkPaths([analysis], {}));
   const ssrf = findings.find(item => item.ruleId === "potential-ssrf" && item.line === 5);
   assert.ok(ssrf);
-  assert.equal(ssrf.confidence, "high");
+  assert.equal(ssrf.confidence, "low");
 });
 
 test("unrelated PHP superglobal fields do not create duplicate paths", () => {

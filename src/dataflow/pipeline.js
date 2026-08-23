@@ -8,7 +8,7 @@ function runDataflowAnalysis(analyses, options = {}) {
   const paths = [...result];
   return {
     paths,
-    findings: evaluateFlowPaths(paths),
+    findings: evaluateFlowPaths(paths, undefined, options),
     metadata: {
       truncated: Boolean(result.truncated),
       explorationTruncated: Boolean(result.explorationTruncated),
