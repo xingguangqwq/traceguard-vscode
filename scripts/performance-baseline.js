@@ -1,7 +1,10 @@
 "use strict";
 
+const path = require("node:path");
 const { performance } = require("node:perf_hooks");
 const { DataflowWorkerClient } = require("../src/dataflow/worker-client");
+
+const benchmarkRoot = path.join(path.parse(process.cwd()).root, "traceguard-benchmark");
 
 const requested = Number(process.argv.find(argument => argument.startsWith("--files="))?.split("=")[1] || 200);
 const fileCount = Math.min(5000, Math.max(1, Number.isFinite(requested) ? Math.floor(requested) : 200));
@@ -59,14 +62,14 @@ async function main() {
 function buildFixture(name, count) {
   if (name === "typescript-dependents") {
     const provider = {
-      absolutePath: "C:\\benchmark\\provider.ts",
+      absolutePath: path.join(benchmarkRoot, "provider.ts"),
       relativePath: "provider.ts",
       language: "typescript",
       version: "string",
       text: "export function consume(callback: (value: string) => void) { callback('safe'); }",
     };
     const consumers = Array.from({ length: Math.max(1, count - 1) }, (_, index) => ({
-      absolutePath: `C:\\benchmark\\consumer-${index}.ts`,
+      absolutePath: path.join(benchmarkRoot, `consumer-${index}.ts`),
       relativePath: `consumer-${index}.ts`,
       language: "typescript",
       version: "1",
@@ -84,7 +87,7 @@ function buildFixture(name, count) {
     };
   }
   const files = Array.from({ length: count }, (_, index) => ({
-    absolutePath: `C:\\benchmark\\route-${index}.js`,
+    absolutePath: path.join(benchmarkRoot, `route-${index}.js`),
     relativePath: `route-${index}.js`,
     language: "javascript",
     version: "1",
