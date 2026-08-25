@@ -15,18 +15,29 @@ class DataflowWorkerClient {
     this.initialized = false;
     this.needsReplay = false;
     this.files = new Map();
+    this.unsavedFiles = new Map();
+    this.fileLoader = options.fileLoader;
+    this.pendingReplayMetrics = undefined;
     this.workspaceOptions = {};
-    this.timeoutMs = Math.max(100, options.timeoutMs || 30_000);
+    this.queryTimeoutMs = normalizeTimeout(options.queryTimeoutMs ?? options.timeoutMs, 30_000);
+    this.indexTimeoutMs = normalizeTimeout(options.indexTimeoutMs, 300_000);
     this.workerPath = options.workerPath || path.join(__dirname, "worker.js");
   }
 
   analyze(analyses, options = {}) {
-    return this._request("analyze", { analyses, options });
+    return this._request("analyze", { analyses, options }, { timeoutMs: this.indexTimeoutMs });
   }
 
   async initializeWorkspace(files, options = {}) {
-    const result = await this._request("initializeWorkspace", { files, options }, { skipReplay: true });
-    this.files = new Map((files || []).map(file => [normalizePath(file.absolutePath), { ...file }]));
+    const result = await this._request("initializeWorkspace", { files, options }, {
+      skipReplay: true,
+      timeoutMs: this.indexTimeoutMs,
+    });
+    this.files = new Map((files || []).map(file => [normalizePath(file.absolutePath), replayMetadata(file)]));
+    this.unsavedFiles = new Map((files || []).filter(file => file.unsaved).map(file => [normalizePath(file.absolutePath), { ...file }]));
+    if (!this.fileLoader) {
+      for (const file of files || []) this.unsavedFiles.set(normalizePath(file.absolutePath), { ...file });
+    }
     this.workspaceOptions = { ...options };
     this.initialized = true;
     this.needsReplay = false;
@@ -40,7 +51,9 @@ class DataflowWorkerClient {
     }
     const key = normalizePath(file.absolutePath);
     const result = await this._request("updateFile", { file, options }, { cancelKey: `update:${key}` });
-    this.files.set(key, { ...file });
+    this.files.set(key, replayMetadata(file));
+    if (file.unsaved || !this.fileLoader) this.unsavedFiles.set(key, { ...file });
+    else this.unsavedFiles.delete(key);
     return result;
   }
 
@@ -48,7 +61,10 @@ class DataflowWorkerClient {
     if (!this.initialized) return { removed: false, affectedFiles: [] };
     const key = normalizePath(absolutePath);
     const result = await this._request("removeFile", { absolutePath, options }, { cancelKey: `remove:${key}` });
-    if (result.removed) this.files.delete(key);
+    if (result.removed) {
+      this.files.delete(key);
+      this.unsavedFiles.delete(key);
+    }
     return result;
   }
 
@@ -85,6 +101,10 @@ class DataflowWorkerClient {
     return this._request("queryAudit", { options }, { cancelKey: "audit-query" });
   }
 
+  setIndexTimeoutMs(timeoutMs) {
+    this.indexTimeoutMs = normalizeTimeout(timeoutMs, 300_000);
+  }
+
   async dispose() {
     this.disposed = true;
     const error = new Error("TraceGuard dataflow worker was stopped.");
@@ -111,7 +131,12 @@ class DataflowWorkerClient {
     if (this.disposed) throw new Error("TraceGuard dataflow worker is disposed.");
     try {
       const worker = await this._ensureReady(Boolean(control.skipReplay));
-      return await this._post(worker, { type, ...payload }, control.cancelKey);
+      const result = await this._post(worker, { type, ...payload }, control);
+      if (this.pendingReplayMetrics && result && typeof result === "object") {
+        result.metadata = { ...(result.metadata || {}), ...this.pendingReplayMetrics };
+        this.pendingReplayMetrics = undefined;
+      }
+      return result;
     } catch (error) {
       if (retry && !this.disposed && isRetriableWorkerFailure(error)) {
         this.needsReplay = this.initialized && type !== "initializeWorkspace";
@@ -126,21 +151,52 @@ class DataflowWorkerClient {
     if (this.readyPromise) return this.readyPromise;
     this.readyPromise = (async () => {
       const worker = this._spawnWorker();
-      if (this.needsReplay && !skipReplay) {
-        await this._post(worker, {
-          type: "initializeWorkspace",
-          files: [...this.files.values()],
-          options: this.workspaceOptions,
-        });
-        this.needsReplay = false;
+      try {
+        if (this.needsReplay && !skipReplay) {
+          const replayStartedAt = performance.now();
+          this.pendingReplayMetrics = undefined;
+          const files = await this._materializeReplayFiles();
+          const replay = await this._post(worker, {
+            type: "initializeWorkspace",
+            files,
+            options: this.workspaceOptions,
+          }, { timeoutMs: this.indexTimeoutMs });
+          this.pendingReplayMetrics = {
+            workerReplayMs: roundMetric(performance.now() - replayStartedAt),
+            workerReplayFiles: files.length,
+            workerReplayRssBytes: replay?.metadata?.workerRssBytes,
+            workerReplayPeakRssBytes: replay?.metadata?.workerPeakRssBytes,
+          };
+          this.needsReplay = false;
+        }
+        return worker;
+      } catch (error) {
+        this._fail(worker, error);
+        void worker.terminate();
+        throw error;
       }
-      return worker;
     })();
     try {
       return await this.readyPromise;
     } finally {
       this.readyPromise = undefined;
     }
+  }
+
+  async _materializeReplayFiles() {
+    const materialized = [];
+    for (const [key, metadata] of [...this.files]) {
+      const unsaved = this.unsavedFiles.get(key);
+      const file = unsaved || (this.fileLoader ? await this.fileLoader({ ...metadata }) : undefined);
+      if (!file || typeof file.text !== "string") {
+        this.files.delete(key);
+        this.unsavedFiles.delete(key);
+        continue;
+      }
+      materialized.push({ ...metadata, ...file });
+      this.files.set(key, replayMetadata({ ...metadata, ...file }));
+    }
+    return materialized;
   }
 
   _spawnWorker() {
@@ -170,20 +226,22 @@ class DataflowWorkerClient {
     return worker;
   }
 
-  _post(worker, message, cancelKey) {
+  _post(worker, message, control = {}) {
+    const cancelKey = control.cancelKey;
     if (cancelKey) this._supersede(cancelKey, worker);
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const timeoutMs = control.timeoutMs === undefined ? this.queryTimeoutMs : control.timeoutMs;
+      const timer = timeoutMs > 0 ? setTimeout(() => {
         const request = this.pending.get(id);
         if (!request) return;
         this._finishRequest(id, request);
-        const error = new Error(`TraceGuard analysis worker timed out after ${this.timeoutMs} ms.`);
+        const error = new Error(`TraceGuard analysis worker timed out after ${timeoutMs} ms while handling ${message.type}.`);
         error.code = "WORKER_TIMEOUT";
         reject(error);
         this._fail(worker, error);
         void worker.terminate();
-      }, this.timeoutMs);
+      }, timeoutMs) : undefined;
       const request = { resolve, reject, timer, cancelKey };
       this.pending.set(id, request);
       if (cancelKey) this.pendingByKey.set(cancelKey, id);
@@ -208,7 +266,7 @@ class DataflowWorkerClient {
   }
 
   _finishRequest(id, request) {
-    clearTimeout(request.timer);
+    if (request.timer) clearTimeout(request.timer);
     this.pending.delete(id);
     if (request.cancelKey && this.pendingByKey.get(request.cancelKey) === id) this.pendingByKey.delete(request.cancelKey);
   }
@@ -216,6 +274,7 @@ class DataflowWorkerClient {
   _fail(worker, error) {
     if (this.worker !== worker) return;
     this.worker = undefined;
+    this.pendingReplayMetrics = undefined;
     this.needsReplay = this.initialized;
     this._rejectPending(error);
   }
@@ -227,6 +286,21 @@ class DataflowWorkerClient {
     }
     this.pendingByKey.clear();
   }
+}
+
+function normalizeTimeout(value, fallback) {
+  if (value === 0) return 0;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric >= 100 ? Math.floor(numeric) : fallback;
+}
+
+function replayMetadata(file = {}) {
+  const { text: _text, analysis: _analysis, ...metadata } = file;
+  return metadata;
+}
+
+function roundMetric(value) {
+  return Math.round(Number(value) * 100) / 100;
 }
 
 function emptyDelta() {

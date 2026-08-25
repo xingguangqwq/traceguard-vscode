@@ -1,6 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const path = require("node:path");
 const test = require("node:test");
 const { analyzeText } = require("../src/audit-analyzer");
 const { DataflowWorkerClient, isRetriableWorkerFailure } = require("../src/dataflow/worker-client");
@@ -30,6 +31,37 @@ test("worker timeouts and analysis errors fail once instead of repeating a stuck
   assert.equal(isRetriableWorkerFailure({ code: "WORKER_REQUEST_ERROR" }), false);
   assert.equal(isRetriableWorkerFailure({ code: "WORKER_EXIT" }), true);
   assert.equal(isRetriableWorkerFailure({ code: "WORKER_ERROR" }), true);
+});
+
+test("workspace initialization and replay use an independent long timeout", async () => {
+  const client = new DataflowWorkerClient({
+    workerPath: path.join(__dirname, "worker-replay-fixture.js"),
+    queryTimeoutMs: 100,
+    indexTimeoutMs: 750,
+  });
+  try {
+    await client.initializeWorkspace([], { delayMs: 180 });
+    await assert.rejects(client.queryPaths({ delayMs: 180 }), error => error.code === "WORKER_TIMEOUT" && /queryPaths/.test(error.message));
+    assert.equal(client.worker, undefined, "a timed-out worker is discarded so a manual retry can recover");
+    const recovered = await client.queryPaths();
+    assert.equal(recovered.initialized, true, "the retry first replays the workspace with the index timeout");
+  } finally {
+    await client.dispose();
+  }
+});
+
+test("an index timeout of zero disables the hard timeout without changing query limits", async () => {
+  const client = new DataflowWorkerClient({
+    workerPath: path.join(__dirname, "worker-replay-fixture.js"),
+    queryTimeoutMs: 20,
+    indexTimeoutMs: 0,
+  });
+  try {
+    const initialized = await client.initializeWorkspace([], { delayMs: 45 });
+    assert.equal(initialized.initialized, true);
+  } finally {
+    await client.dispose();
+  }
 });
 
 test("persistent worker updates one file and returns only analysis/finding deltas", async () => {
@@ -85,6 +117,67 @@ test("persistent worker replays workspace state after a crash", async () => {
     const result = await client.updateFile({ ...file, version: "two", text: "export function proxy(req) { return req.query.url; }" });
     assert.equal(result.analysis.relativePath, "proxy.js");
     assert.notEqual(client.worker, crashedWorker);
+  } finally {
+    await client.dispose();
+  }
+});
+
+test("worker replay keeps only metadata, reloads disk, and preserves unsaved editor text", async () => {
+  let diskText = "export function proxy(req) { return req.query.url; }";
+  const client = new DataflowWorkerClient({
+    fileLoader: async metadata => ({ ...metadata, text: diskText, version: `disk-${diskText.length}`, unsaved: false }),
+  });
+  const file = {
+    absolutePath: "C:\\repo\\proxy.js",
+    relativePath: "proxy.js",
+    language: "javascript",
+    version: "one",
+    text: "export function proxy(req) { fetch(req.query.url); }",
+  };
+  try {
+    await client.initializeWorkspace([file]);
+    const metadata = client.files.get("c:/repo/proxy.js");
+    assert.equal(metadata.text, undefined);
+    assert.equal(client.unsavedFiles.size, 0);
+
+    await client.worker.terminate();
+    const diskReplay = await client.queryPaths();
+    assert.equal(diskReplay.findings.some(finding => finding.ruleId === "potential-ssrf"), false);
+    assert.ok(diskReplay.metadata.workerReplayMs >= 0);
+    assert.equal(diskReplay.metadata.workerReplayFiles, 1);
+    assert.ok(diskReplay.metadata.workerReplayRssBytes > 0);
+
+    await client.updateFile({ ...file, version: "unsaved", unsaved: true, text: "export function proxy(req) { fetch(req.query.url); }" });
+    assert.equal(client.unsavedFiles.size, 1);
+    diskText = "export function proxy(req) { return req.query.url; }";
+    await client.worker.terminate();
+    const editorReplay = await client.queryPaths();
+    assert.ok(editorReplay.findings.some(finding => finding.ruleId === "potential-ssrf"));
+  } finally {
+    await client.dispose();
+  }
+});
+
+test("a failed workspace replay discards the uninitialized worker before the next request", async () => {
+  const client = new DataflowWorkerClient({ workerPath: path.join(__dirname, "worker-replay-fixture.js") });
+  const file = {
+    absolutePath: "C:\\repo\\proxy.js",
+    relativePath: "proxy.js",
+    language: "javascript",
+    version: "one",
+    text: "export function proxy(req) { fetch(req.query.url); }",
+  };
+  try {
+    await client.initializeWorkspace([file]);
+    await client.worker.terminate();
+    client.workspaceOptions = { failReplay: true };
+
+    await assert.rejects(client.queryPaths(), /simulated replay failure/);
+    assert.equal(client.worker, undefined, "the failed replay worker must not remain available");
+
+    client.workspaceOptions = {};
+    const result = await client.queryPaths();
+    assert.equal(result.initialized, true, "the replacement worker receives a fresh workspace replay");
   } finally {
     await client.dispose();
   }

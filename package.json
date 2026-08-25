@@ -2,7 +2,7 @@
   "name": "traceguard-vscode",
   "displayName": "TraceGuard Local SAST",
   "description": "Local, incremental and explainable SAST focused on Java, PHP and Python backend code review.",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "publisher": "traceguard",
   "license": "MIT",
   "repository": {
@@ -628,6 +628,14 @@
           "maximum": 8000,
           "scope": "window",
           "description": "Maximum source files in a full workspace index. Increase only after checking memory use on the target project; partial indexes never orphan review state."
+        },
+        "traceguard.indexTimeoutSeconds": {
+          "type": "integer",
+          "default": 300,
+          "minimum": 0,
+          "maximum": 3600,
+          "scope": "window",
+          "description": "Timeout for full workspace initialization and Worker replay. Use 0 to disable the hard timeout; interactive queries keep their independent 30-second timeout."
         }
       }
     }
@@ -636,6 +644,12 @@
     "test": "node --test test/*.test.js",
     "test:extension-host": "node scripts/run-extension-host-tests.js",
     "benchmark": "node scripts/performance-baseline.js",
+    "benchmark:java": "node scripts/performance-baseline.js --fixture=java-backend --files=1000 --max-incremental-ms=500 --max-rss-mib=500",
+    "benchmark:php": "node scripts/performance-baseline.js --fixture=php-backend --files=1000 --max-incremental-ms=500 --max-rss-mib=500",
+    "benchmark:python": "node scripts/performance-baseline.js --fixture=python-backend --files=1000 --max-incremental-ms=500 --max-rss-mib=500",
+    "benchmark:stress": "node scripts/performance-baseline.js --fixture=java-backend --files=8000 --runs=1 --no-incremental-gate",
+    "eval": "node scripts/evaluate-corpus.js",
+    "eval:compare": "node scripts/evaluate-corpus.js --baseline=eval-corpus/baseline-0.9.0.json",
     "check": "node scripts/check.js",
     "verify:package": "node scripts/verify-packaged-runtime.js",
     "package": "vsce package"

@@ -12,6 +12,7 @@ const queued = [];
 let draining = false;
 let drainScheduled = false;
 let activeRequestId;
+let peakRssBytes = 0;
 
 parentPort.on("message", message => {
   if (message.type === "cancel") {
@@ -50,6 +51,7 @@ async function drainQueue() {
 }
 
 async function dispatch(message) {
+  const startedAt = performance.now();
   try {
     if (cancelled.delete(message.id)) return;
     let result;
@@ -62,6 +64,17 @@ async function dispatch(message) {
     else if (message.type === "queryPaths") result = engine.queryPaths(message.options);
     else if (message.type === "queryAudit") result = engine.queryAudit(message.options);
     else throw new Error(`Unknown TraceGuard worker request: ${message.type}`);
+    if (result && typeof result === "object") {
+      const memory = process.memoryUsage();
+      peakRssBytes = Math.max(peakRssBytes, memory.rss);
+      result.metadata = {
+        ...(result.metadata || {}),
+        workerRequestMs: roundMetric(performance.now() - startedAt),
+        workerRssBytes: memory.rss,
+        workerPeakRssBytes: peakRssBytes,
+        workerHeapUsedBytes: memory.heapUsed,
+      };
+    }
     if (!cancelled.delete(message.id)) parentPort.postMessage({ id: message.id, result });
   } catch (error) {
     parentPort.postMessage({
@@ -69,4 +82,8 @@ async function dispatch(message) {
       error: { message: String(error?.message || error), stack: String(error?.stack || "") },
     });
   }
+}
+
+function roundMetric(value) {
+  return Math.round(value * 100) / 100;
 }

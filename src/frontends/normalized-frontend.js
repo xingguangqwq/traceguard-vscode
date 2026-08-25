@@ -111,8 +111,7 @@ function attachFallbackGuardBindings(operations) {
       inputs: guard.inputs.map(value => value.name),
       output: call?.output?.name,
       receiver: call?.call?.receiver,
-      trustedOperands: (call?.call?.arguments || []).map((expression, index) => ({ expression, index }))
-        .filter(item => /^\s*(?:["'`].*["'`]|\d+)\s*$/.test(item.expression)),
+      trustedOperands: [],
       semanticVerification: "unverified",
       ...association,
     };

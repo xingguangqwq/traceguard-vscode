@@ -4,7 +4,7 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 const { analyzeTextAsync } = require("../src/audit-analyzer");
 const { runDataflowAnalysis } = require("../src/dataflow/pipeline");
-const { SinkKind } = require("../src/security/semantics");
+const { GuardCapability, SinkKind } = require("../src/security/semantics");
 const { SEMANTIC_MODELS, resolveSemanticCall } = require("../src/security/semantic-models");
 
 test("semantic models expose stable call and taint contracts", () => {
@@ -159,6 +159,135 @@ class Search {
 }`, "java", "C:\\repo\\SafeStore.java", "SafeStore.java");
 
   assert.equal(runDataflowAnalysis([analysis]).findings.some(item => item.ruleId === "potential-sql-injection"), false);
+});
+
+test("Java treats dynamic SQL passed to prepareStatement as the sink instead of a sanitizer", async () => {
+  const vulnerable = await analyzeTextAsync(`
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+class Search {
+  void run(HttpServletRequest request, Connection connection) throws Exception {
+    String sql = request.getParameter("sql");
+    PreparedStatement statement = connection.prepareStatement(sql);
+    statement.executeQuery();
+  }
+}`, "java", "C:\\repo\\Search.java", "Search.java");
+  const safe = await analyzeTextAsync(`
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+class Search {
+  void run(HttpServletRequest request, Connection connection) throws Exception {
+    String value = request.getParameter("value");
+    PreparedStatement statement = connection.prepareStatement("select * from users where name = ?");
+    statement.setString(1, value);
+    statement.executeQuery();
+  }
+}`, "java", "C:\\repo\\SafeSearch.java", "SafeSearch.java");
+  const vulnerableFlow = runDataflowAnalysis([vulnerable]);
+  const safeFlow = runDataflowAnalysis([safe]);
+  const finding = vulnerableFlow.findings.find(item => item.ruleId === "potential-sql-injection");
+
+  assert.ok(finding);
+  assert.equal(finding.path.sink.semanticModelId, "java.sql.Connection.prepareStatement");
+  assert.equal(safeFlow.findings.some(item => item.ruleId === "potential-sql-injection"), false);
+});
+
+test("unknown database receivers remain LOW review candidates while proven safe receivers are rejected", async () => {
+  const samples = [
+    ["php", "unknown.php", `<?php
+function run($db) {
+  $sql = $_GET["sql"];
+  return $db->query($sql);
+}`],
+    ["python", "unknown.py", `def run(request, db):
+    sql = request.args.get("sql")
+    return db.execute(sql)`],
+    ["java", "Unknown.java", `class Unknown {
+  void run(HttpServletRequest request, Object db) {
+    String sql = request.getParameter("sql");
+    db.executeQuery(sql);
+  }
+}`],
+  ];
+  for (const [language, file, source] of samples) {
+    const analysis = await analyzeTextAsync(source, language, `C:\\repo\\${file}`, file);
+    const result = runDataflowAnalysis([analysis]);
+    const finding = result.findings.find(item => item.ruleId === "potential-sql-injection");
+    assert.equal(finding?.confidence, "low", `${language} silently discarded its unknown receiver`);
+    assert.equal(finding?.path.sink.semanticVerification, "candidate", `${language} did not expose its candidate status`);
+    assert.ok(finding?.explanation.heuristics.some(item => /receiver type could not be resolved/i.test(item)));
+  }
+
+  const safePhp = await analyzeTextAsync(`<?php
+class BusinessStore { function query($value) { return $value; } }
+function run(BusinessStore $db) {
+  $sql = $_GET["sql"];
+  return $db->query($sql);
+}`, "php", "C:\\repo\\safe.php", "safe.php");
+  assert.equal(runDataflowAnalysis([safePhp]).findings.some(item => item.ruleId === "potential-sql-injection"), false);
+});
+
+test("generic AST frontends discard guards rejected by receiver type resolution", async () => {
+  const cases = [
+    ["java", "Rejected.java", "normalize", `class Rejected { void run(FakePath path, String input) { String safe = path.normalize(input); new File(safe); } }`],
+    ["php", "rejected.php", "realpath", `<?php class Rejected { function run(FakePath $path, string $input) { $safe = $path->realpath($input); file_get_contents($safe); } }`],
+    ["python", "rejected.py", "resolve", `def run(path: FakePath, value):\n    safe = path.resolve(value)\n    open(safe)`],
+    ["csharp", "Rejected.cs", "GetFullPath", `class Rejected { void Run(FakePath Path, string input) { var safe = Path.GetFullPath(input); File.ReadAllText(safe); } }`],
+    ["go", "rejected.go", "Clean", `package main\nfunc run(filepath FakePath, input string) { safe := filepath.Clean(input); os.ReadFile(safe) }`],
+  ];
+
+  for (const [language, file, callName, source] of cases) {
+    const semanticModels = [{
+      id: `test.${language}.trusted-path`,
+      custom: true,
+      languages: [language],
+      moduleNames: [],
+      qualifiedNames: [],
+      receiverTypes: ["TrustedPath"],
+      callNames: [callName],
+      role: "guard",
+      taintArguments: [0],
+      returnsTaint: false,
+      guardCapabilities: [GuardCapability.PATH_CANONICALIZATION],
+      applicableSinkKinds: [SinkKind.FILE_ACCESS],
+      callForms: ["instance-method"],
+    }];
+    const analysis = await analyzeTextAsync(source, language, `C:\\repo\\${file}`, file, { semanticModels });
+    const guards = analysis.ir.functions.flatMap(fn => fn.operations).filter(operation => operation.kind === "guard");
+    assert.ok(!guards.some(guard => guard.metadata.semanticVerification === "rejected"), `${language} retained a rejected guard`);
+    assert.ok(!guards.some(guard => guard.call?.function === callName), `${language} treated the rejected lookalike as a guard`);
+  }
+});
+
+test("generic guard models trust only AST-proven literal operands", async () => {
+  const semanticModels = [{
+    id: "test.java.path-confinement",
+    custom: true,
+    customUnqualified: true,
+    languages: ["java"],
+    moduleNames: [],
+    qualifiedNames: [],
+    receiverTypes: [],
+    callNames: ["withinRoot"],
+    role: "guard",
+    taintArguments: [0],
+    returnsTaint: false,
+    guardCapabilities: [GuardCapability.PATH_CONFINEMENT],
+    applicableSinkKinds: [SinkKind.FILE_ACCESS],
+    callForms: ["function"],
+  }];
+  const analysis = await analyzeTextAsync(`
+class Paths {
+  boolean unsafe(String value, String suffix) { return withinRoot(value, "/srv/" + suffix + ""); }
+  boolean safe(String value) { return withinRoot(value, "/srv/uploads"); }
+}`, "java", "C:\\repo\\Paths.java", "Paths.java", { semanticModels });
+  const guards = analysis.ir.functions.flatMap(fn => fn.operations)
+    .filter(operation => operation.semantic.modelId === "test.java.path-confinement");
+  const unsafe = guards.find(guard => guard.location.line === 3);
+  const safe = guards.find(guard => guard.location.line === 4);
+
+  assert.deepEqual(unsafe.metadata.guardBinding.trustedOperands, []);
+  assert.deepEqual(safe.metadata.guardBinding.trustedOperands.map(item => item.index), [1]);
 });
 
 test("Python pickle calls receive a syntax-verified deserialization model", async () => {

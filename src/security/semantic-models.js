@@ -87,6 +87,119 @@ const SEMANTIC_MODELS = Object.freeze([
     callForms: ["global"],
     global: true,
   }),
+  sourceModel({
+    id: "php.framework.request-input",
+    languages: ["php"],
+    moduleNames: ["Illuminate\\Http", "Symfony\\Component\\HttpFoundation"],
+    qualifiedNames: ["Request.input", "Request.get", "Request.query", "Request.post", "ParameterBag.get", "InputBag.get"],
+    receiverTypes: ["Request", "Illuminate\\Http\\Request", "Symfony\\Component\\HttpFoundation\\Request", "ParameterBag", "InputBag"],
+    callNames: ["input", "get", "query", "post", "string", "integer", "boolean"],
+    taintArguments: [],
+    sourceKind: SourceKind.HTTP_INPUT,
+    callForms: ["instance-method"],
+  }),
+  sinkModel({
+    id: "php.pdo.dynamic-query",
+    languages: ["php"],
+    moduleNames: ["PDO"],
+    qualifiedNames: ["PDO.query", "PDO.exec", "PDO.prepare"],
+    receiverTypes: ["PDO"],
+    callNames: ["query", "exec", "prepare"],
+    taintArguments: [0],
+    sinkKind: SinkKind.SQL_QUERY,
+    category: "database",
+    callForms: ["instance-method"],
+  }),
+  sinkModel({
+    id: "php.laravel.dynamic-query",
+    languages: ["php"],
+    moduleNames: ["Illuminate\\Support\\Facades\\DB", "Illuminate\\Database"],
+    qualifiedNames: ["DB.select", "DB.statement", "DB.unprepared", "Builder.selectRaw", "Builder.whereRaw", "Builder.orderByRaw", "Builder.havingRaw"],
+    receiverTypes: ["DB", "Connection", "Builder", "Eloquent\\Builder"],
+    callNames: ["select", "statement", "unprepared", "selectRaw", "whereRaw", "orderByRaw", "havingRaw"],
+    taintArguments: [0],
+    sinkKind: SinkKind.SQL_QUERY,
+    category: "database",
+    callForms: ["static-method", "instance-method"],
+  }),
+  sinkModel({
+    id: "php.runtime.command",
+    languages: ["php"],
+    moduleNames: [],
+    qualifiedNames: ["system", "exec", "shell_exec", "passthru", "popen", "proc_open", "pcntl_exec"],
+    receiverTypes: [],
+    callNames: ["system", "exec", "shell_exec", "passthru", "popen", "proc_open", "pcntl_exec"],
+    taintArguments: [0],
+    sinkKind: SinkKind.COMMAND_EXEC,
+    category: "command",
+    callForms: ["function"],
+    global: true,
+  }),
+  sinkModel({
+    id: "python.os.command",
+    languages: ["python"],
+    moduleNames: ["os"],
+    qualifiedNames: ["os.system", "os.popen"],
+    receiverTypes: [],
+    callNames: ["system", "popen"],
+    taintArguments: [0],
+    sinkKind: SinkKind.COMMAND_EXEC,
+    category: "command",
+    callForms: ["module-function"],
+  }),
+  sinkModel({
+    id: "python.subprocess.command",
+    languages: ["python"],
+    moduleNames: ["subprocess"],
+    qualifiedNames: ["subprocess.run", "subprocess.Popen", "subprocess.call", "subprocess.check_output", "subprocess.check_call"],
+    receiverTypes: [],
+    callNames: ["run", "Popen", "call", "check_output", "check_call"],
+    taintArguments: [0],
+    sinkKind: SinkKind.COMMAND_EXEC,
+    category: "command",
+    callForms: ["module-function"],
+    argumentPolicy: "python-subprocess",
+  }),
+  sinkModel({
+    id: "python.dbapi.dynamic-query",
+    languages: ["python"],
+    moduleNames: ["sqlite3", "sqlalchemy", "sqlalchemy.orm", "sqlalchemy.ext.asyncio", "django.db"],
+    qualifiedNames: ["Cursor.execute", "Cursor.executemany", "Connection.execute", "Session.execute"],
+    receiverTypes: ["Cursor", "Connection", "Session", "AsyncSession"],
+    callNames: ["execute", "executemany"],
+    taintArguments: [0],
+    taintRestFrom: 0,
+    sinkKind: SinkKind.SQL_QUERY,
+    category: "database",
+    callForms: ["instance-method"],
+    requiresModuleIdentity: true,
+  }),
+  sinkModel({
+    id: "python.django.raw-query",
+    languages: ["python"],
+    moduleNames: ["django.db", "django.db.models"],
+    qualifiedNames: ["django.db.models.QuerySet.raw", "django.db.models.RawQuerySet.raw", "django.db.models.Manager.raw"],
+    receiverTypes: ["django.db.models.QuerySet", "django.db.models.RawQuerySet", "django.db.models.Manager", "QuerySet", "RawQuerySet", "Manager"],
+    callNames: ["raw"],
+    taintArguments: [0],
+    sinkKind: SinkKind.SQL_QUERY,
+    category: "database",
+    callForms: ["instance-method"],
+    requiresModuleIdentity: true,
+  }),
+  sinkModel({
+    id: "python.http.request",
+    languages: ["python"],
+    moduleNames: ["requests", "httpx", "urllib.request"],
+    qualifiedNames: ["requests.get", "requests.post", "requests.request", "httpx.get", "httpx.post", "httpx.request", "httpx.AsyncClient.get", "httpx.AsyncClient.request", "urllib.request.urlopen"],
+    receiverTypes: ["Client", "AsyncClient"],
+    callNames: ["get", "post", "put", "patch", "delete", "request", "urlopen"],
+    taintArguments: [0],
+    sinkKind: SinkKind.HTTP_REQUEST,
+    category: "network",
+    callForms: ["module-function", "instance-method"],
+    requiresModuleIdentity: true,
+  }),
   propagatorModel({
     id: "node.path.value-propagation",
     languages: ["javascript", "typescript"],
@@ -138,8 +251,23 @@ const SEMANTIC_MODELS = Object.freeze([
     languages: ["java"],
     moduleNames: ["java.sql"],
     qualifiedNames: ["java.sql.Statement.executeQuery", "Statement.executeQuery"],
-    receiverTypes: ["java.sql.Statement", "Statement"],
+    receiverTypes: ["java.sql.Statement", "Statement", "java.sql.PreparedStatement", "PreparedStatement"],
     callNames: ["executeQuery", "executeUpdate", "execute"],
+    taintArguments: [0],
+    sinkKind: SinkKind.SQL_QUERY,
+    category: "database",
+    callForms: ["instance-method"],
+  }),
+  sinkModel({
+    id: "java.sql.Connection.prepareStatement",
+    languages: ["java"],
+    moduleNames: ["java.sql"],
+    qualifiedNames: [
+      "java.sql.Connection.prepareStatement", "Connection.prepareStatement",
+      "java.sql.Connection.prepareCall", "Connection.prepareCall",
+    ],
+    receiverTypes: ["java.sql.Connection", "Connection"],
+    callNames: ["prepareStatement", "prepareCall"],
     taintArguments: [0],
     sinkKind: SinkKind.SQL_QUERY,
     category: "database",
@@ -306,25 +434,45 @@ function resolveSemanticCall(language, call = {}, customModels = []) {
   };
 
   for (const model of candidates) {
+    if (call.receiver && model.global) continue;
     if (model.custom && model.customUnqualified && exportMatches(model, identity.exportName || call.function)) {
-      return resolution(model, "syntax", identity);
+      return resolution(model, "syntax", identity, call);
+    }
+    // A receiver type declared in .traceguard.json is an explicit project contract.
+    // It remains authoritative when the frontend can read the declared type name but
+    // the corresponding source/dependency is absent from the workspace.
+    if (model.custom && identity.receiverType && receiverMatches(model, identity.receiverType)) {
+      return resolution(model, "verified", identity, call);
     }
     if (model.global && identity.kind === "global" && exportMatches(model, identity.exportName || call.function)) {
-      return resolution(model, "verified", identity);
+      return resolution(model, "verified", identity, call);
     }
     if (identity.moduleName && moduleMatches(model, identity.moduleName) && exportMatches(model, identity.exportName || call.function)) {
-      return resolution(model, "verified", identity);
+      return resolution(model, "verified", identity, call);
     }
-    if (identity.qualifiedName && qualifiedMatches(model, identity.qualifiedName)) {
-      return resolution(model, identity.verified ? "verified" : "syntax", identity);
+    if (!model.requiresModuleIdentity && !identity.unresolvedType && identity.qualifiedName && qualifiedMatches(model, identity.qualifiedName)) {
+      return resolution(model, identity.verified ? "verified" : "syntax", identity, call);
     }
-    if (identity.receiverType && receiverMatches(model, identity.receiverType)) {
-      return resolution(model, identity.verified ? "verified" : "syntax", identity);
+    if (!model.requiresModuleIdentity && !identity.unresolvedType && identity.receiverType && receiverMatches(model, identity.receiverType)) {
+      return resolution(model, identity.verified ? "verified" : "syntax", identity, call);
     }
-    if (call.receiver && syntaxReceiverMatches(model, call.receiver)) {
-      return resolution(model, "syntax", { ...identity, qualifiedName: `${call.receiver}.${semanticName}` });
+    if (!model.requiresModuleIdentity && call.receiver && (!identity.verified || !identity.receiverType) && syntaxReceiverMatches(model, call.receiver)) {
+      return resolution(model, "syntax", { ...identity, qualifiedName: `${call.receiver}.${semanticName}` }, call);
     }
   }
+
+  if (identity.receiverType && !isDynamicReceiverType(identity.receiverType) &&
+    candidates.every(model => model.custom && model.role === SemanticRole.GUARD)) return {
+    status: "rejected",
+    reason: "The declared receiver type does not match the project-configured guard model.",
+    candidates: candidates.map(model => model.id),
+  };
+
+  if (["java", "php", "python"].includes(language) && identity.receiverType && isDynamicReceiverType(identity.receiverType)) return {
+    status: "candidate",
+    reason: "The receiver has only a dynamic or top-level type, so the security API identity could not be proven.",
+    candidates: candidates.map(model => model.id),
+  };
 
   if (identity.kind === "local" || identity.kind === "import" || identity.kind === "require") return {
     status: "rejected",
@@ -355,13 +503,33 @@ function validCustomModel(model) {
   return Boolean(model && model.custom && Array.isArray(model.languages) && Array.isArray(model.callNames) && model.role);
 }
 
-function resolution(model, status, identity) {
+function resolution(model, status, identity, call) {
+  const policyRejection = callPolicyRejection(model, call);
+  if (policyRejection) return {
+    status: "rejected",
+    reason: policyRejection,
+    candidates: [model.id],
+  };
   return {
     status,
     model,
     identity,
     certainty: status === "verified" ? "high" : "medium",
   };
+}
+
+function callPolicyRejection(model, call = {}) {
+  if (model.argumentPolicy !== "python-subprocess") return undefined;
+  const argumentsList = call.arguments || [];
+  const command = String(argumentsList[0] || "").trim();
+  const shellArgument = argumentsList.find(argument => /^shell\s*=/.test(String(argument).trim()));
+  const shellEnabled = /^shell\s*=\s*true$/i.test(String(shellArgument || "").trim());
+  if (shellEnabled || !/^[[(]/.test(command)) return undefined;
+  const firstElement = command.slice(1).trim();
+  if (/^(?:[rubf]{0,2})?["'](?:\\.|[^"'])*["']/i.test(firstElement)) {
+    return "A constant executable is invoked through an argv list with shell expansion disabled.";
+  }
+  return undefined;
 }
 
 function moduleMatches(model, value) {
@@ -409,6 +577,11 @@ function canonicalQualified(value) {
 
 function canonical(value) {
   return String(value || "").replace(/[^A-Za-z0-9_$]/g, "").toLowerCase();
+}
+
+function isDynamicReceiverType(value) {
+  return new Set(["?", "any", "mixed", "object", "java.lang.object", "dynamic", "unknown"])
+    .has(canonicalQualified(value));
 }
 
 module.exports = {

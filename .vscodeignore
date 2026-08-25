@@ -4,6 +4,7 @@ docs/**
 .gitignore
 test/**
 scripts/**
+eval-corpus/**
 node_modules/**
 !node_modules/web-tree-sitter/package.json
 !node_modules/web-tree-sitter/LICENSE

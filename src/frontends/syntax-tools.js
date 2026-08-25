@@ -17,6 +17,7 @@ const IDENTIFIER_KEYWORDS = new Set([
 
 function extractFileReferences(lines, language) {
   const references = [];
+  const pythonTypes = new Map();
   const add = (local, target, kind = "import") => {
     if (!local || !target) return;
     const key = [canonicalName(local), normalizePath(target), kind].join(":");
@@ -33,6 +34,8 @@ function extractFileReferences(lines, language) {
       if (required) for (const local of parseRequiredBindings(required[1])) add(local, required[2], "require");
     }
     if (language === "python") {
+      const declaration = code.match(/^(?:async\s+)?class\s+([A-Za-z_]\w*)/);
+      if (declaration) add(declaration[1], declaration[1], "declaration");
       const fromImport = code.match(/^from\s+([\w.]+)\s+import\s+(.+)$/);
       if (fromImport) {
         for (const part of splitArguments(fromImport[2])) {
@@ -42,9 +45,32 @@ function extractFileReferences(lines, language) {
       }
       const imported = code.match(/^import\s+([\w.]+)(?:\s+as\s+([A-Za-z_]\w*))?/);
       if (imported) add(imported[2] || imported[1].split(".")[0], imported[1]);
+      const constructed = code.match(/^([A-Za-z_]\w*)\s*(?::[^=]+)?=\s*([A-Za-z_][\w.]*)\s*\(/);
+      if (constructed) {
+        const resolvedType = resolvePythonFactoryType(constructed[2], references, pythonTypes);
+        add(constructed[1], resolvedType, "type");
+        pythonTypes.set(canonicalName(constructed[1]), resolvedType);
+      }
+      const contextConstructed = code.match(/^(?:async\s+)?with\s+([A-Za-z_][\w.]*)\s*\([^)]*\)\s+as\s+([A-Za-z_]\w*)/);
+      if (contextConstructed) add(contextConstructed[2], contextConstructed[1], "type");
+      for (const typed of code.matchAll(/\b([A-Za-z_]\w*)\s*:\s*([A-Za-z_][\w.]*)/g)) add(typed[1], typed[2], "type");
+      const memberAssignment = code.match(/^self\.([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*$/);
+      if (memberAssignment) {
+        const sourceType = references.find(reference => reference.kind === "type" && canonicalName(reference.local) === canonicalName(memberAssignment[2]));
+        if (sourceType) {
+          add(`self.${memberAssignment[1]}`, sourceType.target, "type");
+          pythonTypes.set(canonicalName(`self.${memberAssignment[1]}`), sourceType.target);
+        }
+      }
+      const memberConstruction = code.match(/^self\.([A-Za-z_]\w*)\s*=\s*([A-Za-z_][\w.]*)\s*\(/);
+      if (memberConstruction) add(`self.${memberConstruction[1]}`, memberConstruction[2], "type");
     }
     if (language === "java") {
-      const imported = code.match(/^import\s+(?:static\s+)?([\w.]+)\s*;/);
+      const declaration = code.match(/^(?:public\s+|protected\s+|private\s+|abstract\s+|final\s+|static\s+)*(?:class|interface|record|enum)\s+([A-Za-z_$][\w$]*)/);
+      if (declaration) add(declaration[1], declaration[1], "declaration");
+      const packageDeclaration = code.match(/^package\s+([\w.]+)\s*;/);
+      if (packageDeclaration) add("<package>", packageDeclaration[1], "package");
+      const imported = code.match(/^import\s+(?:static\s+)?([\w.*]+)\s*;/);
       if (imported) add(imported[1].split(".").at(-1), imported[1]);
       collectTypedReceivers(code, add);
     }
@@ -54,11 +80,14 @@ function extractFileReferences(lines, language) {
       collectTypedReceivers(code, add);
     }
     if (language === "php") {
+      const declaration = code.match(/^(?:(?:abstract|final|readonly)\s+)*(?:class|interface|trait|enum)\s+([A-Za-z_]\w*)/i);
+      if (declaration) add(declaration[1], declaration[1], "declaration");
       const imported = code.match(/^use\s+([^;]+);/i);
-      if (imported) {
-        const parts = imported[1].trim().split(/\s+as\s+/i);
-        add(parts[1] || parts[0].split("\\").at(-1), parts[0]);
-      }
+      if (imported) for (const binding of parsePhpUseBindings(imported[1])) add(binding.local, binding.target);
+      const namespaceDeclaration = code.match(/^(?:<\?php\s*)?namespace\s+([^;]+);/i);
+      if (namespaceDeclaration) add("<namespace>", namespaceDeclaration[1].trim(), "namespace");
+      const constructed = code.match(/(\$[A-Za-z_]\w*)\s*=\s*new\s+([A-Za-z_\\][\w\\]*)/i);
+      if (constructed) add(constructed[1], constructed[2], "type");
       collectTypedReceivers(code, add);
     }
     if (language === "go") {
@@ -67,6 +96,37 @@ function extractFileReferences(lines, language) {
     }
   }
   return references.map(({ key, ...reference }) => reference);
+}
+
+function resolvePythonFactoryType(target, references, knownTypes) {
+  const value = String(target || "");
+  const known = knownTypes.get(canonicalName(value));
+  if (known) return known;
+  const [root, member] = value.split(".");
+  const rootType = knownTypes.get(canonicalName(root));
+  if (member === "cursor" && /(?:^|\.)Connection$/i.test(rootType || "")) {
+    return /sqlite|aiosqlite/i.test(rootType) ? `${String(rootType).replace(/\.Connection$/i, "")}.Cursor` : "Cursor";
+  }
+  const imported = references.find(reference => ["import", "require"].includes(reference.kind) && canonicalName(reference.local) === canonicalName(root));
+  const moduleName = imported?.target || root;
+  if (member === "connect" && /^(?:sqlite3|aiosqlite)$/i.test(moduleName)) return `${moduleName}.Connection`;
+  if (!member && /^(?:sessionmaker|async_sessionmaker)$/i.test(value) && /sqlalchemy/i.test(imported?.target || "")) {
+    return `${imported.target}.${/^async_/i.test(value) ? "AsyncSession" : "Session"}`;
+  }
+  return value;
+}
+
+function parsePhpUseBindings(value) {
+  const input = String(value || "").trim().replace(/^(?:function|const)\s+/i, "");
+  const group = input.match(/^([^{}]+)\{([^{}]+)\}$/);
+  const values = group
+    ? splitArguments(group[2]).map(item => `${group[1].replace(/\\+$/, "")}\\${item.trim()}`)
+    : splitArguments(input);
+  return values.map(raw => {
+    const parts = raw.trim().split(/\s+as\s+/i);
+    const target = parts[0].replace(/^\\+/, "");
+    return { target, local: parts[1] || target.split("\\").at(-1) };
+  }).filter(binding => binding.local && binding.target);
 }
 
 function parseImportedBindings(value) {
@@ -96,7 +156,7 @@ function parseRequiredBindings(value) {
 }
 
 function collectTypedReceivers(code, add) {
-  const pattern = /\b([A-Z][A-Za-z0-9_]*(?:<[^>]+>)?(?:\[\])?)\s+([a-z_$][\w$]*)\b/g;
+  const pattern = /\b((?:[A-Za-z_]\w*[.\\])*[A-Z][A-Za-z0-9_]*(?:<[^>]+>)?(?:\[\])?)\s+([a-z_$][\w$]*)\b/g;
   let match;
   while ((match = pattern.exec(code))) add(match[2], match[1].replace(/<.*>|\[\]/g, ""), "type");
 }

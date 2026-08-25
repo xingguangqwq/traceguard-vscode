@@ -106,6 +106,106 @@ export function route(): void {
   assert.ok(operations.some(operation => operation.semantic.modelRole === "sink" && operation.metadata.semanticVerification === "verified"));
 });
 
+test("multi-root custom semantics and rule controls do not cross workspace roots", async () => {
+  const apiConfiguration = parseProjectConfigurationText(JSON.stringify({
+    sources: [{ language: "typescript", function: "readTenantValue" }],
+    sinks: [{ language: "typescript", function: "invokeTenantCommand", arguments: [0], kind: "COMMAND_EXEC" }],
+    severityOverrides: { "potential-command-injection": "critical" },
+  }), "C:/workspace/api/.traceguard.json").config;
+  const webConfiguration = emptyProjectConfiguration();
+  const engine = new WorkspaceAnalysisEngine();
+  await engine.initializeWorkspace([
+    file("C:\\workspace\\api\\route.ts", "route.ts", `
+declare function readTenantValue(): string;
+declare function invokeTenantCommand(value: string): void;
+export function apiRoute(): void {
+  const value = readTenantValue();
+  invokeTenantCommand(value);
+}
+`),
+    file("C:\\workspace\\web\\route.ts", "route.ts", `
+declare function readTenantValue(): string;
+declare function invokeTenantCommand(value: string): void;
+export function webRoute(): void {
+  const value = readTenantValue();
+  invokeTenantCommand(value);
+}
+`),
+  ], {
+    projectConfiguration: mergeProjectConfigurations([apiConfiguration, webConfiguration]),
+    projectConfigurationsByRoot: [
+      { root: "C:\\workspace\\api", configuration: apiConfiguration },
+      { root: "C:\\workspace\\web", configuration: webConfiguration },
+    ],
+    maxDepth: 6,
+    maxPaths: 80,
+  });
+
+  const findings = engine.dataflow.findings.filter(item => item.ruleId === "potential-command-injection");
+  assert.equal(findings.length, 1);
+  assert.match(findings[0].absolutePath, /[\\/]api[\\/]/);
+  assert.equal(findings[0].severity, "critical");
+});
+
+test("multi-root call graphs do not connect same-named PHP functions across repositories", async () => {
+  const empty = emptyProjectConfiguration();
+  const engine = new WorkspaceAnalysisEngine();
+  await engine.initializeWorkspace([
+    {
+      absolutePath: "C:\\workspace\\api\\route.php",
+      relativePath: "route.php",
+      language: "php",
+      version: "1",
+      text: `<?php function route() { process_value($_GET["cmd"]); }`,
+    },
+    {
+      absolutePath: "C:\\workspace\\worker\\processor.php",
+      relativePath: "processor.php",
+      language: "php",
+      version: "1",
+      text: `<?php function process_value($value) { system($value); }`,
+    },
+  ], {
+    projectConfiguration: empty,
+    projectConfigurationsByRoot: [
+      { root: "C:\\workspace\\api", configuration: empty },
+      { root: "C:\\workspace\\worker", configuration: empty },
+    ],
+    maxDepth: 6,
+    maxPaths: 80,
+  });
+
+  assert.equal(engine.dataflow.findings.some(item => item.ruleId === "potential-command-injection"), false);
+});
+
+test("multi-root findings keep distinct IDs even when relative paths and symbols match", async () => {
+  const empty = emptyProjectConfiguration();
+  const engine = new WorkspaceAnalysisEngine();
+  await engine.initializeWorkspace([
+    {
+      absolutePath: "C:\\workspace\\api\\route.php", relativePath: "route.php", language: "php", version: "1",
+      text: `<?php function run() { system($_GET["cmd"]); }`,
+    },
+    {
+      absolutePath: "C:\\workspace\\worker\\route.php", relativePath: "route.php", language: "php", version: "1",
+      text: `<?php function run() { system($_GET["cmd"]); }`,
+    },
+  ], {
+    projectConfiguration: empty,
+    projectConfigurationsByRoot: [
+      { root: "C:\\workspace\\api", configuration: empty },
+      { root: "C:\\workspace\\worker", configuration: empty },
+    ],
+    maxDepth: 6,
+    maxPaths: 80,
+  });
+
+  const findings = engine.dataflow.findings.filter(item => item.ruleId === "potential-command-injection");
+  assert.equal(findings.length, 2);
+  assert.equal(new Set(findings.map(item => item.id)).size, 2);
+  assert.equal(new Set(findings.map(item => item.workspaceRoot)).size, 2);
+});
+
 test("custom sanitizer scope, rule toggles and severity overrides use the normal rule engine", async () => {
   const base = {
     sources: [{ language: "typescript", module: "./security", function: "customInput" }],

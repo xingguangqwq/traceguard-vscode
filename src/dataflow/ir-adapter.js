@@ -2,8 +2,10 @@
 
 const { OperationKind } = require("../ir/schema");
 const { GuardCapability } = require("../security/semantics");
+const { workspaceRootForAbsolutePath } = require("../config/configuration-scope");
+const { projectIdentityForAbsolutePath } = require("../config/project-identity");
 
-function functionsFromAnalyses(analyses) {
+function functionsFromAnalyses(analyses, options = {}) {
   const entriesByFunction = new Map();
   for (const analysis of analyses) {
     for (const entry of analysis.ir?.entryPoints || []) {
@@ -12,16 +14,32 @@ function functionsFromAnalyses(analyses) {
       entriesByFunction.get(entry.functionId).push(entry);
     }
   }
-  return analyses.flatMap(analysis => (analysis.ir?.functions || []).map(fn => flowFunctionFromIR(fn, entriesByFunction.get(fn.id))));
+  const typeRelations = analyses.flatMap(analysis => {
+    const workspaceRoot = workspaceRootForAbsolutePath(options, analysis.absolutePath || analysis.ir?.absolutePath);
+    return (analysis.ir?.typeRelations || []).map(relation => ({ ...relation, workspaceRoot }));
+  });
+  return analyses.flatMap(analysis => {
+    const workspaceRoot = workspaceRootForAbsolutePath(options, analysis.absolutePath || analysis.ir?.absolutePath);
+    const projectIdentity = projectIdentityForAbsolutePath(options, analysis.absolutePath || analysis.ir?.absolutePath);
+    const scopedRelations = typeRelations.filter(relation => !workspaceRoot || relation.workspaceRoot === workspaceRoot);
+    return (analysis.ir?.functions || []).map(fn => flowFunctionFromIR(fn, entriesByFunction.get(fn.id), {
+      workspaceRoot,
+      projectIdentity,
+      typeRelations: scopedRelations,
+    }));
+  });
 }
 
-function flowFunctionFromIR(fn, projectEntries = []) {
+function flowFunctionFromIR(fn, projectEntries = [], context = {}) {
   const entryPoints = projectEntries.length ? projectEntries : fn.entryPoints || (fn.entryPoint ? [fn.entryPoint] : []);
   return {
     id: fn.id,
     symbolKey: fn.symbolKey,
     name: fn.name,
     enclosingScope: fn.enclosingScope,
+    packageName: fn.packageName,
+    namespaceName: fn.namespaceName,
+    qualifiedEnclosingScope: fn.qualifiedEnclosingScope || fn.enclosingScope,
     implementedTypes: fn.implementedTypes || [],
     declarationKind: fn.declarationKind || "function",
     executable: fn.executable !== false,
@@ -43,6 +61,9 @@ function flowFunctionFromIR(fn, projectEntries = []) {
     entryPoints,
     isGlobal: fn.isGlobal,
     references: fn.references || [],
+    workspaceRoot: context.workspaceRoot,
+    projectIdentity: context.projectIdentity,
+    typeRelations: context.typeRelations || [],
     cfg: fn.cfg,
     events: fn.operations.map(operationFromIR),
   };

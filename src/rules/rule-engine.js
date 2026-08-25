@@ -3,11 +3,19 @@
 const { stableHash } = require("../identity");
 const { compareRisk, scoreRisk } = require("../risk/scorer");
 const { RULES } = require("./definitions");
+const { configurationForAbsolutePath } = require("../config/configuration-scope");
 
 function evaluateFlowPaths(paths, rules = RULES, options = {}) {
-  const activeRules = configuredRules(rules || RULES, options.projectConfiguration);
   const findings = [];
+  const ruleCache = new Map();
   for (const flow of paths) {
+    const configuration = configurationForAbsolutePath(options, flow.sink.absolutePath);
+    const configurationKey = configuration?.ruleFingerprint || configuration?.fingerprint || "default";
+    let activeRules = ruleCache.get(configurationKey);
+    if (!activeRules) {
+      activeRules = configuredRules(rules || RULES, configuration);
+      ruleCache.set(configurationKey, activeRules);
+    }
     for (const rule of activeRules) {
       if (!rule.sourceKinds.includes(flow.sourceKind) || !rule.sinkKinds.includes(flow.sinkKind)) continue;
       const observedGuards = flow.guardCapabilities || [];
@@ -15,7 +23,8 @@ function evaluateFlowPaths(paths, rules = RULES, options = {}) {
       const missingGuards = rule.recommendedGuards.filter(capability => !observedGuards.includes(capability));
       const risk = scoreRisk(rule, flow, missingGuards);
       findings.push({
-        id: `finding_${stableHash(`${rule.id}:${flow.sink.symbolKey}:${flow.sink.operationId || flow.sink.label}`)}`,
+        id: `finding_${stableHash(`${rule.id}:${flow.sink.workspaceRoot || ""}:${flow.sink.symbolKey}:${flow.sink.operationId || flow.sink.label}`)}`,
+        workspaceRoot: flow.sink.workspaceRoot,
         kind: "finding",
         ruleId: rule.id,
         title: rule.title,
@@ -79,6 +88,9 @@ function explainFinding(rule, flow, observedGuards, missingGuards, risk) {
     heuristics.push("The sink name is a regex candidate that could not be verified to a modeled symbol.");
   }
   if (flow.sink.semanticVerification === "syntax") heuristics.push("The sink was matched by AST syntax without project-level symbol proof.");
+  if (flow.sink.semanticVerification === "candidate") {
+    heuristics.push("The method name matches a security sink, but the receiver type could not be resolved; review is required.");
+  }
   return {
     source: { kind: flow.sourceKind, label: flow.source.label, relativePath: flow.source.relativePath, line: flow.source.line },
     propagation,

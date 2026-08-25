@@ -4,12 +4,18 @@ const { buildAuditModel, shortHash } = require("./audit-analyzer");
 const {
   MAX_PROJECT_CONFIG_BYTES,
   PROJECT_CONFIG_FILENAME,
-  combinedExcludeGlob,
   emptyProjectConfiguration,
   matchesExcludedPath,
   mergeProjectConfigurations,
   parseProjectConfigurationText,
 } = require("./config/project-config");
+const {
+  COMPOSER_FILENAME,
+  MAX_COMPOSER_BYTES,
+  emptyProjectIdentity,
+  parseComposerConfigurationText,
+  projectIdentityFingerprint,
+} = require("./config/project-identity");
 const { DataflowWorkerClient } = require("./dataflow/worker-client");
 const { normalizePath, stableHash } = require("./identity");
 const { languageForPath } = require("./language-support");
@@ -29,16 +35,21 @@ class AuditSession {
     this.model = emptyModel();
     this.indexing = false;
     this.indexPromise = undefined;
+    this.activeIndexDirtyQueue = undefined;
     this.indexStage = { phase: "idle", message: "Review queue not built", processed: 0, total: 0 };
     this.indexError = undefined;
     this.workspaceIndexBuilt = false;
     this.workspaceCoverageComplete = false;
     this.indexStatus = { cancelled: false, truncated: false, skipped: 0, discovered: 0, processed: 0 };
-    this.dataflowWorker = new DataflowWorkerClient();
+    this.dataflowWorker = new DataflowWorkerClient({ fileLoader: metadata => this._loadWorkerReplayFile(metadata) });
     this.modelGeneration = 0;
     this.projectConfiguration = emptyProjectConfiguration();
+    this.projectConfigurationsByRoot = [];
     this.projectConfigurationIssues = [];
     this.projectConfigurationInitialized = false;
+    this.projectIdentitiesByRoot = [];
+    this.projectIdentityIssues = [];
+    this.performanceReport = { incrementalSamplesMs: [] };
     this._changed = new vscode.EventEmitter();
     this.onDidChange = this._changed.event;
   }
@@ -87,77 +98,138 @@ class AuditSession {
         excludedPatterns: this.projectConfiguration.excludePaths.length,
         issues: this.projectConfigurationIssues,
       },
+      performance: { ...this.performanceReport, incrementalSamplesMs: undefined },
     };
   }
 
   async reloadProjectConfiguration(options = {}) {
     const configurations = [];
+    const configurationsByRoot = [];
     const issues = [];
+    const previousByRoot = new Map(this.projectConfigurationsByRoot.map(item => [normalizePath(item.root), item.configuration]));
+    let frozenRoots = 0;
     for (const folder of vscode.workspace.workspaceFolders || []) {
       const uri = vscode.Uri.joinPath(folder.uri, PROJECT_CONFIG_FILENAME);
+      const workspaceRoot = folder.uri.fsPath;
+      const previous = previousByRoot.get(normalizePath(workspaceRoot));
+      let configuration = previous || emptyProjectConfiguration();
+      let rootValid = true;
       try {
         const stat = await vscode.workspace.fs.stat(uri);
         if (stat.size > MAX_PROJECT_CONFIG_BYTES) {
-          issues.push({ source: uri.fsPath, path: "$", message: `Configuration exceeds the ${MAX_PROJECT_CONFIG_BYTES} byte limit.`, severity: "error", line: 1, column: 1 });
-          continue;
+          issues.push({ source: uri.fsPath, workspaceRoot, path: "$", message: `Configuration exceeds the ${MAX_PROJECT_CONFIG_BYTES} byte limit.`, severity: "error", line: 1, column: 1 });
+          rootValid = false;
+        } else {
+          const bytes = await vscode.workspace.fs.readFile(uri);
+          const parsed = parseProjectConfigurationText(Buffer.from(bytes).toString("utf8"), uri.fsPath);
+          issues.push(...parsed.issues.map(item => ({ ...item, workspaceRoot })));
+          if (parsed.valid) configuration = parsed.config;
+          else rootValid = false;
         }
-        const bytes = await vscode.workspace.fs.readFile(uri);
-        const parsed = parseProjectConfigurationText(Buffer.from(bytes).toString("utf8"), uri.fsPath);
-        issues.push(...parsed.issues);
-        if (parsed.valid) configurations.push(parsed.config);
       } catch (error) {
-        if (!isFileNotFound(error)) issues.push({ source: uri.fsPath, path: "$", message: String(error.message || error), severity: "error", line: 1, column: 1 });
+        if (isFileNotFound(error)) configuration = emptyProjectConfiguration();
+        else {
+          rootValid = false;
+          issues.push({ source: uri.fsPath, workspaceRoot, path: "$", message: String(error.message || error), severity: "error", line: 1, column: 1 });
+        }
       }
+      if (!rootValid) frozenRoots += 1;
+      configurations.push(configuration);
+      configurationsByRoot.push({ root: workspaceRoot, configuration });
     }
     this.projectConfigurationInitialized = true;
     this.projectConfigurationIssues = issues;
     const valid = !issues.some(item => item.severity === "error");
-    if (!valid) {
-      this.output.warn(`TraceGuard kept the last valid project configuration because ${issues.filter(item => item.severity === "error").length} configuration error(s) were found.`);
-      this._changed.fire(this.snapshot);
-      return { valid: false, changed: false, config: this.projectConfiguration, issues };
-    }
     const next = mergeProjectConfigurations(configurations);
-    const changed = next.fingerprint !== this.projectConfiguration.fingerprint;
+    const scopedFingerprint = stableHash(JSON.stringify(configurationsByRoot.map(item => [normalizePath(item.root), item.configuration.fingerprint])));
+    const previousScopedFingerprint = stableHash(JSON.stringify(this.projectConfigurationsByRoot.map(item => [normalizePath(item.root), item.configuration.fingerprint])));
+    const changed = next.fingerprint !== this.projectConfiguration.fingerprint || scopedFingerprint !== previousScopedFingerprint;
     this.projectConfiguration = next;
+    this.projectConfigurationsByRoot = configurationsByRoot;
     if (changed && options.rebuild !== false) await this._rebuildModel();
+    if (frozenRoots) this.output.warn(`TraceGuard kept the last valid project configuration for ${frozenRoots} workspace root(s); valid roots were updated independently.`);
     if (changed && !options.silent) this.output.info(`Project audit semantics: ${next.semanticModels.length} custom models, ${Object.keys(next.rules).length} rule controls, ${next.excludePaths.length} exclude patterns.`);
     this._changed.fire(this.snapshot);
-    return { valid: true, changed, config: next, issues };
+    return { valid, changed, config: next, issues };
   }
 
   async _ensureProjectConfiguration() {
     if (!this.projectConfigurationInitialized) await this.reloadProjectConfiguration({ rebuild: false, silent: true });
   }
 
+  async reloadProjectIdentities(options = {}) {
+    const previousByRoot = new Map(this.projectIdentitiesByRoot.map(item => [normalizePath(item.root), item.identity]));
+    const identitiesByRoot = [];
+    const issues = [];
+    let frozenRoots = 0;
+    for (const folder of vscode.workspace.workspaceFolders || []) {
+      const workspaceRoot = folder.uri.fsPath;
+      const uri = vscode.Uri.joinPath(folder.uri, COMPOSER_FILENAME);
+      let identity = previousByRoot.get(normalizePath(workspaceRoot)) || emptyProjectIdentity(workspaceRoot);
+      let rootValid = true;
+      try {
+        const stat = await vscode.workspace.fs.stat(uri);
+        if (stat.size > MAX_COMPOSER_BYTES) {
+          issues.push({ source: uri.fsPath, workspaceRoot, path: "$", message: `composer.json exceeds the ${MAX_COMPOSER_BYTES} byte limit.`, severity: "error", line: 1, column: 1 });
+          rootValid = false;
+        } else {
+          const bytes = await vscode.workspace.fs.readFile(uri);
+          const parsed = parseComposerConfigurationText(Buffer.from(bytes).toString("utf8"), workspaceRoot, uri.fsPath);
+          issues.push(...parsed.issues.map(item => ({ ...item, workspaceRoot })));
+          if (parsed.valid) identity = parsed.identity;
+          else rootValid = false;
+        }
+      } catch (error) {
+        if (isFileNotFound(error)) identity = emptyProjectIdentity(workspaceRoot);
+        else {
+          rootValid = false;
+          issues.push({ source: uri.fsPath, workspaceRoot, path: "$", message: String(error.message || error), severity: "error", line: 1, column: 1 });
+        }
+      }
+      if (!rootValid) frozenRoots += 1;
+      identitiesByRoot.push({ root: workspaceRoot, identity });
+    }
+    const changed = projectIdentityFingerprint(identitiesByRoot) !== projectIdentityFingerprint(this.projectIdentitiesByRoot);
+    this.projectIdentitiesByRoot = identitiesByRoot;
+    this.projectIdentityIssues = issues;
+    if (frozenRoots && !options.silent) this.output.warn(`TraceGuard kept the last valid Composer identity for ${frozenRoots} workspace root(s).`);
+    this._changed.fire(this.snapshot);
+    return { valid: !issues.some(item => item.severity === "error"), changed, identitiesByRoot, issues };
+  }
+
   indexWorkspace(progress, token) {
     if (this.indexPromise) return this.indexPromise;
     this.indexing = true;
+    const dirtyQueue = new Map();
+    this.activeIndexDirtyQueue = dirtyQueue;
     this.indexError = undefined;
     this._setIndexStage("discovering", "Discovering supported source files");
-    const operation = this._indexWorkspace(progress, token);
+    const operation = this._indexWorkspace(progress, token, dirtyQueue);
     this.indexPromise = operation.catch(error => {
       this.indexError = firstLine(error?.message || error);
       this.indexStage = { phase: "failed", message: this.indexError, processed: 0, total: 0 };
       throw error;
     }).finally(() => {
       this.indexing = false;
+      if (this.activeIndexDirtyQueue === dirtyQueue) this.activeIndexDirtyQueue = undefined;
       this.indexPromise = undefined;
       this._changed.fire(this.snapshot);
     });
     return this.indexPromise;
   }
 
-  async _indexWorkspace(progress, token) {
+  async _indexWorkspace(progress, token, dirtyQueue) {
+    const initializationStartedAt = performance.now();
     await this._ensureProjectConfiguration();
+    await this.reloadProjectIdentities({ silent: true });
     let discovered;
     const configuredLimit = vscode.workspace.getConfiguration("traceguard").get("maxWorkspaceFiles", DEFAULT_MAX_SOURCE_FILES);
     const maxSourceFiles = Math.min(HARD_MAX_SOURCE_FILES, Math.max(100, configuredLimit));
     try {
       discovered = await vscode.workspace.findFiles(
         SOURCE_GLOB,
-        combinedExcludeGlob(EXCLUDE_GLOB, this.projectConfiguration.excludePaths),
-        maxSourceFiles + 1,
+        EXCLUDE_GLOB,
+        undefined,
         token,
       );
     } catch (error) {
@@ -194,8 +266,10 @@ class AuditSession {
           skippedDetails.push({ absolutePath: uri.fsPath, relativePath: workspaceRelativePath(uri), reason: `File exceeds ${MAX_FILE_SIZE} byte limit`, size: stat.size });
           continue;
         }
-        const bytes = await vscode.workspace.fs.readFile(uri);
-        const text = Buffer.from(bytes).toString("utf8");
+        const openDocument = (vscode.workspace.textDocuments || []).find(document => normalizePath(document.uri.fsPath) === normalizePath(uri.fsPath));
+        const text = openDocument?.isDirty
+          ? openDocument.getText()
+          : Buffer.from(await vscode.workspace.fs.readFile(uri)).toString("utf8");
         const language = languageForPath(uri.fsPath);
         if (!language) continue;
         files.push({
@@ -204,6 +278,7 @@ class AuditSession {
           language,
           text,
           version: stableHash(text),
+          unsaved: Boolean(openDocument?.isDirty),
         });
       } catch (error) {
         skipped += 1;
@@ -219,6 +294,8 @@ class AuditSession {
       ? token.onCancellationRequested(() => this.dataflowWorker.cancelActive("TraceGuard workspace indexing was cancelled."))
       : undefined;
     try {
+      const timeoutSeconds = vscode.workspace.getConfiguration("traceguard").get("indexTimeoutSeconds", 300);
+      this.dataflowWorker.setIndexTimeoutMs?.(timeoutSeconds === 0 ? 0 : Math.max(1, timeoutSeconds) * 1000);
       workerResult = await this.dataflowWorker.initializeWorkspace(files, this._flowOptions());
       this.analyses = workerResult.analyses;
       this._applyWorkerResult(workerResult, true);
@@ -234,7 +311,7 @@ class AuditSession {
     } finally {
       cancellation?.dispose();
     }
-    const coverageComplete = !truncated && skipped === 0;
+    let coverageComplete = !truncated && skipped === 0;
     this.workspaceIndexBuilt = true;
     this.workspaceCoverageComplete = coverageComplete;
     this.model = {
@@ -246,8 +323,28 @@ class AuditSession {
       indexSkippedDetails: skippedDetails,
       indexScope: "workspace",
     };
+    this._queueOpenDirtyDocuments(dirtyQueue);
+    const replay = await this._replayIndexDirtyQueue(dirtyQueue);
+    if (replay.failed) {
+      skipped += replay.failed;
+      coverageComplete = false;
+      this.workspaceCoverageComplete = false;
+      this.model = {
+        ...this.model,
+        indexIncomplete: true,
+        indexSkippedFiles: skipped,
+        indexSkippedDetails: [...(this.model.indexSkippedDetails || []), ...replay.skippedDetails],
+      };
+    }
     this.indexStatus = { cancelled: false, truncated, skipped, discovered: eligible.length, processed: files.length };
-    this._setIndexStage("ready", `Indexed ${files.length} files`, files.length, files.length);
+    this.performanceReport = {
+      ...this.performanceReport,
+      initializationMs: roundMetric(performance.now() - initializationStartedAt),
+      extensionHostRssBytes: process.memoryUsage().rss,
+      replayedDirtyUpdates: replay.applied,
+      dirtyUpdateReplayMs: replay.durationMs,
+    };
+    this._setIndexStage("ready", `Indexed ${files.length} files${replay.applied ? `; replayed ${replay.applied} live update(s)` : ""}`, files.length, files.length);
     await this._reconcileReviewStatuses(coverageComplete);
     this.output.info(`Audit index: ${this.model.files} files, ${this.model.functions} functions, ${this.model.entries.length} entry points, ${this.model.findings.length} findings, ${this.model.items.length} review targets${truncated || skipped ? ` (${truncated ? "file limit reached; " : ""}${skipped} skipped)` : ""}.`);
     this._changed.fire(this.snapshot);
@@ -259,8 +356,9 @@ class AuditSession {
     this._changed.fire(this.snapshot);
   }
 
-  async reindexFile(uri) {
+  async reindexFile(uri, options = {}) {
     if (!languageForPath(uri.fsPath) || !vscode.workspace.getWorkspaceFolder(uri)) return;
+    if (!options.bypassIndexQueue && this._queueIndexChange({ kind: "file", uri })) return;
     await this._ensureProjectConfiguration();
     if (this._isExcludedUri(uri)) {
       await this.removeFiles([uri]);
@@ -274,41 +372,45 @@ class AuditSession {
         return;
       }
       const bytes = await vscode.workspace.fs.readFile(uri);
-      await this._replaceAnalysis(uri, Buffer.from(bytes).toString("utf8"));
+      await this._replaceAnalysis(uri, Buffer.from(bytes).toString("utf8"), { unsaved: false });
     } catch (error) {
       this._markWorkspaceCoverageIncomplete(1, { absolutePath: uri.fsPath, relativePath: workspaceRelativePath(uri), reason: String(error.message || error) });
       this.output.warn(`Audit re-index failed for ${uri.fsPath}: ${error.message}`);
     }
   }
 
-  async reindexDocument(document) {
+  async reindexDocument(document, options = {}) {
     if (!languageForPath(document.uri.fsPath) || !vscode.workspace.getWorkspaceFolder(document.uri)) return;
+    const text = document.getText();
+    const unsaved = Boolean(document.isDirty);
+    if (!options.bypassIndexQueue && this._queueIndexChange({ kind: "document", uri: document.uri, text, unsaved })) return;
     await this._ensureProjectConfiguration();
     if (this._isExcludedUri(document.uri)) {
       await this.removeFiles([document.uri]);
       return;
     }
     try {
-      const text = document.getText();
       if (Buffer.byteLength(text, "utf8") > MAX_FILE_SIZE) {
         this._markWorkspaceCoverageIncomplete(1, { absolutePath: document.uri.fsPath, relativePath: workspaceRelativePath(document.uri), reason: `Document exceeds ${MAX_FILE_SIZE} byte limit` });
         await this.removeFiles([document.uri], { coverageLost: true });
         return;
       }
-      await this._replaceAnalysis(document.uri, text);
+      await this._replaceAnalysis(document.uri, text, { unsaved });
     } catch (error) {
       this.output.warn(`Live audit index failed for ${document.uri.fsPath}: ${error.message}`);
     }
   }
 
-  async _replaceAnalysis(uri, text) {
+  async _replaceAnalysis(uri, text, options = {}) {
+    const startedAt = performance.now();
     const result = await this.dataflowWorker.updateFile({
       absolutePath: uri.fsPath,
       relativePath: workspaceRelativePath(uri),
       language: languageForPath(uri.fsPath),
       text,
       version: stableHash(text),
-    }, this._flowOptions());
+      unsaved: Boolean(options.unsaved),
+    }, this._flowOptions(uri));
     const analysis = result.analysis;
     const normalized = normalizePath(uri.fsPath);
     const previousAnalyses = this.analyses;
@@ -322,10 +424,15 @@ class AuditSession {
     }
     if (!this.workspaceIndexBuilt) this.model = { ...this.model, indexIncomplete: true, indexScope: "current-files" };
     await this._reconcileReviewStatuses(this.workspaceCoverageComplete);
+    this._recordIncrementalTiming(performance.now() - startedAt);
     this._changed.fire(this.snapshot);
   }
 
   async removeFiles(uris, options = {}) {
+    if (!options.bypassIndexQueue && this.activeIndexDirtyQueue) {
+      for (const uri of uris) this._queueIndexChange({ kind: "delete", uri });
+      return true;
+    }
     if (options.coverageLost) this.workspaceCoverageComplete = false;
     const removed = new Set(uris.map(uri => normalizePath(uri.fsPath)));
     const analyses = this.analyses.filter(item => !removed.has(normalizePath(item.absolutePath)));
@@ -358,7 +465,66 @@ class AuditSession {
     return true;
   }
 
+  _queueIndexChange(change) {
+    if (!this.activeIndexDirtyQueue) return false;
+    this.activeIndexDirtyQueue.set(normalizePath(change.uri.fsPath), change);
+    return true;
+  }
+
+  _queueOpenDirtyDocuments(dirtyQueue) {
+    for (const document of vscode.workspace.textDocuments || []) {
+      if (!document.isDirty || !languageForPath(document.uri.fsPath) || !vscode.workspace.getWorkspaceFolder(document.uri)) continue;
+      dirtyQueue.set(normalizePath(document.uri.fsPath), { kind: "document", uri: document.uri, text: document.getText() });
+    }
+  }
+
+  async _replayIndexDirtyQueue(dirtyQueue) {
+    const startedAt = performance.now();
+    let applied = 0;
+    const skippedDetails = [];
+    while (dirtyQueue.size) {
+      const batch = [...dirtyQueue.values()];
+      dirtyQueue.clear();
+      for (const change of batch) {
+        try {
+          if (change.kind === "delete") await this.removeFiles([change.uri], { bypassIndexQueue: true });
+          else if (change.kind === "document") {
+            await this.reindexDocument({ uri: change.uri, getText: () => change.text, isDirty: change.unsaved }, { bypassIndexQueue: true });
+          } else await this.reindexFile(change.uri, { bypassIndexQueue: true });
+          applied += 1;
+        } catch (error) {
+          skippedDetails.push({
+            absolutePath: change.uri.fsPath,
+            relativePath: workspaceRelativePath(change.uri),
+            reason: `Dirty update replay failed: ${String(error.message || error)}`,
+          });
+          this.output.warn(`Audit dirty-update replay failed for ${change.uri.fsPath}: ${error.message}`);
+        }
+      }
+    }
+    return { applied, failed: skippedDetails.length, skippedDetails, durationMs: roundMetric(performance.now() - startedAt) };
+  }
+
+  async _loadWorkerReplayFile(metadata) {
+    const openDocument = (vscode.workspace.textDocuments || []).find(document =>
+      normalizePath(document.uri.fsPath) === normalizePath(metadata.absolutePath));
+    if (openDocument?.isDirty) {
+      const text = openDocument.getText();
+      return { ...metadata, text, version: stableHash(text), unsaved: true };
+    }
+    const uri = vscode.Uri.file ? vscode.Uri.file(metadata.absolutePath) : { fsPath: metadata.absolutePath };
+    try {
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      const text = Buffer.from(bytes).toString("utf8");
+      return { ...metadata, text, version: stableHash(text), unsaved: false };
+    } catch (error) {
+      if (isFileNotFound(error)) return undefined;
+      throw error;
+    }
+  }
+
   _applyWorkerResult(dataflow, resetFindings = false) {
+    this._recordWorkerMetrics(dataflow.metadata);
     const analysisModel = buildAuditModel(this.analyses);
     const indexMetadata = {
       indexIncomplete: Boolean(this.model.indexIncomplete),
@@ -378,6 +544,38 @@ class AuditSession {
     };
   }
 
+  _recordWorkerMetrics(metadata = {}) {
+    if (!metadata || typeof metadata !== "object") return;
+    this.performanceReport = {
+      ...this.performanceReport,
+      workerRequestMs: metadata.workerRequestMs ?? this.performanceReport.workerRequestMs,
+      workerRssBytes: metadata.workerRssBytes ?? this.performanceReport.workerRssBytes,
+      workerPeakRssBytes: metadata.workerPeakRssBytes ?? this.performanceReport.workerPeakRssBytes,
+      workerHeapUsedBytes: metadata.workerHeapUsedBytes ?? this.performanceReport.workerHeapUsedBytes,
+      invalidatedFiles: metadata.incrementallyInvalidatedFiles ?? this.performanceReport.invalidatedFiles,
+      invalidatedFunctions: metadata.incrementallyInvalidatedFunctions ?? this.performanceReport.invalidatedFunctions,
+      dataflowMs: metadata.dataflowMs ?? this.performanceReport.dataflowMs,
+      findingPathDiffMs: metadata.findingPathDiffMs ?? this.performanceReport.findingPathDiffMs,
+      workerReplayMs: metadata.workerReplayMs ?? this.performanceReport.workerReplayMs,
+      workerReplayFiles: metadata.workerReplayFiles ?? this.performanceReport.workerReplayFiles,
+      workerReplayRssBytes: metadata.workerReplayRssBytes ?? this.performanceReport.workerReplayRssBytes,
+      workerReplayPeakRssBytes: metadata.workerReplayPeakRssBytes ?? this.performanceReport.workerReplayPeakRssBytes,
+    };
+  }
+
+  _recordIncrementalTiming(durationMs) {
+    const samples = [...(this.performanceReport.incrementalSamplesMs || []), roundMetric(durationMs)].slice(-100);
+    const sorted = [...samples].sort((left, right) => left - right);
+    const p95 = sorted[Math.max(0, Math.ceil(sorted.length * 0.95) - 1)];
+    this.performanceReport = {
+      ...this.performanceReport,
+      incrementalSamplesMs: samples,
+      lastIncrementalMs: roundMetric(durationMs),
+      incrementalP95Ms: p95,
+      extensionHostRssBytes: process.memoryUsage().rss,
+    };
+  }
+
   _flowOptions(uri) {
     const configuration = vscode.workspace.getConfiguration("traceguard", uri);
     return {
@@ -385,15 +583,24 @@ class AuditSession {
       maxPaths: Math.min(400, Math.max(80, configuration.get("flowMaxPaths", 40) * 5)),
       astDifferential: configuration.get("astDifferentialMode", false),
       projectConfiguration: this.projectConfiguration,
+      projectConfigurationsByRoot: this.projectConfigurationsByRoot,
+      projectIdentitiesByRoot: this.projectIdentitiesByRoot,
     };
   }
 
   _isExcludedUri(uri) {
-    const patterns = this.projectConfiguration.excludePaths || [];
+    const patterns = this._projectConfigurationForUri(uri).excludePaths || [];
     if (!patterns.length) return false;
     const folder = vscode.workspace.getWorkspaceFolder(uri);
     const localPath = folder ? path.relative(folder.uri.fsPath, uri.fsPath).replaceAll("\\", "/") : workspaceRelativePath(uri);
     return matchesExcludedPath(localPath, patterns) || matchesExcludedPath(workspaceRelativePath(uri), patterns);
+  }
+
+  _projectConfigurationForUri(uri) {
+    const folder = vscode.workspace.getWorkspaceFolder(uri);
+    if (!folder) return this.projectConfiguration;
+    const root = normalizePath(folder.uri.fsPath);
+    return this.projectConfigurationsByRoot.find(item => normalizePath(item.root) === root)?.configuration || emptyProjectConfiguration();
   }
 
   async rebuildModel() {
@@ -560,6 +767,9 @@ class AuditSession {
       identifier,
       maxDepth: configuration.get("flowMaxDepth", 6),
       maxNodes: configuration.get("queryMaxNodes", 250),
+      indexIncomplete: Boolean(this.model.indexIncomplete),
+      indexScope: this.model.indexScope,
+      indexSkippedFiles: this.model.indexSkippedFiles || 0,
     });
   }
 
@@ -652,6 +862,10 @@ function isFileNotFound(error) {
 
 function firstLine(value) {
   return String(value || "Unknown indexing error").split(/\r?\n/)[0].slice(0, 280);
+}
+
+function roundMetric(value) {
+  return Math.round(Math.max(0, Number(value) || 0) * 100) / 100;
 }
 
 function resolveWorkspacePath(relativePath) {

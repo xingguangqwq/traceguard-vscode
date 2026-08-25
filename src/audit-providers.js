@@ -87,9 +87,12 @@ class FindingItem extends vscode.TreeItem {
     const statusGlyph = { reviewed: "$(pass-filled)", false_positive: "$(circle-slash)", accepted_risk: "$(shield)", suppressed: "$(eye-closed)" }[finding.status] || "$(circle-filled)";
     this.description = `${path.basename(finding.relativePath)}:${finding.line}${finding.pathCount > 1 ? ` · ${finding.pathCount} paths` : ""}`;
     const confidenceReason = finding.explanation?.confidenceReason || "Review the path and call resolution.";
+    const heuristicNotes = finding.explanation?.heuristics?.length
+      ? `\n\nReview notes:\n${finding.explanation.heuristics.map(note => `- ${note}`).join("\n")}`
+      : "";
     const severityMeta = SEVERITY_META[finding.severity] || SEVERITY_META.medium;
     const resolved = finding.status !== "open";
-    this.tooltip = new vscode.MarkdownString(`$(error) **${finding.severity.toUpperCase()} impact** · ${finding.confidence} confidence · ${findingStatusLabel(finding.status)}\n\n${finding.title} (${finding.cwe})\n\nCandidate paths: ${finding.pathCount}\n\nSource: \`${finding.sourceKind}\`\n\nSink: \`${finding.sinkKind}\`\n\nObserved guards: ${observed}\n\nGuards to verify: ${missing}\n\nConfidence: ${confidenceReason}\n\nExpand this item to inspect the Source → Sink path.`);
+    this.tooltip = new vscode.MarkdownString(`$(error) **${finding.severity.toUpperCase()} impact** · ${finding.confidence} confidence · ${findingStatusLabel(finding.status)}\n\n${finding.title} (${finding.cwe})\n\nCandidate paths: ${finding.pathCount}\n\nSource: \`${finding.sourceKind}\`\n\nSink: \`${finding.sinkKind}\`\n\nObserved guards: ${observed}\n\nGuards to verify: ${missing}\n\nConfidence: ${confidenceReason}${heuristicNotes}\n\nExpand this item to inspect the Source → Sink path.`);
     this.iconPath = resolved
       ? new vscode.ThemeIcon(statusGlyph.replace(/\$\((.*)\)/, "$1"), new vscode.ThemeColor("descriptionForeground"))
       : new vscode.ThemeIcon(severityMeta.icon, new vscode.ThemeColor(severityMeta.color));
@@ -103,13 +106,17 @@ class FindingItem extends vscode.TreeItem {
 class FindingPathStep extends vscode.TreeItem {
   constructor(step, index) {
     super(`${index + 1}. ${step.label}`, vscode.TreeItemCollapsibleState.None);
-    this.description = `${step.kind} · ${path.basename(step.relativePath)}:${step.line}`;
+    this.description = `${path.basename(step.relativePath)}:${step.line}`;
+    const stepIcon = { source: "arrow-right", sink: "target", call: "call-outgoing", return: "call-incoming", validation: "verified", authorization: "lock" }[step.kind] || "circle-small-filled";
     this.tooltip = new vscode.MarkdownString();
-    this.tooltip.appendMarkdown(`**${step.kind.toUpperCase()}** · `);
+    this.tooltip.appendMarkdown(`$(${stepIcon}) **${step.kind.toUpperCase()} · ${index + 1}** — `);
     this.tooltip.appendText(step.label);
     if (step.code) this.tooltip.appendCodeblock(step.code);
-    if (step.candidateReason) this.tooltip.appendMarkdown(`\nCall resolution: ${step.candidateReason}`);
-    this.iconPath = new vscode.ThemeIcon({ source: "arrow-right", sink: "target", call: "call-outgoing", return: "call-incoming", validation: "verified", authorization: "lock" }[step.kind] || "circle-small-filled");
+    if (step.candidateReason) this.tooltip.appendMarkdown(`\n\nCall resolution: ${step.candidateReason}`);
+    if (step.kind === "sink" && (step.semanticVerification === "candidate" || /unverified/.test(step.candidateStatus || ""))) {
+      this.tooltip.appendMarkdown("\n\nReview required: the method name matches a sink, but its receiver type was not resolved.");
+    }
+    this.iconPath = new vscode.ThemeIcon(stepIcon);
     this.command = { command: "traceguard.openAuditLocation", title: "Open path step", arguments: [step] };
   }
 }
@@ -149,11 +156,19 @@ class AuditItem extends vscode.TreeItem {
     super(item.title, vscode.TreeItemCollapsibleState.None);
     this.auditItem = item;
     this.description = `${item.language} · ${path.basename(item.relativePath)}:${item.line}`;
+    const statusMeta = {
+      reviewed: { icon: "pass-filled", color: "testing.iconPassed" },
+      in_review: { icon: "debug-pause", color: "editorWarning.foreground" },
+      blocked: { icon: "circle-slash", color: "errorForeground" },
+      unreviewed: { icon: "circle-outline", color: undefined },
+    }[item.status] || { icon: "circle-outline", color: undefined };
     this.tooltip = new vscode.MarkdownString();
-    this.tooltip.appendMarkdown(`**${item.priority}** · `);
+    this.tooltip.appendMarkdown(`$(${statusMeta.icon}) **${item.priority}** · `);
     this.tooltip.appendText(item.title);
-    this.tooltip.appendMarkdown(`\n\n${item.reasons.map(reason => `- ${reason}`).join("\n")}\n\nAudit coverage status: **${statusLabel(item.status)}**`);
-    this.iconPath = new vscode.ThemeIcon(item.status === "reviewed" ? "pass-filled" : item.status === "in_review" ? "debug-pause" : item.status === "blocked" ? "circle-slash" : "circle-outline");
+    this.tooltip.appendMarkdown(`\n\n${item.reasons.map(reason => `- ${reason}`).join("\n")}\n\nReview status: **${statusLabel(item.status)}**`);
+    this.iconPath = statusMeta.color
+      ? new vscode.ThemeIcon(statusMeta.icon, new vscode.ThemeColor(statusMeta.color))
+      : new vscode.ThemeIcon(statusMeta.icon);
     this.contextValue = "traceguard.auditItem";
     this.command = { command: "traceguard.focusAuditItem", title: "Audit this target", arguments: [item] };
   }
@@ -288,11 +303,12 @@ class EvidenceItem extends vscode.TreeItem {
   constructor(item) {
     super(item.note || item.code.trim().slice(0, 70) || `${item.type} evidence`, vscode.TreeItemCollapsibleState.None);
     this.description = `${path.basename(item.relativePath)}:${item.line}`;
+    const tone = { Source: "editorInfo.foreground", Sink: "errorForeground", Authorization: "testing.iconPassed", Validation: "charts.green", Observation: "descriptionForeground" }[item.type] || "descriptionForeground";
     this.tooltip = new vscode.MarkdownString();
-    this.tooltip.appendMarkdown(`**${item.type}**\n\n`);
+    this.tooltip.appendMarkdown(`$(bookmark) **${item.type}** · ${path.basename(item.relativePath)}:${item.line}\n\n`);
     this.tooltip.appendCodeblock(item.code);
-    if (item.note) { this.tooltip.appendMarkdown("\n"); this.tooltip.appendText(item.note); }
-    this.iconPath = new vscode.ThemeIcon("bookmark");
+    if (item.note) { this.tooltip.appendMarkdown("\n\n"); this.tooltip.appendText(item.note); }
+    this.iconPath = new vscode.ThemeIcon(evidenceIcon(item.type), new vscode.ThemeColor(tone));
     this.evidenceItem = item;
     this.contextValue = "traceguard.evidence";
     this.command = { command: "traceguard.openEvidence", title: "Open evidence", arguments: [item] };
@@ -335,7 +351,7 @@ class AuditQueryProvider {
       if (!this.result) return [];
       return [new AuditQueryResultItem(this.result)];
     }
-    if (element.kind === "query-result") return (element.result.roots || []).map(node => new AuditQueryNodeItem(node));
+    if (element.kind === "query-result") return (element.result.roots || []).map(node => new AuditQueryNodeItem(node, true));
     if (element.kind === "query-node") return (element.node.children || []).map(node => new AuditQueryNodeItem(node));
     return [];
   }
@@ -361,9 +377,9 @@ class AuditQueryResultItem extends vscode.TreeItem {
 }
 
 class AuditQueryNodeItem extends vscode.TreeItem {
-  constructor(node) {
+  constructor(node, expand = false) {
     const children = node.children || [];
-    super(node.label, children.length ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None);
+    super(node.label, children.length && expand ? vscode.TreeItemCollapsibleState.Expanded : children.length ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None);
     this.kind = "query-node";
     this.node = node;
     const meta = QUERY_STATUS_META[node.status] || QUERY_STATUS_META.heuristic;

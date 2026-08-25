@@ -5,6 +5,7 @@ const { AttackSurfaceProvider, AuditCodeLensProvider, AuditHoverProvider, AuditQ
 const { AuditSession, workspaceRelativePath } = require("./audit-session");
 const { SUPPORTED_LABEL, SUPPORTED_SELECTORS, languageForPath } = require("./language-support");
 const { markdownFence } = require("./markdown");
+const { normalizeAccessPath } = require("./ir/access-path");
 const { QueryKind, formatQueryMarkdown } = require("./query/audit-query-engine");
 const { buildSarif } = require("./sarif");
 const { normalizePath } = require("./identity");
@@ -272,6 +273,9 @@ class AuditController {
       title: "TraceGuard is querying the analysis graph",
       cancellable: false,
     }, () => this.session.queryAudit(editor.document.uri, editor.selection.active.line, kind, identifier));
+    if (result.coverage?.incomplete && result.coverage.workspaceGraph) {
+      void vscode.window.showWarningMessage("TraceGuard queried a partial workspace index. Missing callers, entries or sinks may exist in files that have not been indexed.");
+    }
     this.lastAuditQuery = result;
     this.queryProvider.setResult(result);
     await vscode.commands.executeCommand("setContext", "traceguard.hasAuditQuery", true);
@@ -541,7 +545,15 @@ class AuditController {
   }
 
   createSarif() {
-    return buildSarif(this.session.snapshot);
+    const folders = vscode.workspace.workspaceFolders || [];
+    const multipleRoots = folders.length > 1;
+    const sourceRoots = folders.map((folder, index) => ({
+      id: multipleRoots ? `SRCROOT_${index + 1}` : "SRCROOT",
+      uri: folder.uri.toString(),
+      pathPrefix: multipleRoots ? `${folder.name}/` : "",
+      description: `TraceGuard workspace folder ${folder.name}.`,
+    }));
+    return buildSarif(this.session.snapshot, { sourceRoots });
   }
 
   async exportReviewSession() {
@@ -588,6 +600,10 @@ class AuditController {
       void this._reloadProjectConfiguration();
       return;
     }
+    if (isProjectIdentityUri(document.uri) && vscode.workspace.isTrusted) {
+      void this._reloadProjectIdentity();
+      return;
+    }
     if (!languageForPath(document.uri.fsPath) || !vscode.workspace.isTrusted) return;
     const key = document.uri.toString();
     clearTimeout(this.documentTimers.get(key));
@@ -597,6 +613,10 @@ class AuditController {
 
   _onChanged(document) {
     if (!languageForPath(document.uri.fsPath) || !vscode.workspace.isTrusted) return;
+    if (this.session.indexing) {
+      void this.session.reindexDocument(document);
+      return;
+    }
     if (!vscode.workspace.getConfiguration("traceguard", document.uri).get("liveIndex", false)) return;
     const key = document.uri.toString();
     clearTimeout(this.documentTimers.get(key));
@@ -610,6 +630,7 @@ class AuditController {
   async _onFilesCreated(files) {
     if (!vscode.workspace.isTrusted) return;
     if (files.some(isProjectConfigurationUri)) await this._reloadProjectConfiguration();
+    if (files.some(isProjectIdentityUri)) await this._reloadProjectIdentity();
     for (const uri of files) await this.session.reindexFile(uri);
   }
 
@@ -617,6 +638,7 @@ class AuditController {
     if (!vscode.workspace.isTrusted) return;
     await this.session.removeFiles(files);
     if (files.some(isProjectConfigurationUri)) await this._reloadProjectConfiguration();
+    if (files.some(isProjectIdentityUri)) await this._reloadProjectIdentity();
   }
 
   async _onFilesRenamed(files) {
@@ -624,11 +646,17 @@ class AuditController {
     await this.session.removeFiles(files.map(item => item.oldUri));
     for (const item of files) await this.session.reindexFile(item.newUri);
     if (files.some(item => isProjectConfigurationUri(item.oldUri) || isProjectConfigurationUri(item.newUri))) await this._reloadProjectConfiguration();
+    if (files.some(item => isProjectIdentityUri(item.oldUri) || isProjectIdentityUri(item.newUri))) await this._reloadProjectIdentity();
   }
 
   async _reloadProjectConfiguration() {
     const result = await this.session.reloadProjectConfiguration({ rebuild: !this.session.workspaceIndexBuilt });
-    if (result.valid && result.changed && this.session.workspaceIndexBuilt) await this.refresh(false);
+    if (result.changed && this.session.workspaceIndexBuilt) await this.refresh(false);
+  }
+
+  async _reloadProjectIdentity() {
+    const result = await this.session.reloadProjectIdentities();
+    if (result.changed && this.session.workspaceIndexBuilt) await this.refresh(false);
   }
 
   _onSessionChanged() {
@@ -676,10 +704,16 @@ class AuditController {
   _updateDecorations(editor) {
     if (!editor || !languageForPath(editor.document.uri.fsPath)) return;
     const enabled = vscode.workspace.getConfiguration("traceguard", editor.document.uri).get("showAuditSignals", true);
+    const hoverIcons = { source: "$(arrow-right)", sink: "$(target)", auth: "$(lock)", sanitizer: "$(verified)" };
     for (const [kind, decoration] of Object.entries(this.decorations)) {
       const ranges = enabled ? (this.session.analysisForUri(editor.document.uri)?.signals || [])
         .filter(signal => signal.kind === kind && signal.line > 0 && signal.line <= editor.document.lineCount)
-        .map(signal => ({ range: editor.document.lineAt(Math.max(0, signal.line - 1)).range, hoverMessage: `TraceGuard ${signal.kind}: ${signal.label}` })) : [];
+        .map(signal => {
+          const hover = new vscode.MarkdownString();
+          hover.appendMarkdown(`${hoverIcons[kind] || "$(eye)"} **TraceGuard ${kind}** — ${signal.label}\n\n`);
+          hover.appendMarkdown("$(info) Audit clue, not a confirmed vulnerability.");
+          return { range: editor.document.lineAt(Math.max(0, signal.line - 1)).range, hoverMessage: hover };
+        }) : [];
       editor.setDecorations(decoration, ranges);
     }
   }
@@ -714,7 +748,7 @@ class AuditController {
 
   _updateConfigurationDiagnostics() {
     const byUri = new Map();
-    for (const issue of this.session.projectConfigurationIssues || []) {
+    for (const issue of [...(this.session.projectConfigurationIssues || []), ...(this.session.projectIdentityIssues || [])]) {
       if (!issue.source) continue;
       const uri = vscode.Uri.file(issue.source);
       const key = uri.toString();
@@ -760,15 +794,19 @@ function isProjectConfigurationUri(uri) {
   return path.basename(uri?.fsPath || "").toLowerCase() === ".traceguard.json";
 }
 
+function isProjectIdentityUri(uri) {
+  return path.basename(uri?.fsPath || "").toLowerCase() === "composer.json";
+}
+
 function selectedAccessPath(editor) {
   const selected = editor.document.getText(editor.selection).trim();
-  const accessPath = /^[A-Za-z_$][\w$]*(?:(?:\?\.|\.)[A-Za-z_$][\w$]*|\[\d+\])*$/;
-  if (accessPath.test(selected)) return selected.replace(/\?\./g, ".");
+  const accessPath = /^\$?[A-Za-z_][\w$]*(?:(?:\?\.|\.)[A-Za-z_$][\w$]*|\[(?:\d+|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')\])*$/;
+  if (accessPath.test(selected)) return normalizeAccessPath(selected, { dynamic: false });
   const range = editor.document.getWordRangeAtPosition(
     editor.selection.active,
-    /[A-Za-z_$][\w$]*(?:(?:\?\.|\.)[A-Za-z_$][\w$]*|\[\d+\])*/,
+    /\$?[A-Za-z_][\w$]*(?:(?:\?\.|\.)[A-Za-z_$][\w$]*|\[(?:\d+|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')\])*/,
   );
-  return range ? editor.document.getText(range).replace(/\?\./g, ".") : "";
+  return range ? normalizeAccessPath(editor.document.getText(range), { dynamic: false }) : "";
 }
 
 function flowPathSummary(flowPath) {
@@ -854,4 +892,4 @@ function buildReport(audit) {
   return lines.join("\n");
 }
 
-module.exports = { AuditController, buildReport, createDecorations };
+module.exports = { AuditController, buildReport, createDecorations, selectedAccessPath };

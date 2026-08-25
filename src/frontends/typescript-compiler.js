@@ -37,6 +37,16 @@ class TypeScriptProject {
     this.dirty = true;
   }
 
+  canAnalyzeIsolated(absolutePath, text) {
+    const key = compilerFileKey(absolutePath);
+    if (!key || !this.files.has(key)) return false;
+    if ((this.moduleDependencies.get(key) || new Set()).size) return false;
+    if ((this.moduleDependents.get(key) || new Set()).size) return false;
+    const record = this.files.get(key);
+    const sourceFile = ts.createSourceFile(record.fileName, String(text || ""), ts.ScriptTarget.Latest, true, scriptKindFor(record.fileName, record.language));
+    return moduleNamesFromSourceFile(sourceFile).length === 0;
+  }
+
   remove(absolutePath) {
     if (this.files.delete(compilerFileKey(absolutePath))) this.dirty = true;
   }

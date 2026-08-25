@@ -9,8 +9,13 @@ const { runDataflowAnalysis } = require("../dataflow/pipeline");
 const { evaluateFlowPaths } = require("../rules/rule-engine");
 const { runAuditQuery } = require("../query/audit-query-engine");
 const { runtime } = require("../frontends/tree-sitter-runtime");
-const { TypeScriptProject } = require("../frontends/typescript-compiler");
+const { TypeScriptProject, createCompilerModel } = require("../frontends/typescript-compiler");
 const { IncrementalAnalysisCache, fileKey } = require("./incremental-cache");
+const { analysisContentDigest } = require("./content-digest");
+const { configurationForAbsolutePath, scopedConfigurationFingerprint } = require("../config/configuration-scope");
+const { workspaceRootForAbsolutePath } = require("../config/configuration-scope");
+const { composerPathsForType, projectIdentityFingerprint, projectIdentityForAbsolutePath } = require("../config/project-identity");
+const { frameworkParameterRoles } = require("../frontends/framework-entries");
 
 class WorkspaceAnalysisEngine {
   constructor() {
@@ -23,6 +28,8 @@ class WorkspaceAnalysisEngine {
     this.generation = 0;
     this.typescriptProject = new TypeScriptProject();
     this.entryBindingFingerprints = new Map();
+    this.flowFunctions = [];
+    this.functionIndex = new Map();
   }
 
   async initializeWorkspace(files, options = {}) {
@@ -61,15 +68,46 @@ class WorkspaceAnalysisEngine {
     const previous = this.files.get(key);
     const typeAware = ["javascript", "typescript"].includes(file.language) ||
       ["javascript", "typescript"].includes(previous?.analysis?.language);
-    const previousTypeDependents = typeAware ? this.typescriptProject.dependentsOf(file.absolutePath) : [];
+    const isolatedCompilerUpdate = typeAware && this.typescriptProject.canAnalyzeIsolated(file.absolutePath, file.text);
+    const previousTypeDependents = typeAware && !isolatedCompilerUpdate ? this.typescriptProject.dependentsOf(file.absolutePath) : [];
     this.typescriptProject.update(file);
-    const record = await this._analyzeFile(file);
+    const record = await this._analyzeFile(file, { isolatedCompiler: isolatedCompilerUpdate });
     if (previous?.version === record.version) {
       return {
         analysis: previous.analysis,
         cacheHit: true,
         affectedFiles: [],
         ...(options.reanalyze === false ? {} : this.reanalyzeAffectedFunctions()),
+      };
+    }
+    if (previous?.irFingerprint === record.irFingerprint) {
+      record.dependencyFunctionIds = [...(previous.dependencyFunctionIds || [])];
+      this.files.set(key, record);
+      this.cache.updateFile({
+        absolutePath: record.analysis.absolutePath,
+        version: record.version,
+        analysis: record.analysis,
+        functionSummaries: record.summaries,
+        dependencyFunctionIds: record.dependencyFunctionIds,
+      });
+      return {
+        analysis: record.analysis,
+        cacheHit: false,
+        semanticNoop: true,
+        changedFunctionIds: [],
+        reparsedTypeDependents: [],
+        affectedFiles: [],
+        findingDelta: { upsert: [], removedIds: [] },
+        pathDelta: { upsert: [], removedIds: [] },
+        metadata: {
+          ...this.dataflow.metadata,
+          generation: this.generation,
+          incrementallyInvalidatedFiles: 0,
+          incrementallyInvalidatedFunctions: 0,
+          dataflowMs: 0,
+          findingPathDiffMs: 0,
+          semanticNoop: true,
+        },
       };
     }
 
@@ -87,7 +125,7 @@ class WorkspaceAnalysisEngine {
     this.files.set(key, record);
     const changedFunctionIds = new Set(invalidation.changedFunctionIds);
     const invalidatedFiles = new Set(invalidation.invalidatedFiles);
-    const nextTypeDependents = typeAware ? this.typescriptProject.dependentsOf(file.absolutePath) : [];
+    const nextTypeDependents = typeAware && !isolatedCompilerUpdate ? this.typescriptProject.dependentsOf(file.absolutePath) : [];
     const reparsedTypeDependents = new Set([...previousTypeDependents, ...nextTypeDependents]);
     reparsedTypeDependents.delete(key);
     for (const dependentKey of reparsedTypeDependents) {
@@ -113,7 +151,7 @@ class WorkspaceAnalysisEngine {
     this.pendingAffectedFiles.add(key);
     for (const caller of this._filesCallingAny(changedNames)) this.pendingAffectedFiles.add(caller);
     for (const functionId of this._applyProjectEntryBindings()) changedFunctionIds.add(functionId);
-    this._rebuildDependencies();
+    this._rebuildDependencies(this.pendingAffectedFiles);
     this._queueAffectedFunctions([...changedFunctionIds]);
 
     const base = {
@@ -168,7 +206,7 @@ class WorkspaceAnalysisEngine {
     for (const caller of this._filesCallingAny(changedNames)) this.pendingAffectedFiles.add(caller);
     this.pendingAffectedFiles.delete(key);
     for (const functionId of this._applyProjectEntryBindings()) changedFunctionIds.add(functionId);
-    this._rebuildDependencies();
+    this._rebuildDependencies(this.pendingAffectedFiles);
     this._queueAffectedFunctions([...changedFunctionIds]);
     const base = {
       removed: true,
@@ -186,6 +224,7 @@ class WorkspaceAnalysisEngine {
   }
 
   reanalyzeAffectedFunctions(options = {}) {
+    const analysisStartedAt = performance.now();
     const { forceAll = false, ...analysisOptions } = options;
     this.options = { ...this.options, ...analysisOptions };
     const affectedFiles = forceAll ? [...this.files.keys()] : [...this.pendingAffectedFiles];
@@ -202,10 +241,15 @@ class WorkspaceAnalysisEngine {
     }
     const previous = this.dataflow;
     let next;
+    const runtimeOptions = {
+      ...this.options,
+      _flowFunctions: this.flowFunctions,
+      _functionIndex: this.functionIndex,
+    };
     if (forceAll || !previous.paths.length) {
-      next = runDataflowAnalysis(this.analyses(), this.options);
+      next = runDataflowAnalysis(this.analyses(), runtimeOptions);
     } else {
-      const partial = runDataflowAnalysis(this.analyses(), { ...this.options, rootFunctionIds: affectedFunctionIds });
+      const partial = runDataflowAnalysis(this.analyses(), { ...runtimeOptions, rootFunctionIds: affectedFunctionIds });
       const invalidated = new Set(affectedFunctionIds);
       const retained = previous.paths.filter(flow => !invalidated.has(flow.rootFunctionId) &&
         !(flow.touchedFunctionIds || []).some(functionId => invalidated.has(functionId)));
@@ -224,15 +268,21 @@ class WorkspaceAnalysisEngine {
     this.pendingAffectedFiles.clear();
     this.pendingAffectedFunctionIds.clear();
     this.generation += 1;
+    const diffStartedAt = performance.now();
+    const findingDelta = diffById(previous.findings, next.findings);
+    const pathDelta = diffById(previous.paths, next.paths);
+    const diffMs = performance.now() - diffStartedAt;
     return {
       affectedFiles,
-      findingDelta: diffById(previous.findings, next.findings),
-      pathDelta: diffById(previous.paths, next.paths),
+      findingDelta,
+      pathDelta,
       metadata: {
         ...next.metadata,
         generation: this.generation,
         incrementallyInvalidatedFiles: affectedFiles.length,
         incrementallyInvalidatedFunctions: affectedFunctionIds.length,
+        dataflowMs: roundMetric(performance.now() - analysisStartedAt - diffMs),
+        findingPathDiffMs: roundMetric(diffMs),
       },
     };
   }
@@ -242,7 +292,9 @@ class WorkspaceAnalysisEngine {
     const changed = JSON.stringify(previousOptions) !== JSON.stringify({ ...previousOptions, ...options });
     const nextOptions = { ...previousOptions, ...options };
     const frontendChanged = previousOptions.astDifferential !== nextOptions.astDifferential ||
-      previousOptions.projectConfiguration?.semanticFingerprint !== nextOptions.projectConfiguration?.semanticFingerprint;
+      previousOptions.projectConfiguration?.semanticFingerprint !== nextOptions.projectConfiguration?.semanticFingerprint ||
+      scopedConfigurationFingerprint(previousOptions.projectConfigurationsByRoot) !== scopedConfigurationFingerprint(nextOptions.projectConfigurationsByRoot) ||
+      projectIdentityFingerprint(previousOptions.projectIdentitiesByRoot) !== projectIdentityFingerprint(nextOptions.projectIdentitiesByRoot);
     this.options = nextOptions;
     if (!changed) return {
       affectedFiles: [],
@@ -257,50 +309,64 @@ class WorkspaceAnalysisEngine {
   }
 
   queryPaths(options = {}) {
-    return runDataflowAnalysis(this.analyses(), { ...this.options, ...options });
+    return runDataflowAnalysis(this.analyses(), {
+      ...this.options,
+      ...options,
+      _flowFunctions: this.flowFunctions,
+      _functionIndex: this.functionIndex,
+    });
   }
 
   queryAudit(options = {}) {
-    return runAuditQuery(this.analyses(), options);
+    return runAuditQuery(this.analyses(), { ...this.options, ...options });
   }
 
   analyses() {
     return [...this.files.values()].map(record => record.analysis);
   }
 
-  async _analyzeFile(file) {
+  async _analyzeFile(file, options = {}) {
     if (file.analysis?.ir) {
       return {
         analysis: file.analysis,
         version: file.version || stableHash(JSON.stringify(file.analysis.ir)),
         summaries: summarizeFileIR(file.analysis.ir),
+        irFingerprint: semanticIrFingerprint(file.analysis.ir),
         dependencyFunctionIds: [],
         source: file,
       };
     }
     const compilerModel = ["javascript", "typescript"].includes(file.language)
-      ? this.typescriptProject.modelFor(file.absolutePath)
+      ? options.isolatedCompiler
+        ? createCompilerModel(file.text, file.absolutePath, file.language)
+        : this.typescriptProject.modelFor(file.absolutePath)
       : undefined;
+    const projectConfiguration = configurationForAbsolutePath(this.options, file.absolutePath);
     const analysis = await analyzeTextAsync(file.text, file.language, file.absolutePath, file.relativePath, {
       differential: Boolean(this.options.astDifferential),
       compilerModel,
-      semanticModels: this.options.projectConfiguration?.semanticModels || [],
+      semanticModels: projectConfiguration?.semanticModels || [],
     });
     return {
       analysis,
       version: file.version || stableHash(file.text),
       summaries: summarizeFileIR(analysis.ir),
+      irFingerprint: semanticIrFingerprint(analysis.ir),
       dependencyFunctionIds: [],
       source: { ...file },
     };
   }
 
-  _rebuildDependencies() {
+  _rebuildDependencies(affectedFiles) {
     const analyses = this.analyses();
-    const functions = functionsFromAnalyses(analyses);
+    const functions = functionsFromAnalyses(analyses, this.options);
     const index = buildFunctionIndex(functions);
+    this.flowFunctions = functions;
+    this.functionIndex = index;
+    const affected = affectedFiles ? new Set([...affectedFiles].map(fileKey)) : undefined;
     const byFile = new Map();
     for (const caller of functions) {
+      if (affected && !affected.has(fileKey(caller.absolutePath))) continue;
       const dependencies = byFile.get(fileKey(caller.absolutePath)) || new Set();
       for (const event of caller.events.filter(event => event.type === "call" && event.callee)) {
         for (const resolution of resolveCandidates(index, event, caller)) dependencies.add(resolution.fn.id);
@@ -308,6 +374,7 @@ class WorkspaceAnalysisEngine {
       byFile.set(fileKey(caller.absolutePath), dependencies);
     }
     for (const [key, record] of this.files) {
+      if (affected && !affected.has(key)) continue;
       record.dependencyFunctionIds = [...(byFile.get(key) || [])];
       this.cache.replaceDependencies(record.analysis.absolutePath, record.dependencyFunctionIds);
     }
@@ -322,6 +389,28 @@ class WorkspaceAnalysisEngine {
     }
     for (const analysis of this.analyses()) {
       for (const entry of analysis.ir.entryPoints || []) {
+        if (!entry.handler) continue;
+        entry.functionId = undefined;
+        entry.symbolKey = undefined;
+        entry.bindingStatus = "unresolved";
+      }
+    }
+    const flowFunctions = functionsFromAnalyses(this.analyses(), this.options);
+    for (const analysis of this.analyses()) {
+      for (const entry of analysis.ir.entryPoints || []) {
+        if (entry.handler && !entry.functionId) {
+          const projectIdentity = projectIdentityForAbsolutePath(this.options, analysis.absolutePath);
+          const workspaceRoot = workspaceRootForAbsolutePath(this.options, analysis.absolutePath) || projectIdentity?.workspaceRoot;
+          const candidates = resolveProjectEntryHandler(entry.handler, flowFunctions, workspaceRoot, projectIdentity);
+          if (candidates.length === 1) {
+            entry.functionId = candidates[0].id;
+            entry.symbolKey = candidates[0].symbolKey;
+            entry.bindingStatus = "verified";
+            if (!entry.parameterRoles?.length) {
+              entry.parameterRoles = frameworkParameterRoles(entry, candidates[0].parameterDetails || []);
+            }
+          } else entry.bindingStatus = candidates.length ? "ambiguous" : "unresolved";
+        }
         const fn = functions.get(entry.functionId);
         if (!fn) continue;
         const binding = {
@@ -396,9 +485,40 @@ class WorkspaceAnalysisEngine {
   }
 }
 
+function resolveProjectEntryHandler(handler, functions, workspaceRoot, projectIdentity) {
+  const candidates = functions.filter(fn =>
+    fn.language === handler.language &&
+    fn.name.toLowerCase() === String(handler.functionName || "").toLowerCase() &&
+    (!workspaceRoot || !fn.workspaceRoot || normalizePath(fn.workspaceRoot) === normalizePath(workspaceRoot)));
+  if (handler.language === "php") {
+    const target = normalizePhpHandlerType(handler.targetType || handler.className);
+    const mappedPaths = composerPathsForType(projectIdentity, handler.targetType);
+    const precise = candidates.filter(fn => {
+      if (mappedPaths.length && mappedPaths.includes(normalizePath(fn.absolutePath))) return true;
+      return normalizePhpHandlerType(fn.qualifiedEnclosingScope) === target;
+    });
+    if (precise.length) return precise;
+    if (mappedPaths.length || String(handler.targetType || "").includes("\\")) return [];
+    return candidates.filter(fn => normalizePhpHandlerType(fn.enclosingScope) === normalizePhpHandlerType(handler.className));
+  }
+  if (handler.language === "python") {
+    const expectedModule = String(handler.moduleName || "").replaceAll(".", "/").replace(/^\/+|\/+$/g, "").toLowerCase();
+    if (!expectedModule) return [];
+    return candidates.filter(fn => {
+      const modulePath = String(fn.relativePath || "").replaceAll("\\", "/").replace(/\.py$/i, "").replace(/\/__init__$/i, "").toLowerCase();
+      return modulePath === expectedModule || modulePath.endsWith(`/${expectedModule}`);
+    });
+  }
+  return [];
+}
+
+function normalizePhpHandlerType(value) {
+  return String(value || "").replace(/^\\+/, "").replace(/[\\/]+/g, ".").toLowerCase();
+}
+
 function diffById(previous, current) {
-  const before = new Map((previous || []).map(item => [item.id, JSON.stringify(item)]));
-  const after = new Map((current || []).map(item => [item.id, JSON.stringify(item)]));
+  const before = new Map((previous || []).map(item => [item.id, analysisContentDigest(item)]));
+  const after = new Map((current || []).map(item => [item.id, analysisContentDigest(item)]));
   return {
     upsert: (current || []).filter(item => before.get(item.id) !== after.get(item.id)),
     removedIds: [...before.keys()].filter(id => !after.has(id)),
@@ -407,6 +527,16 @@ function diffById(previous, current) {
 
 function emptyDataflow() {
   return { paths: [], findings: [], metadata: { truncated: false, explorationTruncated: false, totalCandidates: 0 } };
+}
+
+function roundMetric(value) {
+  return Math.round(Math.max(0, value) * 100) / 100;
+}
+
+function semanticIrFingerprint(ir = {}) {
+  const { lines: _sourceLines, frontend = {}, ...semanticIr } = ir;
+  const { incremental: _incrementalParse, ...frontendCapability } = frontend;
+  return stableHash(JSON.stringify({ ...semanticIr, frontend: frontendCapability }), 32);
 }
 
 module.exports = { WorkspaceAnalysisEngine, diffById };

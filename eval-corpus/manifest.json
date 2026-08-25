@@ -1,0 +1,54 @@
+{
+  "schema": "traceguard-eval-corpus",
+  "version": 1,
+  "cases": [
+    {
+      "id": "java-prepared-statement",
+      "language": "java",
+      "projectDir": "java/prepared-statement",
+      "repository": "local-regression-fixture",
+      "commit": "traceguard-0.9.0-baseline",
+      "vulnerability": "CWE-89 dynamic SQL passed to Connection.prepareStatement",
+      "expected": [{
+        "ruleId": "potential-sql-injection",
+        "relativePath": "SearchController.java",
+        "sinkLine": 6,
+        "requiredFunctions": ["handle"],
+        "allowHeuristic": false
+      }],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "php-unknown-pdo-receiver",
+      "language": "php",
+      "projectDir": "php/unknown-receiver",
+      "repository": "local-regression-fixture",
+      "commit": "traceguard-0.9.0-baseline",
+      "vulnerability": "CWE-89 request data reaches an unresolved query receiver",
+      "expected": [{
+        "ruleId": "potential-sql-injection",
+        "relativePath": "search.php",
+        "sinkLine": 5,
+        "requiredFunctions": ["run"],
+        "allowHeuristic": true
+      }],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "python-sqlite-cursor",
+      "language": "python",
+      "projectDir": "python/sqlite-cursor",
+      "repository": "local-regression-fixture",
+      "commit": "traceguard-0.9.0-baseline",
+      "vulnerability": "CWE-89 request data reaches sqlite3 Cursor.execute",
+      "expected": [{
+        "ruleId": "potential-sql-injection",
+        "relativePath": "search.py",
+        "sinkLine": 6,
+        "requiredFunctions": ["search"],
+        "allowHeuristic": false
+      }],
+      "falsePositiveMax": 0
+    }
+  ]
+}

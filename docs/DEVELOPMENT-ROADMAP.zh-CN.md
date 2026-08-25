@@ -1,6 +1,6 @@
-# TraceGuard 0.1 → 0.7：开发实录与后续路线
+# TraceGuard 0.1 → 0.9：开发实录与后续路线
 
-这份文档记录 TraceGuard 从 0.1 到 0.7 的制作过程、几次关键转向、已经形成的架构，以及后续版本应该继续解决什么问题。
+这份文档记录 TraceGuard 从 0.1 到 0.9 的制作过程、几次关键转向、已经形成的架构，以及后续版本应该继续解决什么问题。
 
 TraceGuard 当前的产品定位是：
 
@@ -18,10 +18,11 @@ TraceGuard 当前的产品定位是：
 | 0.6 | 把功能堆叠改造成可演进的分析架构 | 统一 IR、Frontend Registry、数据流与规则分层、Worker、稳定 ID、状态迁移、SARIF 和发布流程 | 形成 SAST 地基，但部分分析仍从 Pattern/正则结果转换而来 |
 | 0.7 | 让 AST、增量分析和可解释数据流真正进入主链 | 七语言 Tree-sitter WASM、JS/TS Compiler API、精确 source span、CFG/def-use、函数摘要、持久 Worker、项目级入口绑定、参数 provenance、规则专用 guard/sanitizer | TraceGuard 从“正则辅助审计工具”升级为可运行的轻量 SAST RC |
 | 0.8 | 聚焦后端审计并先打穿 Java | 公共 CFG/传播/查询内核、Spring/JAX-RS/Servlet、DTO Access Path、接口与实现、重载、MyBatis/JDBC/JPA、Spring HTTP 客户端 | 从平均覆盖七种语言改为 Java/PHP/Python Tier A，并完成第一条真实 Java 分层路径 |
+| 0.9 | 形成可在真实后端仓库稳定运行的完整候选版 | Worker/索引竞态恢复、多根身份闭环、Composer PSR-4、未知 receiver 降级、三语言增量门禁与评测基线 | Java/PHP/Python 的正确性、失败模式和性能开始由可重复数据约束，而不是只看单元测试 |
 
 ## 各版本是怎么一步步做出来的
 
-下面不是简单的功能清单，而是按“当时的代码状态 → 实际开发步骤 → 遇到的问题 → 最终留下什么”记录 0.1 到 0.7 的制作过程。
+下面不是简单的功能清单，而是按“当时的代码状态 → 实际开发步骤 → 遇到的问题 → 最终留下什么”记录 0.1 到 0.9 的制作过程。
 
 ### 0.1：先跑通 VS Code 内扫描闭环
 
@@ -957,40 +958,103 @@ Spring Controller
 
 开发过程仍按“失败样本 → 模块级修复 → 聚焦测试 → 全量测试 → 静态检查 → coverage/benchmark → Extension Host → VSIX 解包核验”推进。只有源码版本、package lock、README/CHANGELOG、运行时依赖、WASM、Schema、许可证和实际 VSIX 一致时，0.8.0 才算完成。
 
-### 0.8.1：PHP 项目语义
+### 0.9.0：身份正确性、PHP/Python 框架语义与查询一致性
 
-下一版只集中处理 PHP，不同时扩 Java/Python 规则：
+0.9 没有把 0.8.1 和 0.8.2 的清单机械地拼在一起。实际开发从一批可稳定复现的错误开始，先修会让路径连错、漏掉或把安全代码报成漏洞的地方，再把修复下沉到共享接口。
 
-- Laravel/Symfony Route → Controller → Request → Service；
-- Composer PSR-4、Namespace 与 `use ... as ...`；
-- 类方法、继承、Interface、Trait 和有限动态调用；
-- PDO、Doctrine、Guzzle、文件与 Shell Sink；
-- 无法解析的 magic method、container resolve 和动态 method name 给出明确中断原因。
+#### 第一轮：Java 调用先解析 package/import，再截断候选
 
-验收 fixture 必须跨 namespace 和文件，包含安全参数绑定、同名类、Trait wrapper、动态调用中断及 vulnerable/safe 对照。
+旧调用解析先比较 `ToolService` 这样的简单类型名，收集到多个候选后只保留前六个。项目中只要不同 package 存在较多同名 Service，显式 import 的真正实现就可能排在第七个并被丢弃；候选较少时又可能进入没有 import 的同名危险实现。
 
-### 0.8.2：Python 项目语义
+修复顺序如下：
 
-随后单独打穿 Python：
+1. Java Frontend 从 AST 提取 `package`，函数 IR 同时保存 `packageName` 和 `qualifiedEnclosingScope`；
+2. 调用点先根据 receiver 声明类型查当前文件的显式 import；
+3. 候选类型用自己的 package、import、`implements`/`extends` 还原限定名；
+4. 与显式 import 冲突的候选在评分前剔除，匹配候选先加高分，最后才应用数量上限；
+5. 没有 package 事实的旧 IR 仍保留为低证据 fallback，避免把解析不完整误当成“不可能调用”。
 
-- Flask、FastAPI、Django 入口与参数 provenance；
-- Pydantic、Dataclass 和 dict 字段 Access Path；
-- 包/相对导入、alias、类方法、继承和装饰器 wrapper；
-- `*args`、`**kwargs`、async/await、context manager、closure 与跨模块返回；
-- DB-API、Django raw、subprocess、文件、HTTP、反序列化、模板与 XML Sink；
-- SQL 参数绑定、`shlex.quote` 返回值作用域、可信根目录、URL allowlist、safe loader、defusedxml 和字段级 validation。
+同一轮把 `@WebServlet("/tool")` 从类注解直接绑定到 `doGet`/`doPost`，不再生成 `POST <dynamic>`。
 
-目标 fixture 是：
+#### 第二轮：Forward Query 真正执行 CFG strong update
+
+Finding 已经会在 `x = "safe"` 后清除旧污点，Forward Query 却只过滤语法位置更靠后的 consumer，因此仍会显示 verified sink。修复没有在 UI 层隐藏节点，而是在 Query Engine 中按每条可行 CFG event sequence 维护 taint 集合：
+
+```text
+x = request input
+→ x 被污染
+→ x = constant
+→ 当前路径清除 x 及其被强覆盖的子路径
+→ exec(x) 不再可达
+```
+
+只有至少一条 CFG 路径保留污染时，consumer 才进入查询树。跨文件参数映射同时记录 `inputAccessPath`、`outputAccessPath` 和参数位置理由，使 `body.url → url` 这样的边在 Finding 与 Query 中使用同一事实。
+
+#### 第三轮：PHP 从方法名匹配改成 receiver-aware 模型
+
+先用三组对照代码确定旧行为：业务对象 `$runner->exec()` 被同时当成命令和 SQL、Laravel `$request->query()` 被当成 SQL Sink、真正的 `$request->input()` 到 `DB::select()` 反而没有路径。
+
+随后做了这些改动：
+
+1. PHP AST 引用表记录 namespace、`use` 和 `$value = new Type()` 的局部 receiver 类型；
+2. `Request::input/query/get` 只在 receiver 属于 Laravel/Symfony Request 或 ParameterBag/InputBag 时生成 HTTP Source；
+3. PDO、Laravel DB facade、Query/Eloquent Builder 的 raw query 方法进入 Semantic Model Registry，并声明污染参数位置；
+4. PHP 全局 `system/exec/shell_exec/passthru/popen/proc_open` 与任意对象的同名方法分开；
+5. Pattern 层发现的 `->query()`/`->exec()` 候选必须经过 AST receiver 验证，验证不了只保留普通调用，不能直接生成高置信 Sink；
+6. Symfony `#[Route]` 从 attribute AST 提取 method/route 并绑定 controller 函数，`$request->query->get()` 保留为输入源。
+
+这样规则仍然只有原来的 SQL/命令规则，变化发生在“这个调用究竟是不是安全 API”这一层。
+
+#### 第四轮：Python 区分框架输入、依赖和标准库身份
+
+FastAPI 入口过去把角色未知的参数全部播种为 HTTP 输入，`db: Session = Depends(get_db)` 会污染数据库会话，常量 `db.execute("SELECT 1")` 也可能被报成 SQL 注入。0.9 先从参数 AST 和默认值建立 provenance：
+
+- `Query/Body/Path/Header/Cookie/Form/File/UploadFile` 对应具体输入角色；
+- Pydantic model 默认是 body；
+- `Depends(...)` 根据类型区分 service、database、logger 等非输入角色；
+- 无法证明的参数保留 unknown 和较低置信度，不再依赖 `req/res/db` 变量名猜测。
+
+标准库调用则要求 module/import 或 receiver 类型匹配。`import os; os.system(value)` 能绑定命令 Sink；局部执行 `os = SafeRunner()` 后，同名 `os.system()` 会被 local type/shadowing 事实拒绝。相同方法用于 `subprocess`、DB-API/SQLAlchemy、`requests/httpx/urllib` 模型。
+
+Python 方法参数映射还要跳过隐式 `self`/`cls`。否则调用方参数 0 会错误落到 `self`，跨类路径在第一跳就断开。修复后固定目标路径可以贯通：
 
 ```text
 @router.post("/fetch")
 → Pydantic body.url
-→ async service.download()
+→ async DownloadService.download(url)
 → httpx.AsyncClient.get(url)
 → SSRF Finding
 ```
 
-0.8.2 完成后再回到 Java/PHP/Python 循环提高，不把七门语言重新拉回平均投入。
+#### 第五轮：多根工作区配置按文件归属隔离
+
+以前多个根目录的 `.traceguard.json` 会先合并，再交给所有文件。根 A 的自定义 Sink、规则开关和 `generated/**` 排除项会影响根 B。
+
+0.9 保留合并后的摘要供 UI 展示，但 Worker 分析文件和 Rule Engine 评估 Finding 时，会按绝对路径选择最长匹配的 workspace root 配置。文件发现只使用内置通用排除，项目排除项在 `getWorkspaceFolder(uri)` 确定根目录后单独判断。这样同一个 VS Code 窗口中的两个仓库拥有独立语义和排除范围。
+
+#### 第六轮：把“不完整”写进查询协议
+
+`Find Callers`、`Trace to Entry` 和 `Reachable Sinks` 依赖工作区全局索引。当前只分析过一个文件或存在跳过文件时，空结果不能解释成“没有调用者”。AuditSession 现在把 `indexIncomplete`、scope 和 skipped count 传入 Worker；Query Engine 在路径树根部加入 coverage 节点，Controller 同时给出提示。quoted Access Path 选择也扩展到 `$_GET['cmd']`、`obj["key"]` 和数组索引，并在进入查询前规范化。
+
+### 0.9.0：稳定性、身份与评测冻结
+
+原计划留到 0.9.1 的正确性收口已经并入唯一的 0.9.0：Java 同 package/通配 import/传递接口解析、PHP Composer PSR-4、Python 自定义 receiver 消歧、多根调用图隔离和候选过滤顺序均已进入主线。全量索引拥有独立超时；索引期间的保存和删除会在快照后重放；单根配置损坏不再阻塞其他根。
+
+无法证明的数据库 receiver 会作为 LOW/REVIEW 候选显示，已经证明为安全业务类型的同名方法会被拒绝。未验证 Guard 只提供失败提示，不能抑制 Finding。Worker 正常镜像只保留文件元数据，崩溃恢复从磁盘读取已保存内容，并单独保留未保存缓冲区。
+
+发布基线包含三门 Tier A 语言的 1,000 文件初始化、无关保存和真实 IR 更新，以及单独的 8,000 文件超时压力测试。`eval-corpus` 固定记录 Source、Sink、关键函数、允许的 heuristic 和误报上限，比较脚本会拒绝检出回退、误报增长和 verified → heuristic 退化。0.9.0 冻结后不再追加 0.9.1。
+
+### 0.10：下一步写什么
+
+0.10 不增加大批 CWE，继续补三门 Tier A 的项目级关系：
+
+- Java：Spring bean qualifier、泛型接口实现、MyBatis XML Mapper、record/DTO constructor 字段映射；
+- PHP：Trait、Doctrine/Guzzle、动态容器调用和更复杂依赖注入的中断解释；
+- Python：相对 import、继承/override、decorator wrapper、Django ORM/raw、文件/模板/XML Sink，以及字段级 validation；
+- 公共内核：调用图增量失效精度、循环不动点、异常路径上的 Guard 有效范围、按语言/规则统计 precision 与 recall；
+- 产品层：能力等级按实际文件和框架显示，不再用一个语言总标签掩盖降级文件。
+
+开发顺序仍是先放入真实 vulnerable/safe、alias、shadowing、wrapper、跨文件和无关 Guard 对照，再改 Frontend/IR/Resolver；规则数量排在语义正确性之后。
 
 ## 暂时不做
 

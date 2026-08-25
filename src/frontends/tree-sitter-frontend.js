@@ -52,6 +52,7 @@ class TreeSitterLanguageFrontend {
     stabilizeDuplicateSymbols(records);
     assignSignals(records, signals, lines);
     const references = extractFileReferences(lines, this.language);
+    const typeRelations = this.language === "java" ? javaTypeRelations(root, text, references) : [];
     const functions = records.map(record => buildFunction(record, input, lines, references, text));
     const covered = new Set(records.flatMap(record => record.signals.map(signalKey)));
     const globalSignals = signals.filter(signal => !covered.has(signalKey(signal)));
@@ -68,8 +69,9 @@ class TreeSitterLanguageFrontend {
       signals: record.signals,
     }));
     const astEntries = dedupeFrameworkEntries([
-      ...treeFrameworkEntries(root, records, this.language, text),
+      ...treeFrameworkEntries(root, records, this.language, text, references),
       ...(this.language === "java" ? javaFrameworkEntries(records, text) : []),
+      ...(this.language === "php" ? phpFrameworkEntries(records, text) : []),
     ]);
     const entries = mergeFrameworkEntries(
       astEntries,
@@ -101,6 +103,7 @@ class TreeSitterLanguageFrontend {
         degradedReason: recovered ? "Tree-sitter recovered from syntax errors; affected operations use lower confidence." : undefined,
       },
       functions,
+      typeRelations,
       entryPoints: entries.map(entry => {
         const fn = entryFunction(functions, entry);
         return {
@@ -113,6 +116,7 @@ class TreeSitterLanguageFrontend {
           parameterRoles: entry.parameterRoles || fn?.parameters.map(parameter => parameter.role || "unknown") || [],
           framework: entry.framework,
           handlerIndex: entry.handlerIndex,
+          handler: entry.handler,
           location: location({ ...input, ...entry, code: lines[entry.line - 1] }),
         };
       }),
@@ -120,7 +124,7 @@ class TreeSitterLanguageFrontend {
   }
 }
 
-function treeFrameworkEntries(root, records, language, text) {
+function treeFrameworkEntries(root, records, language, text, references = []) {
   const constants = stringConstants(text);
   const entries = [];
   const visit = node => {
@@ -133,7 +137,15 @@ function treeFrameworkEntries(root, records, language, text) {
         const argumentsNode = handlerCallNode?.childForFieldName("arguments") || handlerCallNode?.namedChildren?.find(child => /argument/.test(child.type));
         for (const handlerIndex of classification.handlerIndexes) {
           const argumentNode = argumentsNode?.namedChildren?.[handlerIndex];
-          for (const target of handlerTargets(argumentNode, handlerCall?.arguments?.[handlerIndex])) {
+          const argumentText = handlerCall?.arguments?.[handlerIndex];
+          const externalHandler = externalHandlerDescriptor(language, argumentText, references);
+          if (externalHandler) {
+            const entry = frameworkEntry({ ...classification, handlerIndex }, undefined, treeSourceLocation(argumentNode || node));
+            entry.handler = externalHandler;
+            entries.push(entry);
+            continue;
+          }
+          for (const target of handlerTargets(argumentNode, argumentText)) {
             const record = treeHandlerRecord(records, target.node, target.text);
             if (!record && !target.node) continue;
             entries.push(frameworkEntry({ ...classification, handlerIndex }, record, treeSourceLocation(target.node || node)));
@@ -145,6 +157,42 @@ function treeFrameworkEntries(root, records, language, text) {
   };
   visit(root);
   return dedupeFrameworkEntries(entries);
+}
+
+function externalHandlerDescriptor(language, argumentText, references = []) {
+  const value = String(argumentText || "").trim();
+  if (language === "php") {
+    let className;
+    let functionName;
+    const array = value.match(/^\[([\s\S]+)\]$/);
+    if (array) {
+      const parts = splitArguments(array[1]);
+      className = parts[0]?.match(/(?:^|\\)([A-Za-z_]\w*)\s*::\s*class$/i)?.[1];
+      functionName = stringLiterals(parts[1])[0];
+    } else {
+      const legacy = stringLiterals(value)[0]?.match(/^([A-Za-z_\\][\w\\]*)@([A-Za-z_]\w*)$/);
+      className = legacy?.[1];
+      functionName = legacy?.[2];
+    }
+    if (!className || !functionName) return undefined;
+    const simple = className.split("\\").at(-1);
+    const imported = references.find(reference => reference.kind === "import" && canonicalSymbolName(reference.local) === canonicalSymbolName(simple));
+    const namespaceName = references.find(reference => reference.kind === "namespace")?.target;
+    const targetType = imported?.target || (className.includes("\\") ? className : namespaceName ? `${namespaceName}\\${className}` : className);
+    return { language, className: simple, targetType, functionName };
+  }
+  if (language === "python") {
+    const member = value.match(/^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$/);
+    if (member) {
+      const imported = references.find(reference => ["import", "require"].includes(reference.kind) && canonicalSymbolName(reference.local) === canonicalSymbolName(member[1]));
+      if (!imported) return undefined;
+      const moduleName = imported.target.endsWith(`.${member[1]}`) ? imported.target : `${imported.target}.${member[1]}`;
+      return { language, moduleName, functionName: member[2] };
+    }
+    const imported = references.find(reference => reference.kind === "import" && canonicalSymbolName(reference.local) === canonicalSymbolName(value));
+    if (imported) return { language, moduleName: imported.target, functionName: value };
+  }
+  return undefined;
 }
 
 function handlerTargets(argumentNode, argumentText) {
@@ -247,12 +295,18 @@ function describeFunction(node, language, text, input) {
 
 function buildFunction(record, input, lines, references, text) {
   const operations = buildOperations(record, input, lines, text, references);
+  const packageName = input.language === "java" ? references.find(reference => reference.kind === "package")?.target : undefined;
+  const namespaceName = input.language === "php" ? references.find(reference => reference.kind === "namespace")?.target : undefined;
   return functionIR({
     id: record.id,
     symbolKey: record.symbolKey,
     name: record.name,
     language: input.language,
     enclosingScope: record.enclosingScope,
+    packageName,
+    namespaceName,
+    qualifiedEnclosingScope: packageName ? `${packageName}.${record.enclosingScope}` :
+      namespaceName ? `${namespaceName}\\${record.enclosingScope}` : record.enclosingScope,
     implementedTypes: record.implementedTypes || [],
     declarationKind: record.declarationKind,
     executable: record.executable,
@@ -324,13 +378,14 @@ function buildOperations(record, input, lines, text, references = []) {
       const call = genericCall(node, text);
       call.argumentInputs = call.arguments.map(argument => expressionInputs(argument, input.language).map(symbol));
       call.argumentTypes = call.arguments.map(argument => inferExpressionType(argument, record, references));
-      call.symbol = genericCallIdentity(call, record, references);
+      call.symbol = genericCallIdentity(call, record, references, input.language);
       const output = enclosingCallOutput(node, text, input.language);
       const modeled = genericModeledCall(call, input.language, output, input.options?.semanticModels);
+      const operationCall = serializableGenericCall(call);
       if (call.function) add(OperationKind.CALL, node, {
         inputs: modeled?.kind === OperationKind.CALL ? modeled.inputs : call.argumentInputs.flat(),
         output,
-        call,
+        call: operationCall,
         semantic: modeled?.kind === OperationKind.CALL ? modeled.semantic : undefined,
         certainty: modeled?.kind === OperationKind.CALL ? modeled.certainty : undefined,
         metadata: modeled?.kind === OperationKind.CALL ? modeled.metadata : undefined,
@@ -338,7 +393,7 @@ function buildOperations(record, input, lines, text, references = []) {
       if (modeled && modeled.kind !== OperationKind.CALL) add(modeled.kind, node, {
         inputs: modeled.inputs,
         output: modeled.output,
-        call,
+        call: operationCall,
         semantic: modeled.semantic,
         certainty: modeled.certainty,
         metadata: modeled.metadata,
@@ -392,12 +447,15 @@ function signalOperations(record, input, lines, text, references = []) {
     occurrences.set(fingerprint, occurrence + 1);
     const signalSemantic = semanticForSignal(signal);
     const call = semantic.node && CALL_TYPES.has(semantic.node.type) ? genericCall(semantic.node, text) : undefined;
-    if (call) call.symbol = genericCallIdentity(call, record, references);
+    if (call) {
+      call.argumentInputs = call.arguments.map(argument => expressionInputs(argument, input.language).map(symbol));
+      call.symbol = genericCallIdentity(call, record, references, input.language);
+    }
     const expectedRole = signal.kind === "sink" ? SemanticRole.SINK :
       ["sanitizer", "auth"].includes(signal.kind) ? SemanticRole.GUARD : undefined;
     const modelResolution = expectedRole && call ? resolveSemanticCall(input.language, call, input.options?.semanticModels) : { status: "none" };
     const matchingModel = Boolean(expectedRole && modelResolution.model?.role === expectedRole);
-    if (modelResolution.status === "rejected" && signal.kind === "sink") return [];
+    if (modelResolution.status === "rejected" && expectedRole) return [];
     if (matchingModel && ["verified", "syntax"].includes(modelResolution.status)) {
       const model = modelResolution.model;
       signalSemantic.modelId = model.id;
@@ -427,7 +485,7 @@ function signalOperations(record, input, lines, text, references = []) {
       }),
       inputs: operationInputs.map(symbol),
       output: semantic.output ? symbol(semantic.output) : signal.kind === "source" && assignment?.target ? symbol(assignment.target) : undefined,
-      call,
+      call: serializableGenericCall(call),
       semantic: signalSemantic,
       certainty: ["verified", "syntax"].includes(modelResolution.status) ? Certainty.MEDIUM :
         signal.kind === "sink" ? Certainty.LOW : semantic.resolved ? Certainty.MEDIUM : Certainty.LOW,
@@ -486,6 +544,7 @@ function genericCall(node, text) {
   const argumentNode = node.childForFieldName("arguments") || node.namedChildren?.find(child => /argument/.test(child.type));
   const rawArguments = stripParens(nodeText(argumentNode, text));
   const args = splitArguments(rawArguments);
+  const argumentNodes = argumentNode?.namedChildren || [];
   return {
     function: nodeText(nameNode, text) || parts.at(-1) || callable,
     form: node.type === "object_creation_expression" ? "constructor" : callFormFromReceiver(objectNode),
@@ -493,27 +552,65 @@ function genericCall(node, text) {
     arguments: args,
     argumentInputs: args.map(argument => normalizedIdentifiers(argument).map(symbol)),
     argumentTypes: args.map(inferExpressionType),
+    argumentConstants: args.map((expression, index) => genericArgumentConstant(argumentNodes[index], text, expression, index)),
     receiverCall: objectNode && CALL_TYPES.has(objectNode.type) ? genericCall(objectNode, text) : undefined,
     receiverCallNode: objectNode && CALL_TYPES.has(objectNode.type) ? objectNode : undefined,
   };
 }
 
-function genericCallIdentity(call, record, references = []) {
+function serializableGenericCall(call) {
+  if (!call) return undefined;
+  const { receiverCallNode: _frontendNode, ...serializable } = call;
+  return serializable;
+}
+
+function genericCallIdentity(call, record, references = [], language) {
   const receiverRoot = String(call.receiver || "").match(/^[A-Za-z_$][\w$]*/)?.[0];
-  const receiverType = receiverRoot
-    ? record.parameterDescriptors?.find(parameter => parameter.name === receiverRoot)?.type
+  const receiverMember = String(call.receiver || "").match(/^(?:this|self|\$this)(?:\.|->)(\$?[A-Za-z_]\w*)/)?.[1];
+  const receiverNames = [call.receiver, receiverMember, receiverMember && language === "php" ? `$${receiverMember.replace(/^\$/, "")}` : receiverMember, receiverRoot].filter(Boolean);
+  const parameterType = receiverRoot && !["this", "self", "$this"].includes(receiverRoot)
+    ? record.parameterDescriptors?.find(parameter => canonicalSymbolName(parameter.name) === canonicalSymbolName(receiverRoot))?.type
     : undefined;
-  const imported = references.find(reference => reference.local === receiverRoot || (!call.receiver && reference.local === call.function));
+  const sameLocal = (reference, value) => canonicalSymbolName(reference.local) === canonicalSymbolName(value);
+  const matchingReferences = references.filter(reference => receiverNames.some(name => sameLocal(reference, name)) || (!call.receiver && sameLocal(reference, call.function)));
+  const localType = matchingReferences.find(reference => reference.kind === "type");
+  const declaredType = parameterType && parameterType !== "?" ? parameterType : localType?.target;
+  const declaredTypeName = simpleTypeName(declaredType);
+  const declaredImport = declaredTypeName ? references.find(reference => reference.kind === "import" && sameLocal(reference, declaredTypeName)) : undefined;
+  const declaredTypeDeclaration = declaredTypeName ? references.find(reference => reference.kind === "declaration" && sameLocal(reference, declaredTypeName)) : undefined;
+  const declaredTypeRoot = String(declaredType || "").split(".")[0];
+  const qualifiedTypeImport = declaredTypeRoot && declaredTypeRoot !== declaredType
+    ? references.find(reference => ["import", "require"].includes(reference.kind) && sameLocal(reference, declaredTypeRoot))
+    : undefined;
+  const directImport = localType ? undefined : matchingReferences.find(reference => ["import", "require"].includes(reference.kind));
+  const moduleReference = declaredImport || qualifiedTypeImport || directImport;
+  const qualifiedDeclaredModule = language === "python" && String(declaredType || "").includes(".")
+    ? String(declaredType).split(".").slice(0, -1).join(".")
+    : undefined;
+  const unresolvedDeclaredType = ["java", "python"].includes(language) && declaredType && declaredType !== "?" &&
+    !moduleReference && !qualifiedDeclaredModule && !declaredTypeDeclaration && !String(declaredType).includes(".");
+  const resolvedReceiverType = declaredImport
+    ? language === "python" ? `${declaredImport.target}.${declaredTypeName}` : declaredImport.target
+    : declaredType || (call.form === "constructor" ? call.function : undefined) || call.receiver;
+  const qualifiedBase = declaredImport ? resolvedReceiverType : moduleReference?.target || resolvedReceiverType;
   return {
-    kind: imported ? "import" : "syntax",
-    moduleName: imported?.target,
+    kind: moduleReference ? moduleReference.kind : declaredTypeDeclaration ? "local" : unresolvedDeclaredType ? "syntax" : localType || declaredType ? "local" : "syntax",
+    moduleName: moduleReference?.target || qualifiedDeclaredModule,
     exportName: call.function,
-    qualifiedName: imported ? `${imported.target}.${call.function}` : call.receiver ? `${call.receiver}.${call.function}` : call.function,
-    receiverType: receiverType || (imported?.kind === "type" ? imported.target : undefined) ||
-      (call.form === "constructor" ? call.function : undefined) || call.receiver,
-    shadowed: false,
-    verified: Boolean(imported || (receiverType && receiverType !== "?")),
+    qualifiedName: qualifiedBase ? `${qualifiedBase}.${call.function}` : call.function,
+    receiverType: resolvedReceiverType,
+    unresolvedType: Boolean(unresolvedDeclaredType),
+    shadowed: Boolean(declaredTypeDeclaration),
+    verified: Boolean(moduleReference || qualifiedDeclaredModule || declaredTypeDeclaration || (declaredType && !unresolvedDeclaredType)),
   };
+}
+
+function simpleTypeName(value) {
+  return String(value || "").replace(/<.*>/g, "").split(/[.\\]/).filter(Boolean).at(-1)?.replace(/[^A-Za-z0-9_$]/g, "");
+}
+
+function canonicalSymbolName(value) {
+  return String(value || "").replace(/^\$/, "").replace(/[^A-Za-z0-9_$]/g, "").toLowerCase();
 }
 
 function callFormFromReceiver(receiverNode) {
@@ -538,8 +635,7 @@ function genericModeledCall(call, language, output, semanticModels) {
     inputs: inputs.map(value => value.name),
     output: output?.name,
     receiver: call.receiver,
-    trustedOperands: (call.arguments || []).map((expression, index) => ({ expression, index }))
-      .filter(item => /^\s*(?:["'`].*["'`]|\d+)\s*$/.test(item.expression)),
+    trustedOperands: (call.argumentConstants || []).filter(Boolean),
     semanticVerification: resolution.status,
     ...guardAssociation(model.guardCapabilities || []),
   } : undefined;
@@ -592,7 +688,7 @@ function genericSemanticValues(signal, rootNode, text, language) {
   const visit = node => {
     if (node !== rootNode && FUNCTION_TYPES[language]?.has(node.type)) return;
     if (node.startPosition?.row + 1 === signal.line && isSemanticExpression(node)) {
-      const matches = collectSignals([semanticCandidateText(node, text)], language).some(candidate =>
+      const matches = collectSignals([semanticCandidateText(node, text, language)], language).some(candidate =>
         candidate.kind === signal.kind && candidate.category === signal.category,
       );
       if (matches) candidates.push(node);
@@ -627,11 +723,12 @@ function genericSemanticValues(signal, rootNode, text, language) {
   };
 }
 
-function semanticCandidateText(node, text) {
+function semanticCandidateText(node, text, language) {
   if (!CALL_TYPES.has(node.type)) return nodeText(node, text);
   const call = genericCall(node, text);
   const directArguments = call.arguments.filter(argument => !/(?:=>|\bfunction\s*\(|\bfunc\s*\()/i.test(argument));
-  return `${call.receiver ? `${call.receiver}.` : ""}${call.function}(${directArguments.join(", ")})`;
+  const separator = language === "php" ? "->" : ".";
+  return `${call.receiver ? `${call.receiver}${separator}` : ""}${call.function}(${directArguments.join(", ")})`;
 }
 
 function buildGenericGuardBinding(capabilities = [], semantic = {}, call, semanticVerification) {
@@ -640,12 +737,34 @@ function buildGenericGuardBinding(capabilities = [], semantic = {}, call, semant
     inputs: semantic.inputs || [],
     output: semantic.output,
     receiver: call?.receiver,
-    trustedOperands: (call?.arguments || []).map((expression, index) => ({ expression, index }))
-      .filter(item => /^\s*(?:["'`].*["'`]|\d+)\s*$/.test(item.expression)),
+    trustedOperands: (call?.argumentConstants || []).filter(Boolean),
     semanticVerification,
     allowsBoundParameters: semanticVerification === "structural",
     ...guardAssociation(capabilities),
   };
+}
+
+function genericArgumentConstant(node, text, expression, index) {
+  const value = genericLiteralValue(node, text);
+  return value === undefined ? undefined : { index, expression, value };
+}
+
+function genericLiteralValue(node, text) {
+  if (!node) return undefined;
+  const children = node.namedChildren || [];
+  if (/^(?:argument|parenthesized_expression|parenthesized_expression_list)$/.test(node.type) && children.length === 1) {
+    return genericLiteralValue(children[0], text);
+  }
+  if (/^(?:string|string_literal|character_literal|char_literal|rune_literal|raw_string_literal|interpreted_string_literal)$/.test(node.type)) {
+    return nodeText(node, text);
+  }
+  if (/^(?:integer|float|number|real|decimal_integer|decimal_floating_point)(?:_literal)?$/.test(node.type)) {
+    return nodeText(node, text);
+  }
+  if (/^(?:true|false|null|none|nil|boolean_literal|null_literal)$/.test(node.type)) {
+    return nodeText(node, text);
+  }
+  return undefined;
 }
 
 function structurallyParameterizedGuard(capabilities = [], call) {
@@ -766,12 +885,52 @@ function javaEnclosingTypeInfo(node, text) {
   if (!typeNode) return { declarationKind: "java-method", implementedTypes: [] };
   const relationNodes = (typeNode.namedChildren || []).filter(child =>
     /(?:superclass|super_interfaces|extends_interfaces|type_list)/.test(child.type));
-  const implementedTypes = relationNodes.flatMap(child =>
-    extractIdentifiers(nodeText(child, text)).filter(name => !["extends", "implements"].includes(name)));
+  const implementedTypes = relationNodes.flatMap(child => javaRelationTypes(nodeText(child, text)));
   return {
     declarationKind: typeNode.type.replace(/_declaration$/, ""),
     implementedTypes: [...new Set(implementedTypes)],
   };
+}
+
+function javaTypeRelations(root, text, references) {
+  const packageName = references.find(reference => reference.kind === "package")?.target;
+  const relations = [];
+  const visit = node => {
+    if (["class_declaration", "interface_declaration", "record_declaration", "enum_declaration"].includes(node.type)) {
+      const nameNode = node.childForFieldName("name");
+      const name = nodeText(nameNode, text);
+      if (name) {
+        const relationNodes = (node.namedChildren || []).filter(child =>
+          /(?:superclass|super_interfaces|extends_interfaces|type_list)/.test(child.type));
+        const directTypes = relationNodes.flatMap(child => javaRelationTypes(nodeText(child, text)));
+        relations.push({
+          language: "java",
+          type: packageName ? `${packageName}.${name}` : name,
+          extends: [...new Set(directTypes.map(type => resolveDeclaredJavaType(type, packageName, references)).filter(Boolean))],
+        });
+      }
+    }
+    for (const child of node.namedChildren || []) visit(child);
+  };
+  visit(root);
+  return relations;
+}
+
+function javaRelationTypes(value) {
+  const list = String(value || "").replace(/^\s*(?:extends|implements)\s+/, "");
+  return splitArguments(list).map(part => part.trim().match(/^([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)/)?.[1]).filter(Boolean);
+}
+
+function resolveDeclaredJavaType(type, packageName, references) {
+  const value = String(type || "").replace(/<.*>/g, "").trim();
+  if (!value) return undefined;
+  if (value.includes(".")) return value;
+  const explicit = references.find(reference => reference.kind === "import" &&
+    reference.local !== "*" && reference.local.toLowerCase() === value.toLowerCase());
+  if (explicit) return explicit.target;
+  const wildcard = references.find(reference => reference.kind === "import" && reference.local === "*" && reference.target.endsWith(".*"));
+  if (wildcard) return `${wildcard.target.slice(0, -2)}.${value}`;
+  return packageName ? `${packageName}.${value}` : value;
 }
 
 function enclosingJavaTypeNode(node) {
@@ -789,10 +948,16 @@ function javaFrameworkEntries(records, text) {
     const typeNode = enclosingJavaTypeNode(record.node);
     const typeAnnotations = javaAnnotations(typeNode, text);
     const classRoutes = mappingRoutes(typeAnnotations.filter(annotation => ["RequestMapping", "Path"].includes(annotation.name)));
+    const servletAnnotation = typeAnnotations.find(annotation => annotation.name === "WebServlet");
     const mappings = javaMethodMappings(methodAnnotations);
     const servletMethod = /^do(Get|Post|Put|Delete|Patch)$/i.exec(record.name);
     if (!mappings.length && servletMethod && (record.implementedTypes || []).some(type => /HttpServlet$/i.test(type))) {
-      mappings.push({ method: servletMethod[1].toUpperCase(), routes: [""], framework: "servlet", node: record.node });
+      mappings.push({
+        method: servletMethod[1].toUpperCase(),
+        routes: servletAnnotation ? annotationRoutes(servletAnnotation) : ["<dynamic>"],
+        framework: "servlet",
+        node: servletAnnotation?.node || record.node,
+      });
     }
     for (const mapping of mappings) {
       const methodRoutes = mapping.routes.length ? mapping.routes : [""];
@@ -805,6 +970,37 @@ function javaFrameworkEntries(records, text) {
           language: "java",
         }, record, treeSourceLocation(mapping.node || record.node)));
       }
+    }
+  }
+  return dedupeFrameworkEntries(entries);
+}
+
+function phpFrameworkEntries(records, text) {
+  const entries = [];
+  for (const record of records) {
+    if (record.node.type !== "method_declaration" && record.node.type !== "function_definition") continue;
+    const attributesNode = record.node.childForFieldName("attributes") ||
+      (record.node.namedChildren || []).find(child => child.type === "attribute_list");
+    if (!attributesNode) continue;
+    const attributes = [];
+    const visit = node => {
+      if (node.type === "attribute") attributes.push(node);
+      else for (const child of node.namedChildren || []) visit(child);
+    };
+    visit(attributesNode);
+    for (const attribute of attributes) {
+      const raw = nodeText(attribute, text);
+      const name = raw.match(/^\s*(?:[A-Za-z_\\][\w\\]*\\)?([A-Za-z_]\w*)/)?.[1];
+      if (name !== "Route") continue;
+      const route = stringLiterals(raw)[0] || "<dynamic>";
+      const methodsText = raw.match(/methods\s*:\s*\[([\s\S]*?)\]/i)?.[1] || "";
+      const methods = stringLiterals(methodsText).map(method => method.toUpperCase());
+      entries.push(frameworkEntry({
+        method: methods.length ? [...new Set(methods)].join("|") : "ANY",
+        route,
+        framework: "php-route",
+        language: "php",
+      }, record, treeSourceLocation(attribute)));
     }
   }
   return dedupeFrameworkEntries(entries);
@@ -945,6 +1141,19 @@ function assignSignals(records, signals, lines) {
 function nodeText(node, text) { return node ? String(node.text ?? String(text).slice(node.startIndex, node.endIndex)) : ""; }
 function normalizedIdentifiers(value) { return extractIdentifiers(value).map(name => normalizeAccessPath(name) || name); }
 function expressionInputs(value, language) {
+  if (language === "php") {
+    return [...new Set([...normalizedIdentifiers(value), ...[...String(value || "").matchAll(/\$[A-Za-z_]\w*/g)].map(match => match[0])])];
+  }
+  if (language === "python") {
+    const source = String(value || "");
+    const paths = [...source.matchAll(/\b[A-Za-z_]\w*(?:(?:\.[A-Za-z_]\w*)|\[\s*(?:\d+|["'][^"']+["'])\s*\])+/g)]
+      .filter(match => !/^\s*\(/.test(source.slice(match.index + match[0].length)))
+      .map(match => normalizeAccessPath(match[0]))
+      .filter(Boolean);
+    const identifiers = normalizedIdentifiers(source).filter(identifier =>
+      !paths.some(path => path === identifier || path.startsWith(`${identifier}.`) || path.startsWith(`${identifier}[`)));
+    return [...new Set([...paths, ...identifiers])];
+  }
   if (language !== "java") return normalizedIdentifiers(value);
   const accessPaths = [];
   const source = String(value || "");

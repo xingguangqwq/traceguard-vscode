@@ -1,0 +1,38 @@
+{
+  "schema": "traceguard-eval-report",
+  "version": 1,
+  "summary": {
+    "expected": 3,
+    "detected": 3,
+    "falsePositives": 0,
+    "verifiedPaths": 2,
+    "heuristicPaths": 0,
+    "unresolvedPaths": 2
+  },
+  "cases": [
+    {
+      "id": "java-prepared-statement",
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 1,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "php-unknown-pdo-receiver",
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 2
+    },
+    {
+      "id": "python-sqlite-cursor",
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 1,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    }
+  ]
+}

@@ -27,7 +27,7 @@ const SIGNAL_PATTERNS = {
   java: [
     ["source", "HTTP parameter", /(?:getParameter|getHeader|getCookies|getQueryString|getInputStream|getReader|getPathInfo|getRequestURI)\s*\(/],
     ["source", "Framework-bound request data", /@(?:RequestParam|PathVariable|RequestBody|CookieValue|RequestHeader|ModelAttribute)\b/],
-    ["sink", "SQL / persistence operation", /\.(?:executeQuery|executeUpdate|execute|createNativeQuery|createQuery)\s*\(/, "database"],
+    ["sink", "SQL / persistence operation", /\.(?:prepareStatement|prepareCall|executeQuery|executeUpdate|execute|createNativeQuery|createQuery)\s*\(/, "database"],
     ["sink", "Operating-system command", /(?:Runtime\.getRuntime\(\)\.exec|new\s+ProcessBuilder)\s*\(/, "command"],
     ["sink", "Filesystem operation", /(?:new\s+File|Paths\.get|Path\.of|Files\.(?:read|write|delete|copy|move|newInputStream|newOutputStream))\s*\(/, "file"],
     ["sink", "Outbound network request", /(?:new\s+(?:URL|URI)|URI\.create|\.getForObject|\.getForEntity|WebClient\.create|HttpRequest\.newBuilder)\s*\(/, "network"],
@@ -37,7 +37,7 @@ const SIGNAL_PATTERNS = {
     ["sink", "Directory lookup", /\.(?:lookup|search)\s*\(/, "directory"],
     ["auth", "Authorization annotation", /@(?:PreAuthorize|PostAuthorize|Secured|RolesAllowed|DenyAll|PermitAll)\b/],
     ["auth", "Security decision", /(?:hasRole|hasAuthority|checkPermission|isAuthenticated|SecurityContextHolder|AccessDecisionManager)\s*\(/],
-    ["sanitizer", "Parameterized statement", /(?:PreparedStatement|prepareStatement|\.set(?:String|Int|Long|Object)\s*\()/],
+    ["sanitizer", "Parameterized statement binding", /\.set(?:String|Int|Long|Object)\s*\(/],
     ["sanitizer", "Validation constraint", /@(?:Valid|Validated|Pattern|Size|Min|Max|NotNull)\b/],
     ["sanitizer", "Canonical path check", /(?:normalize|toRealPath|getCanonicalPath)\s*\(/],
     ["sanitizer", "Output encoding", /(?:Encode\.forHtml|HtmlUtils\.htmlEscape|StringEscapeUtils\.escapeHtml)\s*\(/],
@@ -383,9 +383,13 @@ function findPythonEntries(lines, functions) {
     const route = context.match(/@(?:app|router|blueprint|bp)\.(get|post|put|delete|patch|options|route)\s*\(\s*["']([^"']+)["']([^)]*)/i);
     if (route) {
       const method = route[1].toLowerCase() === "route" ? (route[3].match(/["'](GET|POST|PUT|DELETE|PATCH|OPTIONS)["']/i)?.[1]?.toUpperCase() || "ANY") : route[1].toUpperCase();
-      entries.push(entry(method, route[2], fn.line, fn));
+      const item = entry(method, route[2], fn.line, fn);
+      item.framework = route[1].toLowerCase() === "route" ? "flask" : "fastapi";
+      entries.push(item);
     } else if (/\brequest\b/.test(fn.parameters)) {
-      entries.push(entry("REQUEST", fn.name, fn.line, fn));
+      const item = entry("REQUEST", fn.name, fn.line, fn);
+      item.framework = "django";
+      entries.push(item);
     }
   }
   return entries;

@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const Module = require("node:module");
 const path = require("node:path");
 const test = require("node:test");
+const { analyzeText } = require("../src/audit-analyzer");
 
 class EventEmitter {
   constructor() { this.listeners = new Set(); this.event = listener => { this.listeners.add(listener); return { dispose: () => this.listeners.delete(listener) }; }; }
@@ -32,13 +33,15 @@ function loadAuditSessionModule(workspaceFolders, workspaceOverrides = {}) {
           ...workspaceOverrides,
           fs: {
             stat: async uri => {
-              if (path.basename(uri.fsPath) === ".traceguard.json" && configuredFs.configText === undefined) throw fileNotFound();
-              if (path.basename(uri.fsPath) === ".traceguard.json") return { size: Buffer.byteLength(configuredFs.configText, "utf8") };
+              const configText = configuredFs.configTextFor?.(uri) ?? configuredFs.configText;
+              if (path.basename(uri.fsPath) === ".traceguard.json" && configText === undefined) throw fileNotFound();
+              if (path.basename(uri.fsPath) === ".traceguard.json") return { size: Buffer.byteLength(configText, "utf8") };
               if (configuredFs.stat) return configuredFs.stat(uri);
               throw fileNotFound();
             },
             readFile: async uri => {
-              if (path.basename(uri.fsPath) === ".traceguard.json" && configuredFs.configText !== undefined) return Buffer.from(configuredFs.configText, "utf8");
+              const configText = configuredFs.configTextFor?.(uri) ?? configuredFs.configText;
+              if (path.basename(uri.fsPath) === ".traceguard.json" && configText !== undefined) return Buffer.from(configText, "utf8");
               if (configuredFs.readFile) return configuredFs.readFile(uri);
               throw fileNotFound();
             },
@@ -157,7 +160,7 @@ test("cancelled indexing keeps the previous index and concurrent refreshes share
   assert.equal(first, second);
   await first;
 
-  assert.equal(requestedLimit, loaded.MAX_SOURCE_FILES + 1);
+  assert.equal(requestedLimit, undefined, "custom exclusions are applied before the valid-file quota");
   assert.deepEqual(session.analyses, [previous]);
   assert.equal(session.indexStatus.cancelled, true);
   session.dispose();
@@ -313,6 +316,89 @@ test("project configuration keeps the last valid model when a later edit is inva
   session.dispose();
 });
 
+test("an invalid configuration freezes only its own workspace root", async () => {
+  const apiRoot = path.resolve("C:\\review-workspace\\api");
+  const webRoot = path.resolve("C:\\review-workspace\\web");
+  const values = new Map([
+    [apiRoot, JSON.stringify({ sources: [{ language: "javascript", function: "apiInput" }] })],
+    [webRoot, JSON.stringify({ sources: [{ language: "javascript", function: "webInput" }] })],
+  ]);
+  const loaded = loadAuditSessionModule([
+    { name: "api", uri: { fsPath: apiRoot } },
+    { name: "web", uri: { fsPath: webRoot } },
+  ], {
+    fs: { configTextFor: uri => values.get(path.dirname(uri.fsPath)) },
+  });
+  const session = new loaded.AuditSession(contextWith({}), { warn() {}, info() {} });
+  await session.reloadProjectConfiguration({ rebuild: false });
+  const apiFingerprint = session.projectConfigurationsByRoot[0].configuration.fingerprint;
+
+  values.set(apiRoot, "{ invalid json");
+  values.set(webRoot, JSON.stringify({ sources: [{ language: "javascript", function: "webInputV2" }] }));
+  const result = await session.reloadProjectConfiguration({ rebuild: false });
+
+  assert.equal(result.valid, false);
+  assert.equal(result.changed, true, "the valid root is allowed to update");
+  assert.equal(session.projectConfigurationsByRoot[0].configuration.fingerprint, apiFingerprint);
+  assert.equal(session.projectConfigurationsByRoot[1].configuration.semanticModels[0].callNames[0], "webInputV2");
+  assert.ok(session.projectConfigurationIssues.every(issue => issue.workspaceRoot === apiRoot));
+  session.dispose();
+});
+
+test("changes and deletions during a full index are replayed after its snapshot", async () => {
+  const workspaceRoot = path.resolve("C:\\review-workspace");
+  const changed = { fsPath: path.join(workspaceRoot, "changed.js") };
+  const deleted = { fsPath: path.join(workspaceRoot, "deleted.js") };
+  const loaded = loadAuditSessionModule([{ name: "repo", uri: { fsPath: workspaceRoot } }], {
+    findFiles: async () => [changed, deleted],
+    fs: {
+      stat: async () => ({ size: 64 }),
+      readFile: async () => Buffer.from("function stale() {}", "utf8"),
+    },
+  });
+  const session = new loaded.AuditSession(contextWith({}), { warn() {}, info() {} });
+  let finishInitialize;
+  const updates = [];
+  const removals = [];
+  session.dataflowWorker = {
+    setIndexTimeoutMs() {},
+    initializeWorkspace: files => new Promise(resolve => {
+      finishInitialize = () => resolve({
+        analyses: files.map(file => analyzeText(file.text, file.language, file.absolutePath, file.relativePath)),
+        findingDelta: { upsert: [], removedIds: [] },
+        metadata: {},
+      });
+    }),
+    updateFile: async file => {
+      updates.push(file);
+      return {
+        analysis: analyzeText(file.text, file.language, file.absolutePath, file.relativePath),
+        findingDelta: { upsert: [], removedIds: [] },
+        metadata: {},
+      };
+    },
+    removeFile: async absolutePath => { removals.push(absolutePath); return { removed: true }; },
+    reanalyzeAffectedFunctions: async () => ({ findingDelta: { upsert: [], removedIds: [] }, metadata: {} }),
+    dispose: async () => {},
+  };
+
+  const indexing = session.indexWorkspace();
+  while (!finishInitialize) await new Promise(resolve => setImmediate(resolve));
+  await session.reindexDocument({ uri: changed, getText: () => "function newest() {}" });
+  await session.reindexDocument({ uri: changed, getText: () => "function newestAgain() {}" });
+  await session.removeFiles([deleted]);
+  assert.equal(updates.length, 0, "live changes wait until the full snapshot commits");
+  finishInitialize();
+  await indexing;
+
+  assert.equal(updates.length, 1, "only the newest version of a dirty file is replayed");
+  assert.match(updates[0].text, /newestAgain/);
+  assert.deepEqual(removals, [deleted.fsPath]);
+  assert.equal(session.analysisForUri(deleted), undefined);
+  assert.match(session.analysisForUri(changed).functions[0].name, /newestAgain/);
+  session.dispose();
+});
+
 test("project exclude paths stay out of the workspace Worker and coverage counts", async () => {
   const workspaceRoot = path.resolve("C:\\review-workspace");
   const kept = { fsPath: path.join(workspaceRoot, "src", "kept.js") };
@@ -330,10 +416,39 @@ test("project exclude paths stay out of the workspace Worker and coverage counts
   const session = new loaded.AuditSession(contextWith({}), { warn() {}, info() {} });
 
   await session.indexWorkspace();
-  assert.match(excludeGlob, /generated/);
+  assert.doesNotMatch(excludeGlob, /generated/);
   assert.equal(session.snapshot.files, 1);
   assert.equal(session.snapshot.indexDiscoveredFiles, 1);
   assert.equal(session.analysisForUri(excluded), undefined);
   assert.equal(session.snapshot.projectConfiguration.excludedPatterns, 1);
+  session.dispose();
+});
+
+test("multi-root project exclusions stay inside their owning workspace root", async () => {
+  const apiRoot = path.resolve("C:\review-workspace\api");
+  const webRoot = path.resolve("C:\review-workspace\web");
+  const apiGenerated = { fsPath: path.join(apiRoot, "generated", "client.js") };
+  const webGenerated = { fsPath: path.join(webRoot, "generated", "client.js") };
+  const virtualFs = {
+    configTextFor: uri => uri.fsPath.startsWith(apiRoot)
+      ? JSON.stringify({ excludePaths: ["generated/**"] })
+      : JSON.stringify({}),
+    stat: async () => ({ size: 32 }),
+    readFile: async () => Buffer.from("function retained() {}", "utf8"),
+  };
+  const loaded = loadAuditSessionModule([
+    { name: "api", uri: { fsPath: apiRoot } },
+    { name: "web", uri: { fsPath: webRoot } },
+  ], {
+    findFiles: async () => [apiGenerated, webGenerated],
+    fs: virtualFs,
+  });
+  const session = new loaded.AuditSession(contextWith({}), { warn() {}, info() {} });
+
+  await session.indexWorkspace();
+
+  assert.equal(session.analysisForUri(apiGenerated), undefined);
+  assert.ok(session.analysisForUri(webGenerated));
+  assert.equal(session.projectConfigurationsByRoot.length, 2);
   session.dispose();
 });

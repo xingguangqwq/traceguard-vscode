@@ -56,12 +56,15 @@ class TreeSitterRuntime {
   async _parser(grammar) {
     if (this.parsers.has(grammar)) return this.parsers.get(grammar);
     if (!GRAMMARS[grammar]) throw new Error(`No Tree-sitter WASM grammar is configured for ${grammar}.`);
-    if (!this.initialized) {
-      this.initialized = Parser.init({
+    const initialization = this.initialized || (this.initialized = Parser.init({
         locateFile: () => require.resolve("web-tree-sitter/web-tree-sitter.wasm"),
-      });
+      }));
+    try {
+      await initialization;
+    } catch (error) {
+      if (this.initialized === initialization) this.initialized = undefined;
+      throw error;
     }
-    await this.initialized;
     const parser = new Parser();
     parser.setLanguage(await Language.load(require.resolve(GRAMMARS[grammar])));
     this.parsers.set(grammar, parser);

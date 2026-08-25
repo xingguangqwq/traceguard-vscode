@@ -133,4 +133,40 @@ export function route(req) {
   assert.ok(flatten(backward.roots).some(node => /payload\.command/.test(node.label)));
 });
 
+test("forward queries stop after a strong overwrite on every CFG path", async () => {
+  const analysis = await analyzeTextAsync(`
+import { exec } from "node:child_process";
+export function route(req) {
+  let value = req.body.value;
+  value = "safe";
+  exec(value);
+}
+`, "typescript", "C:\\repo\\strong-update.ts", "strong-update.ts");
+  const fn = analysis.ir.functions.find(item => item.name === "route");
+  const result = runAuditQuery([analysis], {
+    kind: QueryKind.TRACE_FORWARD,
+    functionId: fn.id,
+    identifier: "value",
+    line: 4,
+  });
+
+  assert.equal(flatten(result.roots).some(node => node.kind === "sink"), false);
+});
+
+test("workspace graph queries disclose partial index coverage", async () => {
+  const fixture = await queryFixture();
+  const service = fixture.service.ir.functions.find(fn => fn.name === "run");
+  const result = runAuditQuery(fixture.analyses, {
+    kind: QueryKind.FIND_CALLERS,
+    functionId: service.id,
+    indexIncomplete: true,
+    indexScope: "current-files",
+    indexSkippedFiles: 3,
+  });
+
+  assert.equal(result.coverage.incomplete, true);
+  assert.equal(result.coverage.workspaceGraph, true);
+  assert.ok(result.roots.some(node => node.kind === "coverage" && /currently opened/.test(node.reason)));
+});
+
 function flatten(nodes) { return nodes.flatMap(node => [node, ...flatten(node.children || [])]); }

@@ -95,6 +95,9 @@ function functionIR(input) {
     name: input.name,
     language: input.language,
     enclosingScope: input.enclosingScope || "<file>",
+    packageName: input.packageName,
+    namespaceName: input.namespaceName,
+    qualifiedEnclosingScope: input.qualifiedEnclosingScope || input.enclosingScope || "<file>",
     implementedTypes: input.implementedTypes || [],
     declarationKind: input.declarationKind || "function",
     executable: input.executable !== false,
@@ -121,6 +124,7 @@ function fileIR(input) {
     frontend: input.frontend || { id: "unknown", mode: "unknown", capability: "fallback" },
     functions: input.functions || [],
     entryPoints: input.entryPoints || [],
+    typeRelations: input.typeRelations || [],
   };
   const errors = validateFileIR(value);
   if (errors.length) throw new Error(`Invalid TraceGuard IR: ${errors.join("; ")}`);

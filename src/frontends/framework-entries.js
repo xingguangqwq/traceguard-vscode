@@ -32,6 +32,10 @@ const EXACT_TYPE_ROLES = Object.freeze({
   cancellationtoken: "cancellation",
   ilogger: "logger",
   logger: "logger",
+  session: "database",
+  asyncsession: "database",
+  connection: "database",
+  cursor: "database",
 });
 
 const TYPE_ROLE_SUFFIXES = Object.freeze([
@@ -46,7 +50,19 @@ function classifyFrameworkCall(language, call) {
   if (language === "php") return classifyPhpCall(call);
   if (language === "csharp") return classifyCSharpCall(call);
   if (language === "go") return classifyGoCall(call);
+  if (language === "python") return classifyPythonCall(call);
   return undefined;
+}
+
+function classifyPythonCall(call) {
+  const callee = canonical(call.function);
+  if (!["path", "repath"].includes(callee)) return undefined;
+  return {
+    method: "REQUEST",
+    route: call.routeValue || staticString(call.arguments?.[0]) || "<dynamic>",
+    handlerIndexes: [1],
+    framework: "django",
+  };
 }
 
 function classifyJavaScriptCall(call) {
@@ -207,6 +223,9 @@ function frameworkParameterRoles(entry, parameters) {
     return parameters.map((parameter, index) =>
       index === 0 && requestLikeParameter(parameter) ? "request" : "path");
   }
+  if (["fastapi", "flask", "django"].includes(entry.framework)) {
+    return parameters.map((parameter, index) => pythonFrameworkRole(entry.framework, parameter, index));
+  }
   return [];
 }
 
@@ -214,6 +233,13 @@ function inferParameterRoles(language, parameters) {
   if (!Array.isArray(parameters)) return [];
   return parameters.map(parameter => {
     const raw = String(parameter?.raw || "");
+    if (language === "python" && /\bDepends\s*\(/.test(raw)) {
+      return databaseType(parameter?.type) ? "database" : "service";
+    }
+    if (language === "python") {
+      const binding = pythonBindingRole(raw);
+      if (binding) return binding;
+    }
     const declaration = DECLARATION_ROLE_PATTERNS.find(([pattern]) => pattern.test(raw));
     if (declaration) return declaration[1];
     const type = canonicalType(parameter?.type);
@@ -222,6 +248,33 @@ function inferParameterRoles(language, parameters) {
     if (suffix) return suffix[1];
     return "unknown";
   });
+}
+
+function pythonFrameworkRole(framework, parameter, index) {
+  const raw = String(parameter?.raw || "");
+  const type = canonicalType(parameter?.type);
+  if (/\bDepends\s*\(/.test(raw)) return databaseType(parameter?.type) ? "database" : "service";
+  const binding = pythonBindingRole(raw);
+  if (binding) return binding;
+  if (/^(?:request|httprequest|starletterequest)$/.test(type) || /^(?:request|req)$/.test(parameter?.name || "")) return "request";
+  if (/^(?:response|httpresponse)$/.test(type)) return "response";
+  if (databaseType(parameter?.type)) return "database";
+  if (/(?:service|repository|client|logger)$/i.test(type)) return /logger$/i.test(type) ? "logger" : "service";
+  if (framework === "fastapi") {
+    if (/^(?:str|int|float|bool|uuid|date|datetime|decimal)(?:optional)?$/i.test(type)) return "query";
+    if (type && type !== "?") return "body";
+  }
+  if (framework === "django" && index === 0) return "request";
+  return "unknown";
+}
+
+function pythonBindingRole(raw) {
+  const match = String(raw || "").match(/\b(Query|Body|Path|Header|Cookie|Form|File|UploadFile)\b/i)?.[1]?.toLowerCase();
+  return { query: "query", body: "body", path: "path", header: "header", cookie: "header", form: "body", file: "body", uploadfile: "body" }[match];
+}
+
+function databaseType(value) {
+  return /(?:^|[.])(Session|AsyncSession|Connection|Cursor|DbSession|Database)$/i.test(String(value || "").replace(/\s/g, ""));
 }
 
 function requestLikeParameter(parameter) {

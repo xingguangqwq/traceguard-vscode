@@ -8,6 +8,29 @@ const { analyzeTextAsync } = require("../src/audit-analyzer");
 const { runDataflowAnalysis } = require("../src/dataflow/pipeline");
 const { normalizePath } = require("../src/identity");
 
+test("an unrelated saved comment does not rebuild the call graph or dataflow", async () => {
+  const engine = new WorkspaceAnalysisEngine();
+  const file = {
+    language: "java",
+    absolutePath: "/workspace/Search.java",
+    relativePath: "Search.java",
+    version: "1",
+    text: "class Search { void run(HttpServletRequest request) { Runtime.getRuntime().exec(request.getParameter(\"cmd\")); } }",
+  };
+  const initial = await engine.initializeWorkspace([file]);
+  const generation = initial.metadata.generation;
+  const findingIds = engine.dataflow.findings.map(finding => finding.id);
+
+  const updated = await engine.updateFile({ ...file, version: "2", text: `${file.text}\n// saved comment` });
+
+  assert.equal(updated.semanticNoop, true);
+  assert.deepEqual(updated.affectedFiles, []);
+  assert.deepEqual(updated.changedFunctionIds, []);
+  assert.equal(updated.metadata.generation, generation);
+  assert.equal(updated.metadata.dataflowMs, 0);
+  assert.deepEqual(engine.dataflow.findings.map(finding => finding.id), findingIds);
+});
+
 test("POSIX case-sensitive paths remain distinct in the workspace engine", async () => {
   const engine = new WorkspaceAnalysisEngine();
   const result = await engine.initializeWorkspace([

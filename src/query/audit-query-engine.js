@@ -7,6 +7,7 @@ const {
   normalizeAccessPath,
   pathFeeds,
   pathsOverlap,
+  removeAssignedTaint,
   relativeAccessPath,
 } = require("../ir/access-path");
 const { normalizePath, stableHash } = require("../identity");
@@ -82,6 +83,9 @@ function runAuditQuery(analyses, request = {}) {
     reason: noResultReason(request.kind, fn, variable),
     fn,
   })];
+  if (request.indexIncomplete && isWorkspaceGraphQuery(request.kind)) {
+    resolvedRoots.unshift(partialIndexNode(fn, request));
+  }
   return {
     schema: "traceguard-audit-query",
     version: 1,
@@ -91,11 +95,12 @@ function runAuditQuery(analyses, request = {}) {
     roots: resolvedRoots,
     summary: summarize(resolvedRoots, limits),
     truncated: limits.truncated,
+    coverage: queryCoverage(request),
   };
 }
 
 function createContext(analyses, request) {
-  const functions = functionsFromAnalyses(analyses || []);
+  const functions = functionsFromAnalyses(analyses || [], request);
   const functionIndex = callResolver.buildFunctionIndex(functions);
   const byId = new Map(functions.map(fn => [fn.id, fn]));
   const incoming = new Map();
@@ -194,7 +199,7 @@ function backwardVariable(context, fn, variable, beforeLine, visiting, depth, li
       })];
     }
     return callers.map(edge => {
-      const callerValues = callerValuesForParameter(edge.event, parameter);
+      const callerValues = callerValuesForParameter(edge.event, parameter, edge.callee);
       const children = callerValues.length
         ? callerValues.flatMap(value => backwardVariable(context, edge.caller, value, edge.event.line, nextVisiting, depth + 1, limits))
         : [queryNode({ kind: "argument", label: `Argument ${parameter.index + 1} was not resolved`, status: QueryStatus.UNRESOLVED,
@@ -217,7 +222,8 @@ function forwardVariable(context, fn, variable, afterLine, visiting, depth, limi
   if (visiting.has(key) || depth > limits.maxDepth) return [cycleNode(fn, variable, depth > limits.maxDepth)];
   const nextVisiting = new Set(visiting);
   nextVisiting.add(key);
-  const consumers = fn.events.filter(event => event.line >= afterLine && isReachableEvent(event) && eventConsumes(event, variable));
+  const consumers = fn.events.filter(event => event.line >= afterLine && isReachableEvent(event) &&
+    eventConsumes(event, variable) && taintReachesEventOnSomePath(fn, variable, afterLine, event));
   const roots = [];
   for (const event of consumers) {
     if (!reserve(limits)) { roots.push(truncatedNode(fn)); break; }
@@ -272,6 +278,41 @@ function forwardVariable(context, fn, variable, afterLine, visiting, depth, limi
       status: eventStatus(event), reason: `${variable} participates in this control or validation operation; effectiveness remains sink-specific.`, fn, event }));
   }
   return dedupeNodes(roots);
+}
+
+function taintReachesEventOnSomePath(fn, variable, afterLine, targetEvent) {
+  const sequences = eventSequences(fn, {
+    startLine: afterLine,
+    targetBlocks: targetEvent.blockId ? [targetEvent.blockId] : [],
+    includeTarget: true,
+    maxPaths: 64,
+    maxVisits: 3,
+  });
+  return sequences.some(events => {
+    let tainted = new Set([variable]);
+    for (const event of events) {
+      if (event.id === targetEvent.id) return eventConsumes(event, variable) && [...tainted].some(value => pathsOverlap(value, variable));
+      if (event.type === "assignment" && event.target) {
+        if (event.line === afterLine && pathFeeds(event.target, variable)) continue;
+        const propagated = assignmentOutputs(event, [...tainted]);
+        tainted = removeAssignedTaint(tainted, event.target);
+        for (const output of propagated) tainted.add(output);
+        continue;
+      }
+      if (event.type === "source" && event.target && event.line > afterLine) {
+        tainted = removeAssignedTaint(tainted, event.target);
+        continue;
+      }
+      if (event.type === "call" && event.target) {
+        const propagates = (event.argumentVariables || []).some((variables, index) =>
+          (!event.taintArgumentIndexes || event.taintArgumentIndexes.includes(index)) &&
+          variables.some(value => [...tainted].some(current => pathsOverlap(current, value))));
+        tainted = removeAssignedTaint(tainted, event.target);
+        if (propagates) tainted.add(event.target);
+      }
+    }
+    return false;
+  });
 }
 
 function callerNodes(context, fn, limits) {
@@ -427,9 +468,12 @@ function parameterForVariable(fn, variable) {
   return undefined;
 }
 
-function callerValuesForParameter(event, parameter) {
-  const argument = normalizeAccessPath(event.arguments?.[parameter.index]);
-  const variables = event.argumentVariables?.[parameter.index] || [];
+function callerValuesForParameter(event, parameter, callee) {
+  const offset = callee?.language === "python" && event.receiver && ["self", "cls"].includes(callee.parameters?.[0]) ? 1 : 0;
+  const argumentIndex = parameter.index - offset;
+  if (argumentIndex < 0) return [];
+  const argument = normalizeAccessPath(event.arguments?.[argumentIndex]);
+  const variables = event.argumentVariables?.[argumentIndex] || [];
   if (parameter.path.length && argument) return [appendAccessPath(argument, parameter.path)];
   if (parameter.path.length) return variables.map(value => appendAccessPath(value, parameter.path));
   return variables.length ? variables : argument ? [argument] : [];
@@ -437,9 +481,10 @@ function callerValuesForParameter(event, parameter) {
 
 function calleeValuesForCallerVariable(edge, variable) {
   const values = [];
+  const offset = edge.callee.language === "python" && edge.event.receiver && ["self", "cls"].includes(edge.callee.parameters?.[0]) ? 1 : 0;
   edge.event.argumentVariables.forEach((variables, index) => {
     const argument = normalizeAccessPath(edge.event.arguments?.[index]);
-    const parameter = edge.callee.parameters[index];
+    const parameter = edge.callee.parameters[index + offset];
     if (!parameter) return;
     if ((variables || []).some(value => pathFeeds(variable, value))) values.push(parameter);
     else if (argument && pathFeeds(argument, variable)) {
@@ -592,15 +637,45 @@ function missingVariable(fn) {
 }
 
 function emptyResult(request, reason) {
+  const roots = [queryNode({ kind: "empty", label: "Query could not start", status: QueryStatus.UNRESOLVED, reason })];
+  if (request.indexIncomplete && isWorkspaceGraphQuery(request.kind)) roots.unshift(partialIndexNode(undefined, request));
   return {
     schema: "traceguard-audit-query",
     version: 1,
     kind: request.kind,
     title: "TraceGuard Audit Query",
-    roots: [queryNode({ kind: "empty", label: "Query could not start", status: QueryStatus.UNRESOLVED, reason })],
-    summary: { nodes: 1, statuses: { unresolved: 1 } },
+    roots,
+    summary: summarize(roots, { truncated: false }),
     truncated: false,
+    coverage: queryCoverage(request),
   };
+}
+
+function isWorkspaceGraphQuery(kind) {
+  return [QueryKind.FIND_CALLERS, QueryKind.FIND_CALLEES, QueryKind.TRACE_TO_ENTRY, QueryKind.REACHABLE_SINKS].includes(kind);
+}
+
+function queryCoverage(request) {
+  return {
+    incomplete: Boolean(request.indexIncomplete),
+    scope: request.indexScope || (request.indexIncomplete ? "partial" : "workspace"),
+    skippedFiles: Math.max(0, Number(request.indexSkippedFiles) || 0),
+    workspaceGraph: isWorkspaceGraphQuery(request.kind),
+  };
+}
+
+function partialIndexNode(fn, request) {
+  const skipped = Number(request.indexSkippedFiles) || 0;
+  return queryNode({
+    kind: "coverage",
+    label: "Partial workspace index",
+    status: QueryStatus.UNRESOLVED,
+    reason: request.indexScope === "current-files"
+      ? "Only currently opened or refreshed files are indexed. Missing callers, entries and sinks must not be interpreted as proof that none exist."
+      : `The workspace index is incomplete${skipped ? ` because ${skipped} file${skipped === 1 ? " was" : "s were"} skipped` : ""}. Missing graph results may exist outside analyzed files.`,
+    fn,
+    details: queryCoverage(request),
+  });
 }
 
 function noResultReason(kind, fn, variable) {

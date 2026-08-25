@@ -44,7 +44,40 @@ async function main() {
     assert.equal(analysis.frontend.treeHasErrors, false, `${sample.label} grammar recovered from a valid smoke sample`);
     results.push(`${sample.label}:${analysis.frontend.id}`);
   }
+  const { DataflowWorkerClient } = require(path.join(extensionRoot, "src", "dataflow", "worker-client.js"));
+  const worker = new DataflowWorkerClient({
+    workerPath: path.join(extensionRoot, "src", "dataflow", "worker.js"),
+    indexTimeoutMs: 300_000,
+  });
+  try {
+    const backendFiles = [
+      packagedFile("CommandController.java", "java", "class CommandController { void run(HttpServletRequest request) { Runtime.getRuntime().exec(request.getParameter(\"cmd\")); } }"),
+      packagedFile("command.php", "php", "<?php function run() { system($_GET[\"cmd\"]); }"),
+      packagedFile("command.py", "python", "import os\ndef run(request):\n    os.system(request.args.get(\"cmd\"))\n"),
+    ];
+    const initialized = await worker.initializeWorkspace(backendFiles, { maxDepth: 6, maxPaths: 80 });
+    const findings = initialized.findingDelta.upsert;
+    assert.ok(findings.some(finding => finding.relativePath === "CommandController.java"));
+    assert.ok(findings.some(finding => finding.relativePath === "command.php"));
+    assert.ok(findings.some(finding => finding.relativePath === "command.py"));
+    const query = await worker.queryPaths({ absolutePath: backendFiles[0].absolutePath });
+    assert.ok(Array.isArray(query.paths));
+    assert.ok(query.metadata.workerRssBytes > 0);
+    results.push("worker:java/php/python");
+  } finally {
+    await worker.dispose();
+  }
   process.stdout.write(`Verified packaged AST runtimes: ${results.join(", ")}\n`);
+}
+
+function packagedFile(relativePath, language, text) {
+  return {
+    absolutePath: path.join(extensionRoot, ".traceguard-package-smoke", relativePath),
+    relativePath,
+    language,
+    version: "package-smoke-1",
+    text,
+  };
 }
 
 main().catch(error => {

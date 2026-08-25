@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vscode = require("vscode");
+const { selectedAccessPath } = require("../src/audit-controller");
 
 async function run() {
   const extension = vscode.extensions.getExtension("traceguard.traceguard-vscode");
@@ -15,6 +16,14 @@ async function run() {
   const initialSummary = api.audit.summaryProvider.getChildren();
   assert.equal(initialSummary[0]?.label, "Review queue not built", "an idle workspace is not presented as permanently indexing");
   assert.equal(initialSummary[0]?.command?.command, "traceguard.startAudit", "the idle summary starts the review queue");
+  const accessPathEditor = {
+    document: {
+      getText: () => `$_GET['cmd']`,
+      getWordRangeAtPosition: () => undefined,
+    },
+    selection: { active: new vscode.Position(0, 5) },
+  };
+  assert.equal(selectedAccessPath(accessPathEditor), "$_GET.cmd", "quoted PHP access paths are accepted by interactive queries");
 
   const commands = new Set(await vscode.commands.getCommands(true));
   const requiredCommands = [
@@ -84,6 +93,8 @@ async function run() {
 
     const sarif = api.audit.createSarif();
     assert.ok(sarif.runs[0].results.some(result => result.ruleId === "potential-command-injection"), "SARIF is generated from the live Extension Host snapshot");
+    assert.ok(sarif.runs[0].originalUriBaseIds.SRCROOT?.uri, "SARIF declares the workspace source root");
+    assert.ok(sarif.runs[0].results.every(result => result.locations[0].physicalLocation.artifactLocation.uriBaseId === "SRCROOT"), "SARIF locations resolve against the declared source root");
 
     fs.writeFileSync(configurationPath, JSON.stringify({
       version: 1,

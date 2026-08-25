@@ -27,10 +27,12 @@ const NON_TAINTED_PARAMETER_ROLES = new Set([
 const TAINTED_PARAMETER_ROLES = new Set(["request", "body", "query", "path", "header"]);
 
 function findSourceSinkPaths(analyses, options = {}) {
-  const functions = functionsFromAnalyses(analyses);
-  const index = callResolver.buildFunctionIndex(functions);
+  const functions = options._flowFunctions || functionsFromAnalyses(analyses, options);
+  const index = options._functionIndex || callResolver.buildFunctionIndex(functions);
   const selectedFunctions = selectFunctions(functions, options);
-  const potentialRanks = buildPotentialRanks(functions, index, Math.min(4, Math.max(1, options.maxDepth || 6)));
+  const potentialRanks = Array.isArray(options.rootFunctionIds)
+    ? new Map()
+    : buildPotentialRanks(functions, index, Math.min(4, Math.max(1, options.maxDepth || 6)));
   const roots = buildRoots(selectedFunctions, options)
     .sort((left, right) => (potentialRanks.get(right.fn.id) || 0) - (potentialRanks.get(left.fn.id) || 0));
   const paths = [];
@@ -63,7 +65,7 @@ function findSourceSinkPaths(analyses, options = {}) {
 
   const uniquePaths = new Map();
   for (const flowPath of paths) {
-    const key = flowPath.steps.map(step => [step.kind, step.operationId, step.functionId].join(":")).join("|");
+    const key = flowPath.steps.map(step => [step.workspaceRoot, step.kind, step.operationId, step.functionId].join(":")).join("|");
     if (!uniquePaths.has(key)) uniquePaths.set(key, flowPath);
   }
   const sorted = [...uniquePaths.values()]
@@ -153,6 +155,7 @@ function walkLinearFlow(state) {
         if (!incoming.length) continue;
         const key = visitKey(candidate, incoming);
         if (state.visited.has(key)) continue;
+        const accessPathTransition = callAccessPathTransition(candidate, event, tainted, incoming);
         const callStep = makeStep(
           "call",
           state.fn.name + "() → " + candidate.name + "()",
@@ -163,6 +166,7 @@ function walkLinearFlow(state) {
             candidateMatch: resolution.quality,
             candidateReason: resolution.reason,
             calleePath: candidate.relativePath,
+            ...accessPathTransition,
           },
         );
         const visited = new Set(state.visited);
@@ -248,7 +252,7 @@ function walkLinearFlow(state) {
       const confidence = semanticReview || callMatches.includes("review") || propagationStatuses.some(status => ["heuristic", "unresolved"].includes(status)) ? "review" :
         semanticMedium || sourceConfidence !== "high" || !callMatches.every(match => match === "high") || propagationStatuses.includes("syntax-only") ? "medium" : "high";
       state.paths.push({
-        id: `path_${stableHash(steps.map(step => [step.kind, step.operationId || step.label, step.functionId].join(":")).join("|"))}`,
+        id: `path_${stableHash(steps.map(step => [step.workspaceRoot, step.kind, step.operationId || step.label, step.functionId].join(":")).join("|"))}`,
         rootFunctionId: state.rootFunctionId,
         touchedFunctionIds: unique(steps.map(step => step.functionId)),
         source: steps[0],
@@ -462,6 +466,7 @@ function makeStep(kind, label, fn, event, extra = {}) {
     symbolKey: fn.symbolKey,
     operationId: event.id,
     functionName: fn.name,
+    workspaceRoot: fn.workspaceRoot,
     absolutePath: fn.absolutePath,
     relativePath: fn.relativePath,
     line: event.line || fn.line,
@@ -473,7 +478,7 @@ function makeStep(kind, label, fn, event, extra = {}) {
 function dedupeRoots(roots) {
   const seen = new Set();
   return roots.filter(root => {
-    const key = [root.fn.id, root.line, root.variables.slice().sort().join(",")].join(":");
+    const key = [root.fn.workspaceRoot, root.fn.id, root.line, root.variables.slice().sort().join(",")].join(":");
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -481,7 +486,7 @@ function dedupeRoots(roots) {
 }
 
 function visitKey(fn, variables) {
-  return fn.id + ":" + [...variables].sort().join(",");
+  return [fn.workspaceRoot, fn.id, [...variables].sort().join(",")].join(":");
 }
 
 function intersects(values, set) {
@@ -546,9 +551,11 @@ function precedingCallDefinesSameValue(fn, assignment, tainted) {
 
 function incomingParameterVariables(fn, event, tainted) {
   const incoming = [];
-  for (let index = 0; index < fn.parameters.length; index += 1) {
-    if (event.taintArgumentIndexes && !event.taintArgumentIndexes.includes(index)) continue;
-    const variables = event.argumentVariables[index] || [];
+  const parameterOffset = fn.language === "python" && event.receiver && ["self", "cls"].includes(fn.parameters[0]) ? 1 : 0;
+  for (let index = parameterOffset; index < fn.parameters.length; index += 1) {
+    const argumentIndex = index - parameterOffset;
+    if (event.taintArgumentIndexes && !event.taintArgumentIndexes.includes(argumentIndex)) continue;
+    const variables = event.argumentVariables[argumentIndex] || [];
     const root = fn.parameters[index];
     const bindings = parameterAccessBindings(fn, index);
     const wholeArgumentTainted = variables.some(value => [...tainted].some(taintedPath => pathFeeds(taintedPath, value)));
@@ -556,7 +563,7 @@ function incomingParameterVariables(fn, event, tainted) {
       incoming.push(root, ...bindings.map(binding => binding.name));
       continue;
     }
-    const argumentRoot = argumentAccessPath(event.arguments?.[index]);
+    const argumentRoot = argumentAccessPath(event.arguments?.[argumentIndex]);
     if (!argumentRoot) continue;
     if (!bindings.length && [...tainted].some(taintedPath => pathsOverlap(argumentRoot, taintedPath))) {
       incoming.push(root);
@@ -568,6 +575,23 @@ function incomingParameterVariables(fn, event, tainted) {
     }
   }
   return unique(incoming);
+}
+
+function callAccessPathTransition(fn, event, tainted, incoming) {
+  const parameterOffset = fn.language === "python" && event.receiver && ["self", "cls"].includes(fn.parameters[0]) ? 1 : 0;
+  for (let argumentIndex = 0; argumentIndex < (event.argumentVariables || []).length; argumentIndex += 1) {
+    const input = (event.argumentVariables[argumentIndex] || [])
+      .find(value => [...tainted].some(taintedPath => pathsOverlap(value, taintedPath)));
+    if (!input) continue;
+    const parameter = fn.parameters[argumentIndex + parameterOffset];
+    const output = incoming.find(value => value === parameter || value.startsWith(`${parameter}.`) || value.startsWith(`${parameter}[`));
+    return {
+      inputAccessPath: normalizeAccessPath(input),
+      outputAccessPath: normalizeAccessPath(output || parameter),
+      propagationReason: `argument ${argumentIndex} maps to parameter ${parameter}`,
+    };
+  }
+  return {};
 }
 
 function parameterAccessBindings(fn, index) {
@@ -643,41 +667,42 @@ function controlRelation(control, target, fn) {
       requiresSemanticProof: binding.requiresSemanticProof,
       forbidsDirectSinkInput: binding.forbidsDirectSinkInput,
     };
-    const reason = guardCapabilityFailure(scope, binding, target);
-    if (reason) hints.push({ capability, reason });
+    const reasons = guardCapabilityFailures(scope, binding, target);
+    if (reasons.length) reasons.forEach(reason => hints.push({ capability, reason }));
     else effectiveCapabilities.push(capability);
   }
   return { status: effectiveCapabilities.length ? "effective" : "hint", effectiveCapabilities, hints };
 }
 
-function guardCapabilityFailure(scope, binding, target) {
+function guardCapabilityFailures(scope, binding, target) {
+  const reasons = [];
   if (scope.applicableSinkKinds?.length && !scope.applicableSinkKinds.includes(target.sinkKind)) {
-    return `The guard capability does not apply to ${target.sinkKind || "this sink"}.`;
+    reasons.push(`The guard capability does not apply to ${target.sinkKind || "this sink"}.`);
   }
   if (scope.receiverScoped && (!binding.receiver || !target.receiver || canonicalReceiver(binding.receiver) !== canonicalReceiver(target.receiver))) {
-    return "The guard and sink operate on different or unresolved receivers.";
+    reasons.push("The guard and sink operate on different or unresolved receivers.");
   }
   if (scope.requiresTrustedOperand && !(binding.trustedOperands || []).length) {
-    return "The guard depends on an operand that could not be proven trusted.";
+    reasons.push("The guard depends on an operand that could not be proven trusted.");
   }
   if (scope.requiresSemanticProof && !["verified", "syntax", "structural"].includes(binding.semanticVerification)) {
-    return "The guard API could not be resolved to a trusted semantic model.";
+    reasons.push("The guard API could not be resolved to a trusted semantic model.");
   }
   if (scope.forbidsDirectSinkInput && !binding.allowsBoundParameters &&
     (binding.inputs || []).length && intersects(target.variables, new Set(binding.inputs))) {
-    return "The sink still consumes the raw value observed by the guard.";
+    reasons.push("The sink still consumes the raw value observed by the guard.");
   }
   if (scope.outputScoped) {
-    if (!binding.output) return "The guard return value is not captured, so the protected value cannot be proven.";
-    if (!intersects(target.variables, new Set([binding.output]))) return "The sink does not consume the value produced by the guard.";
-    return undefined;
+    if (!binding.output) reasons.push("The guard return value is not captured, so the protected value cannot be proven.");
+    else if (!intersects(target.variables, new Set([binding.output]))) reasons.push("The sink does not consume the value produced by the guard.");
   }
-  if (scope.receiverScoped) return undefined;
-  const protectedValues = binding.inputs || [];
-  if (protectedValues.length && !intersects(target.variables, new Set(protectedValues))) {
-    return "The guard validates a different value from the one consumed by the sink.";
+  if (!scope.receiverScoped && !scope.outputScoped) {
+    const protectedValues = binding.inputs || [];
+    if (protectedValues.length && !intersects(target.variables, new Set(protectedValues))) {
+      reasons.push("The guard validates a different value from the one consumed by the sink.");
+    }
   }
-  return undefined;
+  return [...new Set(reasons)];
 }
 
 function effectiveControlStep(step, relation) {

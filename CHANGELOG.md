@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.9.0 - 2026-08-25
+
+- Full indexing now has its own configurable timeout (`traceguard.indexTimeoutSeconds`, five minutes by default, `0` to disable) while interactive queries retain the 30-second limit. A failed or timed-out Worker is discarded and can be rebuilt by a manual retry.
+- Saves, creates and deletes that occur during a full index are replayed after the snapshot commit. Unsaved editor content wins over disk state, and excluded files are filtered per root before the workspace quota is applied.
+- Invalid `.traceguard.json` or `composer.json` files now freeze only their owning workspace root. Configuration, Composer identity, calls, findings, review state and SARIF preserve workspace-root identity end to end.
+- Composer `autoload.psr-4` and `autoload-dev.psr-4`, PHP group-use aliases and cross-file Laravel route handlers now participate in class resolution. Cross-file Django `path`/`re_path` handlers are bound by module identity.
+- Unknown Java/PHP/Python database receivers remain explicit LOW/REVIEW candidates; proven safe custom receivers are rejected. An unverified Guard can explain why it failed, but cannot suppress a Finding.
+- Java dynamic SQL passed to `prepareStatement`/`prepareCall` is treated as the SQL sink; only value binding on a verified matching statement can provide parameterization evidence.
+- Incremental analysis reuses the workspace function index, limits dependency rebuilding to affected files, skips full path ranking for bounded roots and avoids dataflow rebuilds for semantically unchanged saves. Finding and Path deltas use stable content digests instead of whole-object serialization.
+- Worker replay normally retains file metadata rather than a second full workspace text mirror, reloads saved files from disk, preserves unsaved buffers separately and reports replay time/memory.
+- Added reproducible Java/PHP/Python 1,000-file performance gates, a separate 8,000-file timeout stress run, and a versioned three-language evaluation corpus with detection, false-positive and proof-status regression comparison.
+- Java calls now resolve explicit imports, wildcard imports, same-package types and transitive interface inheritance before receiver-name heuristics. Candidate resolution no longer truncates valid implementations before package checks, and `@WebServlet` routes keep their declared URL and HTTP method.
+- Forward Query now applies the same CFG-path strong overwrites as Findings. A value replaced with a constant no longer continues to a verified sink in the query tree.
+- Workspace-wide queries disclose incomplete indexes instead of presenting missing callers, entries or sinks as a complete answer. Quoted Access Paths such as `$_GET['cmd']` and `obj["key"]` are accepted by editor queries.
+- Added PHP receiver-aware models for Laravel/Symfony request input, PDO, Laravel DB/Eloquent raw queries and PHP command functions. Symfony route attributes bind controller entries without relying on line layout; arbitrary `query()` and `exec()` methods are no longer treated as database or command APIs by name alone.
+- Added Python models for `os`, `subprocess`, DB-API/SQLAlchemy, Django raw queries and `requests`/`httpx`/`urllib`, with module identity and local-shadowing checks. Constant-executable argv calls with shell expansion disabled are not treated as command injection. FastAPI `Depends`, request fields and service/database parameters now receive positional provenance instead of all becoming HTTP input.
+- Python call mapping now accounts for implicit `self`/`cls`, preserving Pydantic field Access Paths through async service methods to network sinks.
+- PHP call resolution now carries namespace and `use` identities into the call graph, preventing a same-named class in another namespace from stealing a path.
+- `.traceguard.json` semantics, rule controls, exclusions and call-graph edges are isolated per workspace root. Opening two repositories in one VS Code window no longer lets one root's configuration or same-named functions change the other root's results.
+- Worker replay failures discard the unusable worker, transient Tree-sitter WASM initialization can recover, rejected guards stay out of IR, and trusted operands require AST-proven constants.
+- SARIF now uses the installed package version, standard result kinds and resolvable source-root declarations.
+
 ## 0.8.0 - 2026-08-23
 
 - Promoted Java, PHP and Python to the Tier A backend-audit focus, moved JavaScript/TypeScript to regression-focused Tier B, and kept C#/Go as correctness-maintained Tier C languages.

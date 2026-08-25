@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 const { analyzeTextAsync } = require("../src/audit-analyzer");
 const { OperationKind } = require("../src/ir/schema");
+const { TreeSitterRuntime } = require("../src/frontends/tree-sitter-runtime");
 
 const CASES = [
   ["java", "Controller.java", `
@@ -56,3 +57,20 @@ for (const [language, fileName, source] of CASES) {
     assert.ok(fn.operations.some(operation => operation.kind === OperationKind.CALL));
   });
 }
+
+test("Tree-sitter initialization can recover after a transient WASM failure", async () => {
+  const runtime = new TreeSitterRuntime();
+  runtime.initialized = Promise.reject(new Error("simulated WASM initialization failure"));
+  const input = {
+    language: "javascript",
+    absolutePath: "C:\\repo\\retry.js",
+    relativePath: "retry.js",
+    text: "function retry() { return true; }",
+  };
+
+  await assert.rejects(runtime.parse(input), /simulated WASM initialization failure/);
+  assert.equal(runtime.initialized, undefined);
+  const parsed = await runtime.parse(input);
+  assert.equal(parsed.tree.rootNode.hasError, false);
+  runtime.remove(input.absolutePath);
+});
