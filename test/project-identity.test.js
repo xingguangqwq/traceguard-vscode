@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const path = require("node:path");
 const test = require("node:test");
 const { WorkspaceAnalysisEngine } = require("../src/analysis/workspace-engine");
+const { normalizePath } = require("../src/identity");
 const {
   composerPathsForType,
   parseComposerConfigurationText,
@@ -16,8 +17,8 @@ test("Composer PSR-4 and PSR-4 dev mappings compile into deterministic source id
   }), path.resolve("C:\\workspace"), path.resolve("C:\\workspace\\composer.json"));
 
   assert.equal(parsed.valid, true);
-  assert.deepEqual(composerPathsForType(parsed.identity, "App\\Service\\Runner"), [normalize(path.resolve("C:\\workspace\\src\\Service\\Runner.php"))]);
-  assert.deepEqual(composerPathsForType(parsed.identity, "Tests\\Feature\\AuditTest"), [normalize(path.resolve("C:\\workspace\\tests\\Feature\\AuditTest.php"))]);
+  assert.deepEqual(composerPathsForType(parsed.identity, "App\\Service\\Runner"), [normalizePath(path.resolve("C:\\workspace\\src\\Service\\Runner.php"))]);
+  assert.deepEqual(composerPathsForType(parsed.identity, "Tests\\Feature\\AuditTest"), [normalizePath(path.resolve("C:\\workspace\\tests\\Feature\\AuditTest.php"))]);
   assert.equal(parsed.identity.mappings.find(item => item.prefix === "Tests\\").dev, true);
 });
 
@@ -47,8 +48,4 @@ class Controller {
 
 function file(absolutePath, relativePath, text) {
   return { language: "php", absolutePath, relativePath, text, version: text.length.toString() };
-}
-
-function normalize(value) {
-  return String(value).replaceAll("\\", "/").toLowerCase();
 }
