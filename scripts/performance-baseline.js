@@ -30,7 +30,7 @@ async function main() {
   const initial = await client.initializeWorkspace(files, { maxDepth: 6, maxPaths: Math.max(400, fileCount * 2) });
   const initializedAt = performance.now();
   const unrelatedStartedAt = performance.now();
-  const unrelated = await client.updateFile(benchmark.changed);
+  const unrelated = await client.updateFile(benchmark.unrelated || benchmark.changed);
   const unrelatedSaveMs = performance.now() - unrelatedStartedAt;
   const incrementalTimes = [];
   let mainThreadDispatchMs = 0;
@@ -69,8 +69,9 @@ async function main() {
   };
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   if (result.mainThreadDispatchMs >= 50) throw new Error(`Main-thread dispatch gate failed: ${result.mainThreadDispatchMs} ms (target <50 ms).`);
-  if (result.unrelatedSaveMs >= 500 || result.unrelatedInvalidatedFiles !== 0) {
-    throw new Error(`Unrelated-save gate failed: ${result.unrelatedSaveMs} ms, ${result.unrelatedInvalidatedFiles} invalidated files.`);
+  const maximumUnrelatedInvalidatedFiles = benchmark.maximumUnrelatedInvalidatedFiles || 0;
+  if (result.unrelatedSaveMs >= 500 || result.unrelatedInvalidatedFiles > maximumUnrelatedInvalidatedFiles) {
+    throw new Error(`Unrelated-save gate failed: ${result.unrelatedSaveMs} ms, ${result.unrelatedInvalidatedFiles} invalidated files (maximum ${maximumUnrelatedInvalidatedFiles}).`);
   }
   if (maxIncrementalMs !== null && result.incrementalMs >= maxIncrementalMs) {
     throw new Error(`Incremental analysis gate failed: ${result.incrementalMs} ms (target <${maxIncrementalMs} ms).`);
@@ -105,11 +106,17 @@ function buildFixture(name, count) {
     return {
       name: "persistent-worker-typescript-dependent-fanout",
       files: [provider, ...consumers],
+      unrelated: {
+        ...consumers[0],
+        version: "comment",
+        text: `${consumers[0].text}\n// unrelated saved edit\n`,
+      },
       changed: {
         ...provider,
         version: "number",
         text: "export function consume(callback: (value: number) => void) { callback(1); }",
       },
+      maximumUnrelatedInvalidatedFiles: 1,
       minimumInvalidatedFiles: count,
     };
   }
