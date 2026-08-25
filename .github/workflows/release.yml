@@ -29,7 +29,7 @@ jobs:
         run: |
           set -o pipefail
           if ! npm test 2>&1 | tee test-output.log; then
-            node -e 'const fs = require("node:fs"); const text = fs.readFileSync("test-output.log", "utf8").split(/\r?\n/).slice(-120).join("\n"); console.log(`::error title=Node test failure::${text.replaceAll("%", "%25").replaceAll("\r", "%0D").replaceAll("\n", "%0A")}`);'
+            node -e 'const fs = require("node:fs"); const lines = fs.readFileSync("test-output.log", "utf8").split(/\r?\n/); const failures = lines.flatMap((line, index) => /^not ok\b/.test(line) ? [lines.slice(Math.max(0, index - 2), index + 45).join("\n")] : []); const text = failures.join("\n---\n") || lines.slice(-120).join("\n"); console.log(`::error title=Node test failure::${text.replaceAll("%", "%25").replaceAll("\r", "%0D").replaceAll("\n", "%0A")}`);'
             exit 1
           fi
 
