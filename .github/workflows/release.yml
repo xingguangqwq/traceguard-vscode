@@ -25,7 +25,13 @@ jobs:
         run: npm ci
 
       - name: Run tests
-        run: npm test
+        shell: bash
+        run: |
+          set -o pipefail
+          if ! npm test 2>&1 | tee test-output.log; then
+            node -e 'const fs = require("node:fs"); const text = fs.readFileSync("test-output.log", "utf8").split(/\r?\n/).slice(-120).join("\n"); console.log(`::error title=Node test failure::${text.replaceAll("%", "%25").replaceAll("\r", "%0D").replaceAll("\n", "%0A")}`);'
+            exit 1
+          fi
 
       - name: Check JavaScript syntax
         run: npm run check
