@@ -8,9 +8,9 @@ const { legacyHash, normalizePath, stableHash } = require("../identity");
 // rules/rule-engine, structure and signals come from the language front-ends.
 const SENSITIVE_PATH = /(?:auth|login|admin|upload|download|payment|billing|token|secret|config|account|user|permission|session|webhook|callback)/i;
 
-const PRIORITY_RANK = { P0: 0, P1: 1, P2: 2 };
+const PRIORITY_RANK = { P0: 0, P1: 1, P2: 2, Backlog: 3 };
 
-function buildReviewTargets(analysis) {
+function buildReviewTargets(analysis, options = {}) {
   const items = [];
   const entryFunctionLines = new Set(analysis.entries.map(entry => entry.functionLine).filter(Boolean));
 
@@ -28,6 +28,10 @@ function buildReviewTargets(analysis) {
       relativePath: analysis.relativePath,
       language: analysis.language,
       sensitivePath: SENSITIVE_PATH.test(analysis.relativePath),
+      functionId: fn?.id || entry.functionId,
+      entryFunctionIds: [fn?.id || entry.functionId].filter(Boolean),
+      reachableFromEntry: true,
+      containsUnresolvedCalls: options.unresolvedFunctionIds?.has(fn?.id || entry.functionId) || false,
       symbolKey: ["endpoint", fn?.symbolKey || entry.symbolKey || "unresolved", entry.method, entry.route].join("::"),
       legacyStableKey: ["endpoint", entry.method, entry.route, fn?.name || entry.functionName || "request handler"].join(":"),
     }));
@@ -35,9 +39,13 @@ function buildReviewTargets(analysis) {
 
   for (const fn of analysis.functions) {
     if (entryFunctionLines.has(fn.line)) continue;
-    const hasSensitiveFlow = fn.signals.some(signal => signal.kind === "sink") ||
-      (fn.signals.some(signal => signal.kind === "source") && SENSITIVE_PATH.test(`${analysis.relativePath} ${fn.name}`));
-    if (!hasSensitiveFlow) continue;
+    const hasSource = fn.signals.some(signal => signal.kind === "source");
+    const sinks = fn.signals.filter(signal => signal.kind === "sink");
+    const hasSensitiveFlow = (hasSource && sinks.length > 0) ||
+      sinks.some(signal => ["command", "expression", "deserialization"].includes(signal.category)) ||
+      (hasSource && SENSITIVE_PATH.test(`${analysis.relativePath} ${fn.name}`));
+    const reachableFromEntry = options.reachableFunctionIds?.has(fn.id) || false;
+    if (!hasSensitiveFlow && !reachableFromEntry) continue;
     items.push(prioritizeTarget({
       kind: "function",
       title: `${fn.name}()`,
@@ -49,6 +57,11 @@ function buildReviewTargets(analysis) {
       relativePath: analysis.relativePath,
       language: analysis.language,
       sensitivePath: SENSITIVE_PATH.test(`${analysis.relativePath} ${fn.name}`),
+      backlog: !hasSensitiveFlow,
+      functionId: fn.id,
+      entryFunctionIds: [...(options.entryFunctionIdsByFunctionId?.get(fn.id) || [])],
+      reachableFromEntry,
+      containsUnresolvedCalls: options.unresolvedFunctionIds?.has(fn.id) || false,
       symbolKey: fn.symbolKey,
       legacyStableKey: ["function", fn.name, normalizeParameters(fn.parameters)].join(":"),
     }));
@@ -89,7 +102,7 @@ function prioritizeTarget(input) {
   if (input.kind === "endpoint" && sinks.length && !auth.length) score += 10;
   if (sources.length && sinks.length && !sanitizers.length) score += 8;
   if (input.sensitivePath) score += 5;
-  const priority = score >= 50 ? "P0" : score >= 32 ? "P1" : "P2";
+  const priority = input.backlog ? "Backlog" : score >= 50 ? "P0" : score >= 32 ? "P1" : "P2";
   const reasons = [];
   if (input.kind === "endpoint") reasons.push("Externally reachable entry point");
   if (sources.length) reasons.push(`${sources.length} untrusted input signal${sources.length > 1 ? "s" : ""}`);
@@ -97,6 +110,7 @@ function prioritizeTarget(input) {
   if (input.kind === "endpoint" && !auth.length) reasons.push("No obvious authorization decision in local scope");
   if (sources.length && sinks.length && !sanitizers.length) reasons.push("No obvious validation or encoding signal in local scope");
   if (input.sensitivePath) reasons.push("Security-sensitive file or function name");
+  if (input.backlog) reasons.push("Ordinary function retained as reachable-code review backlog");
   return {
     id: `review_${stableHash(`${input.kind}:${input.symbolKey}`)}`,
     legacyIds: [...new Set([
@@ -134,8 +148,114 @@ function compareTargets(left, right) {
     left.relativePath.localeCompare(right.relativePath);
 }
 
+function calibrateReviewTargets(items, findings = []) {
+  return (items || []).map(item => {
+    const linkedFindings = (findings || []).filter(finding => findingTouchesTarget(finding, item));
+    if (linkedFindings.length) {
+      const paths = linkedFindings.flatMap(uniqueFindingPaths);
+      const hasSupportedPath = paths.length
+        ? paths.some(pathIsVerified)
+        : linkedFindings.some(finding => ["high", "medium"].includes(String(finding.confidence || "").toLowerCase()));
+      const containsUnresolvedCalls = paths.some(pathHasUnresolvedCall);
+      const priority = item.kind === "endpoint"
+        ? hasSupportedPath ? "P0" : "P1"
+        : item.backlog && !containsUnresolvedCalls ? "Backlog" : "P2";
+      return {
+        ...item,
+        priority,
+        confidence: hasSupportedPath ? "verified" : "review",
+        verifiedFindingIds: linkedFindings.map(finding => finding.id),
+        reachableFromEntry: item.reachableFromEntry || item.kind === "endpoint" || linkedFindings.some(findingReachesEntry),
+        containsUnresolvedCalls: item.containsUnresolvedCalls || containsUnresolvedCalls,
+        reasons: [...item.reasons, item.kind === "endpoint" && hasSupportedPath
+          ? "Entry reaches a data-flow-proven dangerous operation"
+          : containsUnresolvedCalls
+            ? "Entry-related path contains an unresolved or heuristic call"
+            : `${linkedFindings.length} security-relevant flow${linkedFindings.length === 1 ? "" : "s"} crosses this target`],
+      };
+    }
+    if (item.priority !== "P0") return {
+      ...item,
+      priority: item.kind === "endpoint" && item.containsUnresolvedCalls ? "P1" : item.priority,
+      confidence: "review",
+      verifiedFindingIds: [],
+      reachableFromEntry: item.reachableFromEntry || item.kind === "endpoint",
+      containsUnresolvedCalls: Boolean(item.containsUnresolvedCalls),
+    };
+    return {
+      ...item,
+      priority: "P1",
+      confidence: "review",
+      verifiedFindingIds: [],
+      reachableFromEntry: true,
+      containsUnresolvedCalls: true,
+      reasons: [...item.reasons, "Source and sink clues are present, but no Source to Sink path is verified"],
+    };
+  }).sort(compareTargets);
+}
+
+function uniqueFindingPaths(finding) {
+  const paths = [...(finding?.paths || []), finding?.path].filter(Boolean);
+  return [...new Map(paths.map(flow => [
+    flow.id || (flow.steps || []).map(step => `${step.functionId}:${step.operationId}:${step.kind}`).join("|"),
+    flow,
+  ])).values()];
+}
+
+function pathIsVerified(flow) {
+  if (flow?.sink?.semanticVerification === "candidate" || /unverified/.test(flow?.sink?.candidateStatus || "")) return false;
+  if (["low", "review"].includes(String(flow?.confidence || "").toLowerCase())) return false;
+  return !(flow?.steps || []).some(step => step.analysisStatus === "heuristic" || step.analysisStatus === "unresolved" ||
+    (step.kind === "call" && step.candidateMatch && step.candidateMatch !== "high"));
+}
+
+function pathHasUnresolvedCall(flow) {
+  return !pathIsVerified(flow) || (flow?.steps || []).some(step =>
+    step.analysisStatus === "unresolved" || step.analysisStatus === "heuristic" ||
+    (step.kind === "call" && (step.candidateReason || (step.candidateMatch && step.candidateMatch !== "high"))));
+}
+
+function findingReachesEntry(finding) {
+  return uniqueFindingPaths(finding).some(flow => (flow.steps || []).some(step =>
+    step.kind === "entry" || step.entryPoint || step.source?.entryPoint));
+}
+
+function findingTouchesTarget(finding, target) {
+  const targetPath = normalizePath(target.absolutePath);
+  const findingPaths = [...(finding.paths || []), finding.path].filter(Boolean);
+  const uniquePaths = [...new Map(findingPaths.map(flow => [
+    flow.id || (flow.steps || []).map(step => `${step.functionId}:${step.operationId}:${step.kind}`).join("|"),
+    flow,
+  ])).values()];
+  const paths = [
+    { absolutePath: finding.absolutePath, relativePath: finding.relativePath, line: finding.line || finding.sinkLine || finding.sourceLine },
+    ...uniquePaths.flatMap(flow => flow.steps || []).map(step => ({
+      absolutePath: step.absolutePath,
+      relativePath: step.relativePath,
+      line: step.line,
+    })),
+    ...((finding.steps || []).map(step => ({
+      absolutePath: step.absolutePath,
+      relativePath: step.relativePath,
+      line: step.line,
+    }))),
+  ];
+  return paths.some(location => {
+    const sameAbsolutePath = location.absolutePath && normalizePath(location.absolutePath) === targetPath;
+    const sameRelativePath = !location.absolutePath && location.relativePath &&
+      normalizePath(location.relativePath) === normalizePath(target.relativePath);
+    if (!sameAbsolutePath && !sameRelativePath) return false;
+    if (target.kind === "endpoint" || target.kind === "file" || !location.line) return true;
+    return location.line >= target.line && location.line <= target.endLine;
+  });
+}
+
+function severityRank(severity) {
+  return ({ critical: 0, high: 1, medium: 2, low: 3 })[String(severity || "low").toLowerCase()] ?? 3;
+}
+
 function range(start, end) {
   return Array.from({ length: Math.max(0, end - start + 1) }, (_, index) => start + index);
 }
 
-module.exports = { SENSITIVE_PATH, buildChecklist, buildReviewTargets, compareTargets, prioritizeTarget };
+module.exports = { SENSITIVE_PATH, buildChecklist, buildReviewTargets, calibrateReviewTargets, compareTargets, prioritizeTarget };

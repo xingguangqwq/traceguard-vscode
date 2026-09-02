@@ -3,6 +3,8 @@
 const { parentPort } = require("node:worker_threads");
 const { runDataflowAnalysis } = require("./pipeline");
 const { WorkspaceAnalysisEngine } = require("../analysis/workspace-engine");
+const { buildAuditModel } = require("../audit-analyzer");
+const { normalizePath } = require("../identity");
 
 if (!parentPort) throw new Error("TraceGuard dataflow worker must run in a worker thread.");
 
@@ -63,7 +65,17 @@ async function dispatch(message) {
     else if (message.type === "configure") result = await engine.configure(message.options);
     else if (message.type === "queryPaths") result = engine.queryPaths(message.options);
     else if (message.type === "queryAudit") result = engine.queryAudit(message.options);
+    else if (message.type === "getAnalysis") {
+      result = engine.analyses().find(item => normalizePath(item.absolutePath) === normalizePath(message.absolutePath));
+    }
     else throw new Error(`Unknown TraceGuard worker request: ${message.type}`);
+    if (message.options?.compactResult && [
+      "initializeWorkspace", "updateFile", "removeFile", "reanalyzeAffectedFunctions", "configure",
+    ].includes(message.type)) {
+      result.auditModel = buildAuditModel(engine.analyses(), engine.reviewReachability());
+      if (Array.isArray(result.analyses)) result.analyses = result.analyses.map(compactAnalysis);
+      if (result.analysis) result.analysis = compactAnalysis(result.analysis);
+    }
     if (result && typeof result === "object") {
       const memory = process.memoryUsage();
       peakRssBytes = Math.max(peakRssBytes, memory.rss);
@@ -82,6 +94,16 @@ async function dispatch(message) {
       error: { message: String(error?.message || error), stack: String(error?.stack || "") },
     });
   }
+}
+
+function compactAnalysis(analysis) {
+  return {
+    absolutePath: analysis.absolutePath,
+    relativePath: analysis.relativePath,
+    language: analysis.language,
+    frontend: analysis.frontend,
+    signals: analysis.signals || [],
+  };
 }
 
 function roundMetric(value) {

@@ -1,6 +1,7 @@
 "use strict";
 
 const { normalizePath } = require("../identity");
+const { structuralDigest } = require("./structural-digest");
 
 class IncrementalAnalysisCache {
   constructor() {
@@ -118,7 +119,7 @@ function fileKey(value) {
 }
 
 function fingerprint(value) {
-  return JSON.stringify(value);
+  return structuralDigest(value);
 }
 
 module.exports = { IncrementalAnalysisCache, changedFunctions, fileKey };

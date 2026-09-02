@@ -1,8 +1,8 @@
 "use strict";
 
 const { stableHash } = require("../identity");
-const { GuardCapability, SinkKind, SourceKind, guardAssociation } = require("../security/semantics");
-const { SemanticRole } = require("../security/semantic-models");
+const { GuardCapability, SinkKind, SourceKind, guardAssociation, sourceExposureForKind } = require("../security/semantics");
+const { SemanticRole } = require("../security/catalog");
 
 const PROJECT_CONFIG_FILENAME = ".traceguard.json";
 const PROJECT_CONFIG_VERSION = 1;
@@ -24,7 +24,7 @@ const TOP_LEVEL_KEYS = new Set([
 const MODEL_KEYS = new Set([
   "id", "language", "languages", "function", "module", "qualifiedName", "receiverType",
   "arguments", "restFrom", "returnsTaint", "kind", "capability", "applicableSinks",
-  "callForms", "role",
+  "callForms", "role", "symbol", "certainty",
 ]);
 
 function parseProjectConfigurationText(text, source = PROJECT_CONFIG_FILENAME) {
@@ -92,6 +92,9 @@ function compileModelList(value, property, defaultRole, source, issues, output) 
     const moduleName = optionalString(input.module, 500, source, `${configPath}.module`, issues);
     const receiverType = optionalString(input.receiverType, 500, source, `${configPath}.receiverType`, issues);
     const qualifiedName = optionalString(input.qualifiedName, 500, source, `${configPath}.qualifiedName`, issues);
+    const symbolName = optionalString(input.symbol, 500, source, `${configPath}.symbol`, issues);
+    const interactiveCertainty = input.certainty === undefined ? undefined :
+      enumValue(input.certainty, new Set(["verified", "review"]), undefined, source, `${configPath}.certainty`, issues);
     const taintArguments = integerArray(input.arguments, `${configPath}.arguments`, source, issues);
     const taintRestFrom = optionalIndex(input.restFrom, `${configPath}.restFrom`, source, issues);
     const callForms = stringArray(input.callForms, `${configPath}.callForms`, source, issues, 20, 80);
@@ -104,17 +107,19 @@ function compileModelList(value, property, defaultRole, source, issues, output) 
       role,
       languages,
       moduleNames: moduleName ? [moduleName] : [],
-      qualifiedNames: [qualifiedName || (moduleName ? `${moduleName}.${functionName}` : receiverType ? `${receiverType}.${functionName}` : functionName)],
+      qualifiedNames: [symbolName || qualifiedName || (moduleName ? `${moduleName}.${functionName}` : receiverType ? `${receiverType}.${functionName}` : functionName)],
       receiverTypes: receiverType ? [receiverType] : [],
       callNames: [lastCallName(functionName)],
       taintArguments: taintArguments === undefined ? defaultTaintArguments(role) : taintArguments,
       returnsTaint: input.returnsTaint === undefined ? role !== SemanticRole.SINK : Boolean(input.returnsTaint),
       callForms: callForms.length ? callForms : ["project-function", "named-import", "namespace-import", "instance-method", "static-method", "package-function"],
-      customUnqualified: !moduleName && !receiverType && !qualifiedName && !/[.:#]|->/.test(functionName),
+      customUnqualified: !moduleName && !receiverType && !qualifiedName && !symbolName && !/[.:#]|->/.test(functionName),
+      interactiveCertainty,
     };
     if (taintRestFrom !== undefined) model.taintRestFrom = taintRestFrom;
     if (role === SemanticRole.SOURCE) {
       model.sourceKind = enumValue(input.kind, SOURCE_KINDS, SourceKind.EXTERNAL_INPUT, source, `${configPath}.kind`, issues);
+      model.exposure = sourceExposureForKind(model.sourceKind);
     }
     if (role === SemanticRole.SINK) {
       model.sinkKind = enumValue(input.kind, SINK_KINDS, undefined, source, `${configPath}.kind`, issues);

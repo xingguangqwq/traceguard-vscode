@@ -4,12 +4,10 @@ const path = require("path");
 const { stableHash } = require("./identity");
 const { projectAnalysis } = require("./frontends/ir-projection");
 const {
-  SIGNAL_PATTERNS,
   collectSignals,
   findEntries,
   findFunctions,
   parseSourceStructure,
-  traceIdentifier,
 } = require("./frontends/pattern-parser");
 const { frontendForLanguage, parseWithBestFrontend } = require("./frontends/registry");
 const { buildReviewTargets, compareTargets } = require("./review/targets");
@@ -20,8 +18,8 @@ function analyzeText(text, language, absolutePath, relativePath = path.basename(
   return projectAnalysis(frontend.parse({ text, absolutePath, relativePath }));
 }
 
-function buildAuditModel(analyses) {
-  const items = analyses.flatMap(analysis => buildReviewTargets(analysis)).sort(compareTargets);
+function buildAuditModel(analyses, options = {}) {
+  const items = analyses.flatMap(analysis => buildReviewTargets(analysis, options)).sort(compareTargets);
   const entries = analyses.flatMap(analysis => analysis.entries.map(item => ({
     ...item,
     absolutePath: analysis.absolutePath,
@@ -70,7 +68,6 @@ async function analyzeTextAsync(text, language, absolutePath, relativePath = pat
 }
 
 module.exports = {
-  SIGNAL_PATTERNS,
   analyzeText,
   analyzeTextAsync,
   buildAuditModel,
@@ -80,5 +77,4 @@ module.exports = {
   findFunctions,
   parseSourceStructure,
   shortHash,
-  traceIdentifier,
 };

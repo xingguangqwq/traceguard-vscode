@@ -3,17 +3,25 @@
 const DEFAULT_ORPHAN_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 function reconcileReviewStatuses(statuses, items, options = {}) {
+  return reconcilePersistedStatuses(statuses, items, options);
+}
+
+function reconcileFindingStatuses(statuses, findings, options = {}) {
+  return reconcilePersistedStatuses(statuses, findings, options);
+}
+
+function reconcilePersistedStatuses(statuses, records, options = {}) {
   const now = options.now instanceof Date ? options.now : new Date(options.now || Date.now());
   const nowIso = now.toISOString();
   const retentionMs = options.retentionMs ?? DEFAULT_ORPHAN_RETENTION_MS;
   const complete = Boolean(options.complete);
   const next = Object.fromEntries(Object.entries(statuses || {}).map(([id, record]) => [id, { ...record }]));
-  const activeIds = new Set(items.map(item => item.id));
+  const activeIds = new Set(records.map(item => item.id));
   let migrated = 0;
   let removed = 0;
   let changed = false;
 
-  for (const item of items) {
+  for (const item of records) {
     const legacyIds = item.legacyIds || [];
     const legacyId = legacyIds.find(id => next[id]);
     if (!next[item.id] && legacyId) {
@@ -53,4 +61,4 @@ function reconcileReviewStatuses(statuses, items, options = {}) {
   return { statuses: next, migrated, removed, changed };
 }
 
-module.exports = { DEFAULT_ORPHAN_RETENTION_MS, reconcileReviewStatuses };
+module.exports = { DEFAULT_ORPHAN_RETENTION_MS, reconcileFindingStatuses, reconcilePersistedStatuses, reconcileReviewStatuses };

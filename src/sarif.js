@@ -78,6 +78,7 @@ function sarifResult(finding, sourceRoots) {
       confidence: finding.confidence,
       status: finding.status || "open",
       sourceKind: finding.sourceKind,
+      sourceExposure: finding.sourceExposure,
       sinkKind: finding.sinkKind,
       observedGuards: finding.observedGuards || [],
       missingGuards: finding.missingGuards || [],

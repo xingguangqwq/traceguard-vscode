@@ -14,7 +14,7 @@ class PatternLanguageFrontend {
 
   parse(input) {
     const lines = String(input.text).split(/\r?\n/);
-    const structure = parseSourceStructure(lines, this.language, input.relativePath);
+    const structure = parseSourceStructure(lines, this.language, input.relativePath, input.options);
     const scopes = buildIRScopes(
       lines,
       structure.functions,
@@ -31,6 +31,12 @@ class PatternLanguageFrontend {
       lines: lines.length,
       entries: structure.entries,
       scopes,
+      frontend: {
+        id: this.id,
+        mode: "pattern",
+        capability: "fallback",
+        ...(structure.patternDifferential ? { patternDifferential: structure.patternDifferential } : {}),
+      },
     });
   }
 }

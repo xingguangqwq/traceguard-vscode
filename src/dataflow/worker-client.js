@@ -22,6 +22,7 @@ class DataflowWorkerClient {
     this.queryTimeoutMs = normalizeTimeout(options.queryTimeoutMs ?? options.timeoutMs, 30_000);
     this.indexTimeoutMs = normalizeTimeout(options.indexTimeoutMs, 300_000);
     this.workerPath = options.workerPath || path.join(__dirname, "worker.js");
+    this.workerMemoryLimitMb = Math.min(4096, Math.max(256, Number(options.workerMemoryLimitMb) || 1024));
   }
 
   analyze(analyses, options = {}) {
@@ -33,10 +34,12 @@ class DataflowWorkerClient {
       skipReplay: true,
       timeoutMs: this.indexTimeoutMs,
     });
-    this.files = new Map((files || []).map(file => [normalizePath(file.absolutePath), replayMetadata(file)]));
-    this.unsavedFiles = new Map((files || []).filter(file => file.unsaved).map(file => [normalizePath(file.absolutePath), { ...file }]));
+    const skipped = new Set((result.metadata?.sourceAdmissionSkippedDetails || []).map(item => normalizePath(item.absolutePath)));
+    const admittedFiles = (files || []).filter(file => !skipped.has(normalizePath(file.absolutePath)));
+    this.files = new Map(admittedFiles.map(file => [normalizePath(file.absolutePath), replayMetadata(file)]));
+    this.unsavedFiles = new Map(admittedFiles.filter(file => file.unsaved).map(file => [normalizePath(file.absolutePath), { ...file }]));
     if (!this.fileLoader) {
-      for (const file of files || []) this.unsavedFiles.set(normalizePath(file.absolutePath), { ...file });
+      for (const file of admittedFiles) this.unsavedFiles.set(normalizePath(file.absolutePath), { ...file });
     }
     this.workspaceOptions = { ...options };
     this.initialized = true;
@@ -51,9 +54,14 @@ class DataflowWorkerClient {
     }
     const key = normalizePath(file.absolutePath);
     const result = await this._request("updateFile", { file, options }, { cancelKey: `update:${key}` });
-    this.files.set(key, replayMetadata(file));
-    if (file.unsaved || !this.fileLoader) this.unsavedFiles.set(key, { ...file });
-    else this.unsavedFiles.delete(key);
+    if (result.skippedFile) {
+      this.files.delete(key);
+      this.unsavedFiles.delete(key);
+    } else {
+      this.files.set(key, replayMetadata(file));
+      if (file.unsaved || !this.fileLoader) this.unsavedFiles.set(key, { ...file });
+      else this.unsavedFiles.delete(key);
+    }
     return result;
   }
 
@@ -99,6 +107,11 @@ class DataflowWorkerClient {
       truncated: false,
     });
     return this._request("queryAudit", { options }, { cancelKey: "audit-query" });
+  }
+
+  getAnalysis(absolutePath) {
+    if (!this.initialized) return Promise.resolve(undefined);
+    return this._request("getAnalysis", { absolutePath }, { cancelKey: `analysis:${normalizePath(absolutePath)}` });
   }
 
   setIndexTimeoutMs(timeoutMs) {
@@ -200,7 +213,10 @@ class DataflowWorkerClient {
   }
 
   _spawnWorker() {
-    const worker = new Worker(this.workerPath, { execArgv: [] });
+    const worker = new Worker(this.workerPath, {
+      execArgv: [],
+      resourceLimits: { maxOldGenerationSizeMb: this.workerMemoryLimitMb, stackSizeMb: 8 },
+    });
     worker.on("message", message => {
       const request = this.pending.get(message.id);
       if (!request) return;

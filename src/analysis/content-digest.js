@@ -1,6 +1,6 @@
 "use strict";
 
-const { stableHash } = require("../identity");
+const { structuralDigest } = require("./structural-digest");
 
 function analysisContentDigest(item) {
   return String(item?.id || "").startsWith("finding_") || item?.kind === "finding"
@@ -11,7 +11,7 @@ function analysisContentDigest(item) {
 function findingDigest(finding = {}) {
   return digest([
     finding.id, finding.ruleId, finding.severity, finding.confidence,
-    finding.sourceKind, finding.sinkKind, finding.absolutePath, finding.line, finding.functionName,
+    finding.sourceKind, finding.sourceExposure, finding.sinkKind, finding.absolutePath, finding.line, finding.functionName,
     finding.observedGuards || [], finding.missingGuards || [], finding.guardHints || [],
     (finding.paths || (finding.path ? [finding.path] : [])).map(pathDigest),
   ]);
@@ -19,7 +19,7 @@ function findingDigest(finding = {}) {
 
 function pathDigest(flow = {}) {
   return digest([
-    flow.id, flow.rootFunctionId, flow.sourceKind, flow.sinkKind, flow.category, flow.confidence,
+    flow.id, flow.rootFunctionId, flow.sourceKind, flow.sourceExposure, flow.sinkKind, flow.category, flow.confidence,
     flow.reviewPriority, flow.guardCapabilities || [], flow.guardHints || [], flow.controls || {},
     (flow.steps || []).map(step => [
       step.kind, step.operationId, step.functionId, step.symbolKey, step.absolutePath, step.line,
@@ -31,7 +31,7 @@ function pathDigest(flow = {}) {
 }
 
 function digest(value) {
-  return stableHash(JSON.stringify(value));
+  return structuralDigest(value);
 }
 
 module.exports = { analysisContentDigest, findingDigest, pathDigest };

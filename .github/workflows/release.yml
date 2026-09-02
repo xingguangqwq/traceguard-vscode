@@ -24,6 +24,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Verify tag matches package metadata
+        run: npm run verify:release-version -- "$GITHUB_REF_NAME"
+
       - name: Run tests
         shell: bash
         run: |
@@ -48,6 +51,9 @@ jobs:
       - name: Enforce TypeScript dependency invalidation baseline
         run: npm run benchmark -- --fixture=typescript-dependents --files=100 --max-incremental-ms=500 --max-rss-mib=500
 
+      - name: Enforce 8000-file Worker stress baseline
+        run: npm run benchmark:stress
+
       - name: Compare evaluation baseline
         run: npm run eval:compare
 
@@ -62,7 +68,7 @@ jobs:
         run: |
           package_root=$(mktemp -d)
           unzip -q traceguard-*.vsix -d "$package_root"
-          node scripts/verify-packaged-runtime.js "$package_root/extension"
+          node scripts/verify-packaged-runtime.js "$package_root/extension" "$PWD/dist-assets"
 
       - name: Prepare reviewed release notes
         shell: bash
@@ -74,23 +80,26 @@ jobs:
           fi
 
           asset=$(ls ./traceguard-*.vsix)
-          checksum=$(sha256sum "$asset" | awk '{print $1}')
           cp "$notes_source" release-notes.md
-          printf '\n### SHA-256\n\n`%s`\n' "$checksum" >> release-notes.md
+          printf '\n### SHA-256\n\n' >> release-notes.md
+          for release_asset in "$asset" ./dist-assets/*.json.gz; do
+            checksum=$(sha256sum "$release_asset" | awk '{print $1}')
+            printf -- '- `%s` — `%s`\n' "$(basename "$release_asset")" "$checksum" >> release-notes.md
+          done
 
       - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          asset=$(ls ./traceguard-*.vsix)
+          assets=(./traceguard-*.vsix ./dist-assets/*.json.gz)
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" "$asset" --clobber
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
             gh release edit "$GITHUB_REF_NAME" \
               --title "TraceGuard $GITHUB_REF_NAME" \
               --notes-file release-notes.md
           else
-            gh release create "$GITHUB_REF_NAME" "$asset" \
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
               --title "TraceGuard $GITHUB_REF_NAME" \
               --notes-file release-notes.md
           fi

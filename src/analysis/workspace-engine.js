@@ -3,19 +3,22 @@
 const { analyzeTextAsync } = require("../audit-analyzer");
 const { normalizePath, stableHash } = require("../identity");
 const { buildFunctionIndex, resolveCandidates } = require("../dataflow/call-resolver");
-const { summarizeFileIR } = require("../dataflow/function-summary");
+const { FunctionSummaryCache, summarizeFileIR } = require("../dataflow/function-summary");
 const { functionsFromAnalyses } = require("../dataflow/ir-adapter");
 const { runDataflowAnalysis } = require("../dataflow/pipeline");
 const { evaluateFlowPaths } = require("../rules/rule-engine");
 const { runAuditQuery } = require("../query/audit-query-engine");
 const { runtime } = require("../frontends/tree-sitter-runtime");
-const { TypeScriptProject, createCompilerModel } = require("../frontends/typescript-compiler");
+const { TypeScriptProject, createCompilerModel, createSyntaxModel } = require("../frontends/typescript-compiler");
 const { IncrementalAnalysisCache, fileKey } = require("./incremental-cache");
 const { analysisContentDigest } = require("./content-digest");
-const { configurationForAbsolutePath, scopedConfigurationFingerprint } = require("../config/configuration-scope");
+const { inspectAnalysisComplexity, inspectSourceFile } = require("./source-admission");
+const { structuralDigest } = require("./structural-digest");
+const { analysisSettingsForAbsolutePath, configurationForAbsolutePath, scopedConfigurationFingerprint } = require("../config/configuration-scope");
 const { workspaceRootForAbsolutePath } = require("../config/configuration-scope");
 const { composerPathsForType, projectIdentityFingerprint, projectIdentityForAbsolutePath } = require("../config/project-identity");
 const { frameworkParameterRoles } = require("../frontends/framework-entries");
+const { languageAssets } = require("../assets/language-assets");
 
 class WorkspaceAnalysisEngine {
   constructor() {
@@ -28,21 +31,44 @@ class WorkspaceAnalysisEngine {
     this.generation = 0;
     this.typescriptProject = new TypeScriptProject();
     this.entryBindingFingerprints = new Map();
+    this.summaryCache = new FunctionSummaryCache();
     this.flowFunctions = [];
     this.functionIndex = new Map();
   }
 
   async initializeWorkspace(files, options = {}) {
+    const initializationStartedAt = performance.now();
     for (const record of this.files.values()) runtime.remove(record.analysis.absolutePath);
     this.files.clear();
     this.cache.clear();
     this.dataflow = emptyDataflow();
     this.generation = 0;
     this.entryBindingFingerprints.clear();
+    this.summaryCache.clear();
     this.options = { ...options };
-    this.typescriptProject.initialize(files || []);
-    for (const file of files || []) {
-      const record = await this._analyzeFile(file);
+    const admissions = (files || []).map(file => ({
+      file,
+      admission: inspectSourceFile(file, { maxSourceBytes: analysisSettingsForAbsolutePath(options, file.absolutePath).maxSourceBytes }),
+    }));
+    const admittedFiles = admissions.filter(item => item.admission.accepted).map(item => item.file);
+    const skippedDetails = admissions.filter(item => !item.admission.accepted).map(item => item.admission.detail);
+    const frontendStartedAt = performance.now();
+    const standardLibraryPath = await this._prepareTypeScriptAssets(admittedFiles);
+    this.typescriptProject.initialize(admittedFiles, { standardLibraryPath });
+    for (let index = 0; index < admittedFiles.length; index += 1) {
+      const file = admittedFiles[index];
+      const isolatedCompiler = ["javascript", "typescript"].includes(file.language) &&
+        this.typescriptProject.canAnalyzeIsolated(file.absolutePath, file.text);
+      const record = await this._analyzeFile(file, {
+        isolatedCompiler: isolatedCompiler && file.language === "typescript",
+        syntaxOnlyCompiler: isolatedCompiler && file.language === "javascript",
+      });
+      const complexity = inspectAnalysisComplexity(record.analysis);
+      if (!complexity.accepted) {
+        skippedDetails.push(complexity.detail);
+        runtime.remove(record.analysis.absolutePath);
+        continue;
+      }
       this.files.set(fileKey(record.analysis.absolutePath), record);
       this.cache.updateFile({
         absolutePath: record.analysis.absolutePath,
@@ -51,11 +77,27 @@ class WorkspaceAnalysisEngine {
         functionSummaries: record.summaries,
       });
     }
+    this.typescriptProject.releasePrograms();
+    const frontendMs = performance.now() - frontendStartedAt;
+    const entryBindingStartedAt = performance.now();
     this._applyProjectEntryBindings();
+    const entryBindingMs = performance.now() - entryBindingStartedAt;
+    const callGraphStartedAt = performance.now();
     this._rebuildDependencies();
+    const callGraphMs = performance.now() - callGraphStartedAt;
     this.pendingAffectedFiles = new Set(this.files.keys());
     this.pendingAffectedFunctionIds = new Set(this.analyses().flatMap(analysis => analysis.ir.functions.map(fn => fn.id)));
     const analysis = this.reanalyzeAffectedFunctions({ forceAll: true });
+    analysis.metadata = {
+      ...(analysis.metadata || {}),
+      initializationMs: roundMetric(performance.now() - initializationStartedAt),
+      frontendMs: roundMetric(frontendMs),
+      entryBindingMs: roundMetric(entryBindingMs),
+      callGraphMs: roundMetric(callGraphMs),
+      sourceAdmissionSkippedFiles: skippedDetails.length,
+      sourceAdmissionSkippedDetails: skippedDetails,
+      functionSummaryCache: this.summaryCache.snapshot(),
+    };
     return {
       analyses: this.analyses(),
       ...analysis,
@@ -64,14 +106,55 @@ class WorkspaceAnalysisEngine {
   }
 
   async updateFile(file, options = {}) {
+    const runtimeOptions = { ...this.options, ...options };
+    const admission = inspectSourceFile(file, {
+      maxSourceBytes: analysisSettingsForAbsolutePath(runtimeOptions, file.absolutePath).maxSourceBytes,
+    });
+    if (!admission.accepted) {
+      const removed = await this.removeFile(file.absolutePath, options);
+      return {
+        ...removed,
+        analysis: undefined,
+        skippedFile: admission.detail,
+        findingDelta: removed.findingDelta || { upsert: [], removedIds: [] },
+        pathDelta: removed.pathDelta || { upsert: [], removedIds: [] },
+        metadata: {
+          ...(removed.metadata || this.dataflow.metadata),
+          sourceAdmissionSkippedFiles: 1,
+          sourceAdmissionSkippedDetails: [admission.detail],
+        },
+      };
+    }
     const key = fileKey(file.absolutePath);
     const previous = this.files.get(key);
     const typeAware = ["javascript", "typescript"].includes(file.language) ||
       ["javascript", "typescript"].includes(previous?.analysis?.language);
+    if (typeAware) this.typescriptProject.setStandardLibraryPath(await this._prepareTypeScriptAssets([file]));
     const isolatedCompilerUpdate = typeAware && this.typescriptProject.canAnalyzeIsolated(file.absolutePath, file.text);
     const previousTypeDependents = typeAware && !isolatedCompilerUpdate ? this.typescriptProject.dependentsOf(file.absolutePath) : [];
     this.typescriptProject.update(file);
-    const record = await this._analyzeFile(file, { isolatedCompiler: isolatedCompilerUpdate });
+    const record = await this._analyzeFile(file, {
+      isolatedCompiler: isolatedCompilerUpdate && file.language === "typescript",
+      syntaxOnlyCompiler: isolatedCompilerUpdate && file.language === "javascript",
+    });
+    const complexity = inspectAnalysisComplexity(record.analysis);
+    if (!complexity.accepted) {
+      runtime.remove(record.analysis.absolutePath);
+      if (!previous) this.typescriptProject.remove(file.absolutePath);
+      const removed = await this.removeFile(file.absolutePath, options);
+      return {
+        ...removed,
+        analysis: undefined,
+        skippedFile: complexity.detail,
+        findingDelta: removed.findingDelta || { upsert: [], removedIds: [] },
+        pathDelta: removed.pathDelta || { upsert: [], removedIds: [] },
+        metadata: {
+          ...(removed.metadata || this.dataflow.metadata),
+          sourceAdmissionSkippedFiles: 1,
+          sourceAdmissionSkippedDetails: [complexity.detail],
+        },
+      };
+    }
     if (previous?.version === record.version) {
       return {
         analysis: previous.analysis,
@@ -257,11 +340,7 @@ class WorkspaceAnalysisEngine {
       next = {
         paths,
         findings: evaluateFlowPaths(paths, undefined, this.options),
-        metadata: {
-          truncated: Boolean(partial.metadata.truncated || previous.metadata.truncated),
-          explorationTruncated: Boolean(partial.metadata.explorationTruncated),
-          totalCandidates: retained.length + partial.metadata.totalCandidates,
-        },
+        metadata: mergeIncrementalDataflowMetadata(previous.metadata, partial.metadata, retained.length, paths.length, invalidated),
       };
     }
     this.dataflow = next;
@@ -321,6 +400,14 @@ class WorkspaceAnalysisEngine {
     return runAuditQuery(this.analyses(), { ...this.options, ...options });
   }
 
+  currentPaths() {
+    return this.dataflow.paths || [];
+  }
+
+  reviewReachability() {
+    return buildReviewReachability(this.flowFunctions, this.functionIndex);
+  }
+
   analyses() {
     return [...this.files.values()].map(record => record.analysis);
   }
@@ -329,29 +416,34 @@ class WorkspaceAnalysisEngine {
     if (file.analysis?.ir) {
       return {
         analysis: file.analysis,
-        version: file.version || stableHash(JSON.stringify(file.analysis.ir)),
-        summaries: summarizeFileIR(file.analysis.ir),
-        irFingerprint: semanticIrFingerprint(file.analysis.ir),
+        version: file.version || semanticIrFingerprint(file.analysis.ir, file.text?.length),
+        summaries: summarizeFileIR(file.analysis.ir, { cache: this.summaryCache }),
+        irFingerprint: semanticIrFingerprint(file.analysis.ir, file.text?.length),
         dependencyFunctionIds: [],
         source: file,
       };
     }
     const compilerModel = ["javascript", "typescript"].includes(file.language)
-      ? options.isolatedCompiler
-        ? createCompilerModel(file.text, file.absolutePath, file.language)
+      ? options.syntaxOnlyCompiler
+        ? createSyntaxModel(file.text, file.absolutePath, file.language)
+        : options.isolatedCompiler
+        ? createCompilerModel(file.text, file.absolutePath, file.language, {
+          standardLibraryPath: this.typescriptProject.standardLibraryPath,
+        })
         : this.typescriptProject.modelFor(file.absolutePath)
       : undefined;
     const projectConfiguration = configurationForAbsolutePath(this.options, file.absolutePath);
     const analysis = await analyzeTextAsync(file.text, file.language, file.absolutePath, file.relativePath, {
       differential: Boolean(this.options.astDifferential),
       compilerModel,
+      languageAssets: this.options.languageAssets,
       semanticModels: projectConfiguration?.semanticModels || [],
     });
     return {
       analysis,
       version: file.version || stableHash(file.text),
-      summaries: summarizeFileIR(analysis.ir),
-      irFingerprint: semanticIrFingerprint(analysis.ir),
+      summaries: summarizeFileIR(analysis.ir, { cache: this.summaryCache }),
+      irFingerprint: semanticIrFingerprint(analysis.ir, file.text.length),
       dependencyFunctionIds: [],
       source: { ...file },
     };
@@ -450,7 +542,8 @@ class WorkspaceAnalysisEngine {
     const preserved = [...this.files.values()].filter(record => record.source?.text === undefined);
     this.files.clear();
     this.cache.clear();
-    this.typescriptProject.initialize(sources);
+    const standardLibraryPath = await this._prepareTypeScriptAssets(sources);
+    this.typescriptProject.initialize(sources, { standardLibraryPath });
     for (const record of preserved) {
       this.files.set(fileKey(record.analysis.absolutePath), record);
       this.cache.updateFile({
@@ -461,7 +554,12 @@ class WorkspaceAnalysisEngine {
       });
     }
     for (const source of sources) {
-      const record = await this._analyzeFile(source);
+      const isolatedCompiler = ["javascript", "typescript"].includes(source.language) &&
+        this.typescriptProject.canAnalyzeIsolated(source.absolutePath, source.text);
+      const record = await this._analyzeFile(source, {
+        isolatedCompiler: isolatedCompiler && source.language === "typescript",
+        syntaxOnlyCompiler: isolatedCompiler && source.language === "javascript",
+      });
       this.files.set(fileKey(record.analysis.absolutePath), record);
       this.cache.updateFile({
         absolutePath: record.analysis.absolutePath,
@@ -470,6 +568,7 @@ class WorkspaceAnalysisEngine {
         functionSummaries: record.summaries,
       });
     }
+    this.typescriptProject.releasePrograms();
     this._applyProjectEntryBindings();
     this._rebuildDependencies();
     this.pendingAffectedFiles = new Set(this.files.keys());
@@ -481,6 +580,16 @@ class WorkspaceAnalysisEngine {
     for (const functionId of changedFunctionIds) this.pendingAffectedFunctionIds.add(functionId);
     for (const key of this.pendingAffectedFiles) {
       for (const summary of this.files.get(key)?.summaries || []) this.pendingAffectedFunctionIds.add(summary.id);
+    }
+  }
+
+  async _prepareTypeScriptAssets(files = []) {
+    if (!(files || []).some(file => ["javascript", "typescript"].includes(file.language))) return this.typescriptProject.standardLibraryPath;
+    try {
+      const asset = await languageAssets.ensure("typescript", this.options.languageAssets || {});
+      return asset.typeLibraryPath;
+    } catch {
+      return undefined;
     }
   }
 }
@@ -509,6 +618,11 @@ function resolveProjectEntryHandler(handler, functions, workspaceRoot, projectId
       return modulePath === expectedModule || modulePath.endsWith(`/${expectedModule}`);
     });
   }
+  if (["javascript", "typescript"].includes(handler.language)) {
+    const target = String(handler.targetType || handler.className || "").toLowerCase();
+    if (!target) return [];
+    return candidates.filter(fn => String(fn.enclosingScope || "").split(".").some(scope => scope.toLowerCase() === target));
+  }
   return [];
 }
 
@@ -526,17 +640,97 @@ function diffById(previous, current) {
 }
 
 function emptyDataflow() {
-  return { paths: [], findings: [], metadata: { truncated: false, explorationTruncated: false, totalCandidates: 0 } };
+  return { paths: [], findings: [], metadata: { truncated: false, explorationTruncated: false, totalCandidates: 0, partialPaths: 0, partialRoots: [] } };
+}
+
+function mergeIncrementalDataflowMetadata(previous = {}, partial = {}, retainedPaths = 0, currentPaths = 0, invalidatedFunctionIds = new Set()) {
+  const totalCandidates = retainedPaths + (partial.totalCandidates || 0);
+  const invalidated = invalidatedFunctionIds instanceof Set ? invalidatedFunctionIds : new Set(invalidatedFunctionIds || []);
+  const retainedPartialRoots = (previous.partialRoots || []).filter(root => !invalidated.has(root.functionId));
+  const partialRoots = [...new Map([...retainedPartialRoots, ...(partial.partialRoots || [])]
+    .map(root => [root.key, root])).values()];
+  return {
+    ...previous,
+    truncated: Boolean(previous.truncated || partial.truncated),
+    explorationTruncated: Boolean(previous.explorationTruncated || partial.explorationTruncated),
+    totalCandidates: Math.max(currentPaths, totalCandidates),
+    partialPaths: partialRoots.length,
+    partialRoots,
+    truncationReasons: [...new Set([
+      ...(previous.truncationReasons || []),
+      ...(partial.truncationReasons || []),
+    ])],
+    // Pass-level counters describe this incremental recomputation. Coverage flags
+    // above remain conservative until a full rebuild proves the workspace complete.
+    incrementalExploredFlowStates: partial.exploredFlowStates || 0,
+    incrementalVisitedFlowEvents: partial.visitedFlowEvents || 0,
+    incrementalTotalFlowRoots: partial.totalFlowRoots || 0,
+    incrementalProcessedFlowRoots: partial.processedFlowRoots || 0,
+    incrementalFlowRankingMs: partial.flowRankingMs || 0,
+    incrementalFlowExplorationMs: partial.flowExplorationMs || 0,
+  };
+}
+
+function buildReviewReachability(functions = [], functionIndex = buildFunctionIndex(functions)) {
+  const entries = functions.filter(fn => fn.isEntry);
+  const reachableFunctionIds = new Set(entries.map(fn => fn.id));
+  const unresolvedFunctionIds = new Set();
+  const entryFunctionIdsByFunctionId = new Map(entries.map(fn => [fn.id, new Set([fn.id])]));
+  const functionById = new Map(functions.map(fn => [fn.id, fn]));
+  const queue = entries.map(fn => ({ functionId: fn.id, entryFunctionId: fn.id }));
+  const visited = new Set();
+
+  while (queue.length) {
+    const current = queue.shift();
+    const visit = `${current.entryFunctionId}:${current.functionId}`;
+    if (visited.has(visit)) continue;
+    visited.add(visit);
+    const caller = functionById.get(current.functionId);
+    if (!caller) continue;
+    const entryIds = entryFunctionIdsByFunctionId.get(caller.id) || new Set();
+    entryIds.add(current.entryFunctionId);
+    entryFunctionIdsByFunctionId.set(caller.id, entryIds);
+
+    for (const event of caller.events.filter(item => item.type === "call" && item.callee && item.reachable !== false)) {
+      const resolutions = resolveCandidates(functionIndex, event, caller);
+      const uncertain = !resolutions.length || resolutions.some(resolution => resolution.quality !== "high");
+      if (uncertain) {
+        unresolvedFunctionIds.add(caller.id);
+        unresolvedFunctionIds.add(current.entryFunctionId);
+      }
+      for (const resolution of resolutions) {
+        const callee = resolution.fn;
+        reachableFunctionIds.add(callee.id);
+        if (!entryFunctionIdsByFunctionId.has(callee.id)) entryFunctionIdsByFunctionId.set(callee.id, new Set());
+        entryFunctionIdsByFunctionId.get(callee.id).add(current.entryFunctionId);
+        queue.push({ functionId: callee.id, entryFunctionId: current.entryFunctionId });
+      }
+    }
+  }
+
+  return { reachableFunctionIds, unresolvedFunctionIds, entryFunctionIdsByFunctionId };
 }
 
 function roundMetric(value) {
   return Math.round(Math.max(0, value) * 100) / 100;
 }
 
-function semanticIrFingerprint(ir = {}) {
+function semanticIrFingerprint(ir = {}, sourceCharacters = 0) {
   const { lines: _sourceLines, frontend = {}, ...semanticIr } = ir;
   const { incremental: _incrementalParse, ...frontendCapability } = frontend;
-  return stableHash(JSON.stringify({ ...semanticIr, frontend: frontendCapability }), 32);
+  const payload = { ...semanticIr, frontend: frontendCapability };
+  if (isCompactSemanticIr(ir, sourceCharacters)) return stableHash(JSON.stringify(payload), 32);
+  return structuralDigest(payload, 32);
 }
 
-module.exports = { WorkspaceAnalysisEngine, diffById };
+function isCompactSemanticIr(ir, sourceCharacters) {
+  if (Number(sourceCharacters) > 250_000) return false;
+  let operations = 0;
+  for (const fn of ir.functions || []) {
+    operations += (fn.operations || []).length;
+    if (operations > 2_000) return false;
+  }
+  return true;
+}
+
+module.exports = { WorkspaceAnalysisEngine, buildReviewReachability, diffById, mergeIncrementalDataflowMetadata };

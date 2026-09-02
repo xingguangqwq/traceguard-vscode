@@ -2,6 +2,11 @@ node_modules/
 *.vsix
 .vscode-test/
 .npm-cache/
+.target-labs/
+.tmp-vsix-verify*/
+.tmp-vsix-installed-audit/
+.tmp-vsix-whitebox-ui-audit/
+dist-assets/
 coverage/
 *.log
 .DS_Store

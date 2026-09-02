@@ -38,8 +38,8 @@ function buildOperationCFG(operations) {
       edges.push(edge(blockId, conditionBlocks[0], "condition"));
       removeOutgoing(edges, decisionBlock);
     }
-    edges.push(edge(decisionBlock, thenBlocks[0] || joinId, "true"));
-    edges.push(edge(decisionBlock, elseBlocks[0] || joinId, "false"));
+    if (branch.constantOutcome !== false) edges.push(edge(decisionBlock, thenBlocks[0] || joinId, "true"));
+    if (branch.constantOutcome !== true) edges.push(edge(decisionBlock, elseBlocks[0] || joinId, "false"));
     connectTail(edges, thenBlocks, branch.controlKind === "loop" ? blockId : joinId, ordered, branch.controlKind === "loop" ? "loop" : "join");
     connectTail(edges, elseBlocks, joinId, ordered);
     branch.thenBlocks = thenBlocks;
@@ -301,25 +301,46 @@ function enumerateCFGPaths(cfg, options = {}) {
   }
   const results = [];
   let truncated = false;
-  const visit = (current, path, visits) => {
-    if (results.length >= maxPaths) { truncated = true; return; }
-    const nextPath = [...path, current];
-    const nextVisits = new Map(visits);
-    nextVisits.set(current, (nextVisits.get(current) || 0) + 1);
+  const exit = cfg.exit || "exit";
+  const path = [];
+  const visits = new Map();
+  const stack = [{ type: "enter", blockId: start }];
+  while (stack.length) {
+    const frame = stack.pop();
+    if (frame.type === "leave") {
+      path.pop();
+      const remaining = (visits.get(frame.blockId) || 1) - 1;
+      if (remaining > 0) visits.set(frame.blockId, remaining);
+      else visits.delete(frame.blockId);
+      continue;
+    }
+    if (results.length >= maxPaths) { truncated = true; break; }
+    const current = frame.blockId;
+    path.push(current);
+    visits.set(current, (visits.get(current) || 0) + 1);
     const nextEdges = outgoing.get(current) || [];
-    if (current === (cfg.exit || "exit") || !nextEdges.length) {
-      results.push(nextPath);
-      return;
+    if (current === exit || !nextEdges.length) {
+      results.push([...path]);
+      path.pop();
+      const remaining = (visits.get(current) || 1) - 1;
+      if (remaining > 0) visits.set(current, remaining);
+      else visits.delete(current);
+      continue;
     }
-    let followed = false;
-    for (const item of nextEdges) {
-      if ((nextVisits.get(item.to) || 0) >= maxVisits) continue;
-      followed = true;
-      visit(item.to, nextPath, nextVisits);
+    const eligible = nextEdges.filter(item => (visits.get(item.to) || 0) < maxVisits);
+    if (!eligible.length) {
+      truncated = true;
+      path.pop();
+      const remaining = (visits.get(current) || 1) - 1;
+      if (remaining > 0) visits.set(current, remaining);
+      else visits.delete(current);
+      continue;
     }
-    if (!followed && current !== (cfg.exit || "exit")) truncated = true;
-  };
-  visit(start, [], new Map());
+    stack.push({ type: "leave", blockId: current });
+    for (let index = eligible.length - 1; index >= 0; index -= 1) {
+      stack.push({ type: "enter", blockId: eligible[index].to });
+    }
+  }
   Object.defineProperty(results, "truncated", { value: truncated, enumerable: false });
   return results;
 }

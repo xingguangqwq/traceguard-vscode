@@ -3,6 +3,7 @@
 const JS_METHODS = new Set(["get", "post", "put", "delete", "patch", "options", "all", "use"]);
 const PHP_METHODS = new Set(["get", "post", "put", "delete", "patch", "any"]);
 const GO_METHODS = new Set(["get", "post", "put", "delete", "patch", "options", "any"]);
+const PYTHON_METHODS = new Set(["get", "post", "put", "delete", "patch", "options", "head"]);
 const JS_RECEIVERS = new Set(["app", "router", "server", "fastify"]);
 const GENERIC_METHODS = new Set(["ANY", "REQUEST"]);
 
@@ -11,6 +12,7 @@ const EXPRESS_ERROR_ROLES = ["error", "request", "response", "continuation"];
 const GO_HTTP_ROLES = ["response", "request"];
 
 const DECLARATION_ROLE_PATTERNS = Object.freeze([
+  [/@(?:CurrentUser(?:name)?|AuthenticationPrincipal|Principal)\b/i, "context"],
   [/(?:@(?:request)?headers?\b|\[\s*FromHeaders?\b)/i, "header"],
   [/(?:@(?:request)?body\b|\[\s*From(?:Body|Form)\b)/i, "body"],
   [/(?:@query\b|@requestparam\b|\[\s*FromQuery\b)/i, "query"],
@@ -28,6 +30,8 @@ const EXACT_TYPE_ROLES = Object.freeze({
   response: "response",
   httpresponse: "response",
   httpcontext: "context",
+  principal: "context",
+  authentication: "context",
   nextfunction: "continuation",
   cancellationtoken: "cancellation",
   ilogger: "logger",
@@ -56,13 +60,40 @@ function classifyFrameworkCall(language, call) {
 
 function classifyPythonCall(call) {
   const callee = canonical(call.function);
-  if (!["path", "repath"].includes(callee)) return undefined;
-  return {
+  if (["path", "repath"].includes(callee)) return {
     method: "REQUEST",
     route: call.routeValue || staticString(call.arguments?.[0]) || "<dynamic>",
     handlerIndexes: [1],
     framework: "django",
   };
+  const receivers = receiverNamesFor(call.receiver);
+  const routeReceiver = [...receivers].some(name => /(?:app|router|blueprint|bp)$/.test(name));
+  if (callee === "addapiroute" && routeReceiver) {
+    const methods = keywordStringLiterals(call.arguments, "methods");
+    return {
+      method: methods.length ? methods.map(method => method.toUpperCase()).join("|") : "ANY",
+      route: call.routeValue || staticString(call.arguments?.[0]) || "<dynamic>",
+      handlerIndexes: [1],
+      framework: "fastapi",
+    };
+  }
+  if (callee === "addurlrule" && routeReceiver) {
+    const methods = keywordStringLiterals(call.arguments, "methods");
+    const viewIndex = (call.arguments || []).findIndex(argument => /^\s*view_func\s*=/.test(String(argument)));
+    return {
+      method: methods.length ? methods.map(method => method.toUpperCase()).join("|") : "ANY",
+      route: call.routeValue || staticString(call.arguments?.[0]) || "<dynamic>",
+      handlerIndexes: [viewIndex >= 0 ? viewIndex : 2],
+      framework: "flask",
+    };
+  }
+  if (PYTHON_METHODS.has(callee) && routeReceiver) return {
+    method: callee.toUpperCase(),
+    route: call.routeValue || staticString(call.arguments?.[0]) || "<dynamic>",
+    handlerIndexes: [1],
+    framework: "fastapi",
+  };
+  return undefined;
 }
 
 function classifyJavaScriptCall(call) {
@@ -184,7 +215,7 @@ function mergeFrameworkEntries(astEntries, patternEntries) {
   ];
   const seen = new Set();
   return merged.filter(item => {
-    const key = `${item.method}:${item.route}:${item.functionId || item.functionLine || item.line}`;
+    const key = `${item.method}:${entryIdentity(item)}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -213,8 +244,10 @@ function entryIdentity(entry) {
 function frameworkParameterRoles(entry, parameters) {
   if (!Array.isArray(parameters) || !parameters.length || !entry?.framework) return [];
   if (entry.framework === "express") {
-    const roles = parameters.length >= 4 ? EXPRESS_ERROR_ROLES : EXPRESS_ROLES;
-    return parameters.map((_, index) => roles[index] || "unknown");
+    const callableParameters = parameters.filter(parameter => !parameter?.captured);
+    const roles = callableParameters.length >= 4 ? EXPRESS_ERROR_ROLES : EXPRESS_ROLES;
+    let callableIndex = 0;
+    return parameters.map(parameter => parameter?.captured ? "unknown" : roles[callableIndex++] || "unknown");
   }
   if (entry.framework === "go-http") {
     return parameters.map((_, index) => GO_HTTP_ROLES[index] || "unknown");
@@ -242,6 +275,10 @@ function inferParameterRoles(language, parameters) {
     }
     const declaration = DECLARATION_ROLE_PATTERNS.find(([pattern]) => pattern.test(raw));
     if (declaration) return declaration[1];
+    const name = String(parameter?.name || "").replace(/^\$/, "");
+    if (/^(?:db|database|pdo|mysqli|conn|connection|cursor|session)$/i.test(name)) return "database";
+    if (/(?:service|repository|client)$/i.test(name)) return "service";
+    if (/^(?:log|logger)$/i.test(name)) return "logger";
     const type = canonicalType(parameter?.type);
     if (EXACT_TYPE_ROLES[type]) return EXACT_TYPE_ROLES[type];
     const suffix = TYPE_ROLE_SUFFIXES.find(([pattern]) => pattern.test(type));
@@ -290,6 +327,11 @@ function staticString(value) {
 
 function stringLiterals(value) {
   return [...String(value || "").matchAll(/(["'])([^"'\\]*(?:\\.[^"'\\]*)*)\1/g)].map(match => match[2]);
+}
+
+function keywordStringLiterals(argumentsList, keyword) {
+  const value = (argumentsList || []).find(argument => new RegExp(`^\\s*${keyword}\\s*=`).test(String(argument)));
+  return stringLiterals(value || "");
 }
 
 function canonicalType(value) {

@@ -2,6 +2,7 @@
 
 const { Language, Parser } = require("web-tree-sitter");
 const { normalizePath } = require("../identity");
+const { languageAssets } = require("../assets/language-assets");
 
 const GRAMMARS = Object.freeze({
   java: "tree-sitter-java/tree-sitter-java.wasm",
@@ -24,7 +25,7 @@ class TreeSitterRuntime {
 
   async parse(input) {
     const grammar = grammarFor(input.language, input.absolutePath || input.relativePath);
-    const parser = await this._parser(grammar);
+    const parser = await this._parser(grammar, input.options?.languageAssets);
     const key = normalizePath(input.absolutePath);
     const previous = this.trees.get(key);
     let incremental = false;
@@ -53,7 +54,7 @@ class TreeSitterRuntime {
     this.trees.delete(key);
   }
 
-  async _parser(grammar) {
+  async _parser(grammar, assetOptions) {
     if (this.parsers.has(grammar)) return this.parsers.get(grammar);
     if (!GRAMMARS[grammar]) throw new Error(`No Tree-sitter WASM grammar is configured for ${grammar}.`);
     const initialization = this.initialized || (this.initialized = Parser.init({
@@ -66,7 +67,10 @@ class TreeSitterRuntime {
       throw error;
     }
     const parser = new Parser();
-    parser.setLanguage(await Language.load(require.resolve(GRAMMARS[grammar])));
+    const asset = await languageAssets.ensure(grammar, assetOptions || {});
+    const grammarPath = asset.grammars?.[grammar];
+    if (!grammarPath) throw new Error(`TraceGuard language asset ${asset.assetId} has no ${grammar} grammar.`);
+    parser.setLanguage(await Language.load(grammarPath));
     this.parsers.set(grammar, parser);
     return parser;
   }

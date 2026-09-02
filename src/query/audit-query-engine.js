@@ -7,12 +7,12 @@ const {
   normalizeAccessPath,
   pathFeeds,
   pathsOverlap,
-  removeAssignedTaint,
   relativeAccessPath,
 } = require("../ir/access-path");
 const { normalizePath, stableHash } = require("../identity");
 const { assignmentFact, assignmentInputs, assignmentOutputs, eventConsumes, isReachableEvent } = require("../dataflow/propagation");
 const { eventSequences, targetBlocksAtLine } = require("../dataflow/control-flow");
+const { applyAssignment, applyCallOutput, applySource } = require("../dataflow/taint-kernel");
 
 const QueryKind = Object.freeze({
   TRACE_BACKWARD: "trace-backward",
@@ -154,6 +154,7 @@ function backwardVariable(context, fn, variable, beforeLine, visiting, depth, li
     const children = [];
     if (event.type === "source") {
       children.push(queryNode({ kind: "source", label: event.label || `Source · ${variable}`, status: eventStatus(event), reason: sourceReason(event), fn, event }));
+      if (fn.isEntry) children.push(...entryNodes(fn, variable));
     } else if (event.type === "assignment") {
       for (const input of assignmentInputs(event, variable)) {
         children.push(...backwardVariable(context, fn, input, event.line, nextVisiting, depth + 1, limits));
@@ -294,21 +295,18 @@ function taintReachesEventOnSomePath(fn, variable, afterLine, targetEvent) {
       if (event.id === targetEvent.id) return eventConsumes(event, variable) && [...tainted].some(value => pathsOverlap(value, variable));
       if (event.type === "assignment" && event.target) {
         if (event.line === afterLine && pathFeeds(event.target, variable)) continue;
-        const propagated = assignmentOutputs(event, [...tainted]);
-        tainted = removeAssignedTaint(tainted, event.target);
-        for (const output of propagated) tainted.add(output);
+        tainted = applyAssignment(tainted, event).tainted;
         continue;
       }
       if (event.type === "source" && event.target && event.line > afterLine) {
-        tainted = removeAssignedTaint(tainted, event.target);
+        tainted = applySource(tainted, event);
         continue;
       }
       if (event.type === "call" && event.target) {
         const propagates = (event.argumentVariables || []).some((variables, index) =>
           (!event.taintArgumentIndexes || event.taintArgumentIndexes.includes(index)) &&
           variables.some(value => [...tainted].some(current => pathsOverlap(current, value))));
-        tainted = removeAssignedTaint(tainted, event.target);
-        if (propagates) tainted.add(event.target);
+        tainted = applyCallOutput(tainted, event, propagates);
       }
     }
     return false;

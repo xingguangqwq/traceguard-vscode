@@ -1,6 +1,6 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { analyzeText, buildAuditModel, traceIdentifier } = require("../src/audit-analyzer");
+const { analyzeText, buildAuditModel } = require("../src/audit-analyzer");
 const { buildReviewTargets } = require("../src/review/targets");
 const { languageForPath } = require("../src/language-support");
 
@@ -124,19 +124,6 @@ test("supported file extensions map to the intended analyzers", () => {
   assert.equal(languageForPath("Controller.cs"), "csharp");
   assert.equal(languageForPath("server.go"), "go");
   assert.equal(languageForPath("README.md"), undefined);
-});
-
-test("selected symbol trace orders input, assignment and sensitive use", () => {
-  const source = `
-function run(req) {
-  const command = req.body.command;
-  if (!command) return;
-  exec(command);
-}`;
-  const analysis = analyzeText(source, "javascript", "C:\\src\\run.js", "src/run.js");
-  const trace = traceIdentifier(source, "command", analysis.signals);
-  assert.deepEqual(trace.map(item => item.role), ["input", "condition", "sensitive-use"]);
-  assert.deepEqual(trace.map(item => item.line), [3, 4, 5]);
 });
 
 test("parser output stays free of review priority; the review-target layer adds it", () => {

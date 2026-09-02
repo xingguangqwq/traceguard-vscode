@@ -6,7 +6,7 @@ const { isReachableEvent } = require("./propagation");
 function eventSequences(fn, options = {}) {
   const startLine = Number(options.startLine) || fn.line || 1;
   const annotations = (fn.events || []).filter(event =>
-    event.line <= (fn.line || 1) && (event.type === "control" || event.functionAnnotation));
+    event.functionAnnotation || event.type === "control" && event.line < (fn.line || 1));
   if (!fn.cfg?.edges?.length) return withTruncation([uniqueEvents([
     ...annotations,
     ...(fn.events || []).filter(event => event.line >= startLine && isReachableEvent(event)),
@@ -36,7 +36,7 @@ function eventSequences(fn, options = {}) {
       ...annotations,
       ...blocks.flatMap(blockId => byBlock.get(blockId) || [])
         .filter(event => event.line >= startLine ||
-          (event.line <= (fn.line || 1) && (event.type === "control" || event.functionAnnotation))),
+          event.functionAnnotation || event.type === "control" && event.line < (fn.line || 1)),
     ]);
   });
   return withTruncation(sequences, paths.truncated);

@@ -1,6 +1,7 @@
 "use strict";
 
 const IR_VERSION = 2;
+const MAX_LOCATION_CODE_CHARACTERS = 1_000;
 
 const OperationKind = Object.freeze({
   SOURCE: "source",
@@ -56,6 +57,8 @@ function symbol(name, type = "?", role, metadata = {}) {
     })).filter(binding => binding.name);
   }
   if (metadata.captured) value.captured = true;
+  if (Array.isArray(metadata.annotations)) value.annotations = metadata.annotations.map(String).filter(Boolean);
+  if (metadata.cascadedValidation) value.cascadedValidation = true;
   return value;
 }
 
@@ -65,12 +68,19 @@ function location(input) {
     relativePath: input.relativePath,
     line: Math.max(1, Number(input.line) || 1),
     endLine: Math.max(1, Number(input.endLine || input.line) || 1),
-    code: String(input.code || ""),
+    code: boundedCodeExcerpt(input.code),
   };
   for (const key of ["startColumn", "endColumn", "startOffset", "endOffset"]) {
     if (Number.isFinite(input[key]) && input[key] >= 0) value[key] = Number(input[key]);
   }
   return value;
+}
+
+function boundedCodeExcerpt(code) {
+  const value = String(code || "");
+  if (value.length <= MAX_LOCATION_CODE_CHARACTERS) return value;
+  const half = Math.floor((MAX_LOCATION_CODE_CHARACTERS - 5) / 2);
+  return `${value.slice(0, half)} ... ${value.slice(-half)}`;
 }
 
 function operation(input) {
@@ -163,6 +173,7 @@ function validateFileIR(value) {
 module.exports = {
   Certainty,
   IR_VERSION,
+  MAX_LOCATION_CODE_CHARACTERS,
   OperationKind,
   ParameterRole,
   ValueKind,

@@ -18,6 +18,8 @@ class TraceGuardExtension {
 function activate(context) {
   const extension = new TraceGuardExtension(context);
   context.subscriptions.push(extension);
+  const version = context.extension?.packageJSON?.version || "development";
+  extension.output.info(`TraceGuard ${version} activated from ${context.extensionPath || "development workspace"}.`);
   extension.audit.initialize().catch(error => {
     extension.output.error(`Initial code index failed: ${firstLine(error?.message || error)}`);
   });

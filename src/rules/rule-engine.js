@@ -4,6 +4,7 @@ const { stableHash } = require("../identity");
 const { compareRisk, scoreRisk } = require("../risk/scorer");
 const { RULES } = require("./definitions");
 const { configurationForAbsolutePath } = require("../config/configuration-scope");
+const { guardCapabilityAppliesToSink } = require("../security/semantics");
 
 function evaluateFlowPaths(paths, rules = RULES, options = {}) {
   const findings = [];
@@ -18,8 +19,8 @@ function evaluateFlowPaths(paths, rules = RULES, options = {}) {
     }
     for (const rule of activeRules) {
       if (!rule.sourceKinds.includes(flow.sourceKind) || !rule.sinkKinds.includes(flow.sinkKind)) continue;
-      const observedGuards = flow.guardCapabilities || [];
-      if ((rule.sanitizerCapabilities || []).some(capability => observedGuards.includes(capability))) continue;
+      const observedGuards = effectiveObservedGuards(flow);
+      if (acceptedSanitizers(rule).some(capability => observedGuards.includes(capability))) continue;
       const missingGuards = rule.recommendedGuards.filter(capability => !observedGuards.includes(capability));
       const risk = scoreRisk(rule, flow, missingGuards);
       findings.push({
@@ -33,6 +34,7 @@ function evaluateFlowPaths(paths, rules = RULES, options = {}) {
         confidence: risk.confidence,
         risk,
         sourceKind: flow.sourceKind,
+        sourceExposure: flow.sourceExposure,
         sinkKind: flow.sinkKind,
         observedGuards,
         guardHints: flow.guardHints || [],
@@ -92,7 +94,7 @@ function explainFinding(rule, flow, observedGuards, missingGuards, risk) {
     heuristics.push("The method name matches a security sink, but the receiver type could not be resolved; review is required.");
   }
   return {
-    source: { kind: flow.sourceKind, label: flow.source.label, relativePath: flow.source.relativePath, line: flow.source.line },
+    source: { kind: flow.sourceKind, exposure: flow.sourceExposure, label: flow.source.label, relativePath: flow.source.relativePath, line: flow.source.line },
     propagation,
     sink: { kind: flow.sinkKind, label: flow.sink.label, relativePath: flow.sink.relativePath, line: flow.sink.line },
     observedGuards,
@@ -105,9 +107,27 @@ function explainFinding(rule, flow, observedGuards, missingGuards, risk) {
       sources: rule.sourceKinds,
       propagators: rule.propagators || [],
       sinks: rule.sinkKinds,
-      sanitizers: rule.sanitizerCapabilities || [],
+      sanitizers: acceptedSanitizers(rule),
     },
   };
+}
+
+function acceptedSanitizers(rule) {
+  return rule.acceptsSanitizers || rule.sanitizerCapabilities || [];
+}
+
+function effectiveObservedGuards(flow) {
+  return [...new Set(flow.guardCapabilities || [])].filter(capability =>
+    guardCapabilityAppliesToSink(capability, flow.sinkKind, declaredSinkKinds(flow, capability)));
+}
+
+function declaredSinkKinds(flow, capability) {
+  const values = (flow.steps || []).flatMap(step => {
+    if (!(step.guardCapabilities || []).includes(capability)) return [];
+    const binding = step.guardBinding;
+    return binding?.capabilityScopes?.[capability]?.applicableSinkKinds || binding?.applicableSinkKinds || [];
+  });
+  return values.length ? [...new Set(values)] : undefined;
 }
 
 function callEvidenceStatus(match) {

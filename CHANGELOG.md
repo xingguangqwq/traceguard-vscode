@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.0 - 2026-09-01
+
+- Reworked TraceGuard around four parts of a manual audit: Scope, Review Queue, Trace and Notes.
+- Added a review queue built from entry reachability, unresolved calls and security-sensitive operations. P0, P1, P2 and Backlog remain reading priorities rather than severity levels.
+- Split results into Verified Flow, Review Hypothesis and Dismissed/Resolved so incomplete evidence stays visible without being presented as a confirmed vulnerability.
+- Added Origin, Uses, Caller, Callee, Entry and Reachable Sink queries with clickable paths and clear interruption reasons.
+- Moved editor actions into one `TraceGuard >` menu and added temporary or project-level modeling for custom Sources, Sinks, Sanitizers and Propagators.
+- Improved Java, PHP and Python framework entry binding, project-level call resolution, field-level Access Paths and common backend API semantics.
+- Unified assignment, call-output and control-flow handling between Findings and interactive queries.
+- Made partial indexes, skipped files, truncated paths and unresolved calls visible in Scope, Trace, SARIF and exported sessions.
+- Improved Worker recovery, incremental invalidation, multi-root isolation and bounded analysis for large workspaces.
+- Bundled offline Java, PHP and Python parsing; JavaScript/TypeScript, C# and Go language assets can be installed when needed.
+
 ## 0.9.0 - 2026-08-25
 
 - Full indexing now has its own configurable timeout (`traceguard.indexTimeoutSeconds`, five minutes by default, `0` to disable) while interactive queries retain the 30-second limit. A failed or timed-out Worker is discarded and can be rebuilt by a manual retry.

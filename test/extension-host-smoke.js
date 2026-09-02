@@ -13,6 +13,7 @@ async function run() {
   const api = await extension.activate();
   assert.equal(extension.isActive, true, "TraceGuard activates successfully");
   assert.ok(api?.audit?.session, "TraceGuard creates its audit session");
+  assert.ok(api.audit.codeProvider, "TraceGuard exposes the prioritized Review Queue");
   const initialSummary = api.audit.summaryProvider.getChildren();
   assert.equal(initialSummary[0]?.label, "Review queue not built", "an idle workspace is not presented as permanently indexing");
   assert.equal(initialSummary[0]?.command?.command, "traceguard.startAudit", "the idle summary starts the review queue");
@@ -29,6 +30,12 @@ async function run() {
   const requiredCommands = [
     "traceguard.startAudit",
     "traceguard.traceCrossFileFlow",
+    "traceguard.traceFromEntry",
+    "traceguard.traceFinding",
+    "traceguard.searchEntries",
+    "traceguard.previousTraceStep",
+    "traceguard.nextTraceStep",
+    "traceguard.selectTraceStep",
     "traceguard.traceBackward",
     "traceguard.traceForward",
     "traceguard.findCallers",
@@ -39,7 +46,13 @@ async function run() {
     "traceguard.copyAuditQueryMarkdown",
     "traceguard.exportAnalysisDebugJson",
     "traceguard.searchFindings",
+    "traceguard.filterReviewQueue",
     "traceguard.openProjectConfiguration",
+    "traceguard.markSelectionAsSource",
+    "traceguard.markSelectionAsSink",
+    "traceguard.markSelectionAsTemporarySanitizer",
+    "traceguard.markSelectionAsTemporarySink",
+    "traceguard.clearTemporaryModels",
     "traceguard.exportSarif",
     "traceguard.markFindingReviewed",
     "traceguard.markFindingFalsePositive",
@@ -64,13 +77,26 @@ async function run() {
   const configurationUri = vscode.Uri.file(configurationPath);
   const previousConfiguration = fs.existsSync(configurationPath) ? fs.readFileSync(configurationPath) : undefined;
   try {
-    fs.writeFileSync(smokePath, "export function proxy(req: any) { return fetch(req.query.url); }", "utf8");
+    fs.writeFileSync(smokePath, "export function proxy(req: any) { return fetch(req.query.url); }\napp.get('/proxy', proxy);", "utf8");
     await api.audit.session.reindexFile(smokeUri);
     let snapshot = api.audit.session.snapshot;
     assert.equal(api.audit.session.analysisForUri(smokeUri).frontend.mode, "ast", "AST frontend runs inside Extension Host");
     assert.ok(snapshot.findings.some(finding => finding.ruleId === "potential-ssrf"), "Worker produces an SSRF finding inside Extension Host");
+    const codeTree = flattenTreeProvider(api.audit.codeProvider, api.audit.codeProvider.getChildren());
+    assert.ok(codeTree.some(item => item.label === "Manual review coverage"), "Review Queue separates human progress from analysis coverage");
+    assert.ok(codeTree.some(item => item.kind === "section" && /^P0/.test(item.label)), "Review Queue prioritizes the entry-to-sensitive-operation target as P0");
+    assert.ok(codeTree.some(item => item.kind === "finding" && /request/i.test(item.label)), "Review Queue exposes the live flow in its evidence pool");
+    const attackSurface = flattenTreeProvider(api.audit.summaryProvider, api.audit.summaryProvider.getChildren());
+    assert.ok(attackSurface.some(item => item.kind === "surface-method" && item.method === "GET"), "Attack Surface groups HTTP APIs by method");
+    assert.ok(attackSurface.some(item => item.kind === "attack-entry" && /GET \/proxy/.test(item.label)), "Attack Surface exposes the route as a first-class review entry");
+    let providerRefreshes = 0;
+    const refreshSubscription = api.audit.codeProvider.onDidChangeTreeData(() => { providerRefreshes += 1; });
+    for (let index = 0; index < 8; index += 1) api.audit.codeProvider.refresh();
+    await new Promise(resolve => setTimeout(resolve, 220));
+    refreshSubscription.dispose();
+    assert.equal(providerRefreshes, 1, "Review Queue coalesces bursty session updates into one rebuild notification");
 
-    fs.writeFileSync(smokePath, "export function proxy(req: any) { return exec(req.query.cmd); }", "utf8");
+    fs.writeFileSync(smokePath, "import { exec } from 'node:child_process';\nexport function proxy(req: any) { return exec(req.query.cmd); }\napp.get('/proxy', proxy);", "utf8");
     await api.audit.session.reindexFile(smokeUri);
     snapshot = api.audit.session.snapshot;
     assert.ok(snapshot.findings.some(finding => finding.ruleId === "potential-command-injection"), "incremental Worker update replaces the finding");
@@ -83,8 +109,16 @@ async function run() {
     assert.ok(flattenQuery(query.roots).every(node => node.status && node.reason), "every query step explains its confidence and connection");
     api.audit.queryProvider.setResult(query);
     assert.equal(api.audit.queryProvider.current, query, "audit query tree receives the live query result");
+    const finding = snapshot.findings.find(item => item.ruleId === "potential-command-injection");
+    const tracePath = finding.paths?.[0] || finding.path;
+    api.audit.queryProvider.setTrace(tracePath);
+    assert.equal(api.audit.queryProvider.current, undefined, "interactive finding traces replace the generic query tree");
+    assert.equal(api.audit.queryProvider.getChildren()[0]?.kind, "interactive-trace", "Traces exposes a Source to Sink stepper");
+    const finalStep = api.audit.queryProvider.selectTraceStep(tracePath.steps.length - 1);
+    assert.equal(finalStep.kind, "sink", "interactive traces can move directly to the Sink step");
+    api.audit.queryProvider.setResult(query);
 
-    const debug = api.audit.session.debugAnalysisForUri(smokeUri, query);
+    const debug = await api.audit.session.debugAnalysisForUri(smokeUri, query);
     assert.equal(debug.schema, "traceguard-analysis-debug");
     assert.doesNotThrow(() => JSON.stringify(debug), "analysis debug payload is serializable");
 
@@ -155,6 +189,10 @@ export function customFlow(): void {
 
 function flattenQuery(nodes) {
   return (nodes || []).flatMap(node => [node, ...flattenQuery(node.children || [])]);
+}
+
+function flattenTreeProvider(provider, nodes) {
+  return (nodes || []).flatMap(node => [node, ...flattenTreeProvider(provider, provider.getChildren(node))]);
 }
 
 module.exports = { run };

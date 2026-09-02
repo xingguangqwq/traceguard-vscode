@@ -14,20 +14,31 @@ function functionsFromAnalyses(analyses, options = {}) {
       entriesByFunction.get(entry.functionId).push(entry);
     }
   }
-  const typeRelations = analyses.flatMap(analysis => {
+  // Keep one shared relation table per workspace root. The previous implementation
+  // filtered the full table once per file, which produced O(files * relations)
+  // arrays even though every function in a root sees the same type graph.
+  const typeRelationsByRoot = new Map();
+  for (const analysis of analyses) {
     const workspaceRoot = workspaceRootForAbsolutePath(options, analysis.absolutePath || analysis.ir?.absolutePath);
-    return (analysis.ir?.typeRelations || []).map(relation => ({ ...relation, workspaceRoot }));
-  });
+    const key = workspaceRelationKey(workspaceRoot);
+    if (!typeRelationsByRoot.has(key)) typeRelationsByRoot.set(key, []);
+    const scoped = typeRelationsByRoot.get(key);
+    for (const relation of analysis.ir?.typeRelations || []) scoped.push({ ...relation, workspaceRoot });
+  }
   return analyses.flatMap(analysis => {
     const workspaceRoot = workspaceRootForAbsolutePath(options, analysis.absolutePath || analysis.ir?.absolutePath);
     const projectIdentity = projectIdentityForAbsolutePath(options, analysis.absolutePath || analysis.ir?.absolutePath);
-    const scopedRelations = typeRelations.filter(relation => !workspaceRoot || relation.workspaceRoot === workspaceRoot);
+    const scopedRelations = typeRelationsByRoot.get(workspaceRelationKey(workspaceRoot)) || [];
     return (analysis.ir?.functions || []).map(fn => flowFunctionFromIR(fn, entriesByFunction.get(fn.id), {
       workspaceRoot,
       projectIdentity,
       typeRelations: scopedRelations,
     }));
   });
+}
+
+function workspaceRelationKey(workspaceRoot) {
+  return workspaceRoot ? `root:${workspaceRoot}` : "<unscoped-workspace>";
 }
 
 function flowFunctionFromIR(fn, projectEntries = [], context = {}) {
@@ -50,6 +61,9 @@ function flowFunctionFromIR(fn, projectEntries = [], context = {}) {
       role: value.role,
       parameterIndex: value.parameterIndex ?? index,
       bindings: value.bindings || [],
+      captured: Boolean(value.captured),
+      annotations: value.annotations || [],
+      cascadedValidation: Boolean(value.cascadedValidation),
     })),
     line: fn.location.line,
     endLine: fn.location.endLine,
@@ -76,6 +90,8 @@ function operationFromIR(operation) {
     id: operation.id,
     type: operation.kind === OperationKind.GUARD ? "control" : operation.kind,
     line: operation.location.line,
+    startOffset: operation.location.startOffset,
+    endOffset: operation.location.endOffset,
     code: operation.location.code,
     variables: operation.inputs.length ? operation.inputs.map(value => value.name) :
       operation.kind === OperationKind.SOURCE && operation.output?.name ? [operation.output.name] : [],
@@ -83,13 +99,16 @@ function operationFromIR(operation) {
     label: operation.semantic.label,
     category: operation.semantic.category || operation.metadata.category,
     sourceKind: operation.semantic.sourceKind,
+    sourceExposure: operation.semantic.exposure,
     sinkKind: operation.semantic.sinkKind,
     guardCapabilities: capabilities,
     controlKind: operation.kind === OperationKind.GUARD ? (isAuthorization ? "auth" : "sanitizer") : undefined,
     callee: operation.call?.function,
     targetFunctionId: operation.call?.targetFunctionId,
     closure: Boolean(operation.call?.closure || operation.metadata.closure),
+    asyncBoundary: Boolean(operation.metadata.asyncBoundary),
     receiver: operation.call?.receiver,
+    receiverVariables: (operation.call?.receiverInputs || []).map(value => value.name),
     receiverType: operation.call?.symbol?.receiverType,
     arguments: operation.call?.arguments || [],
     argumentVariables: (operation.call?.argumentInputs || []).map(group => group.map(value => value.name)),

@@ -2,115 +2,41 @@
 
 const { maskNonCodeLines } = require("../source-mask");
 const { parameterDescriptors } = require("../identity");
+const { compileCatalogPatterns } = require("../security/catalog");
+const { SinkKind } = require("../security/semantics");
 
-const JAVASCRIPT_PATTERNS = [
-  ["source", "HTTP request data", /\breq(?:uest)?\.(?:body|query|params|headers|cookies|files)\b|\b(?:searchParams|formData)\.(?:get|getAll)\s*\(/],
-  ["source", "Framework-bound request data", /@(?:Body|Query|Param|Headers|Req|Request|UploadedFile)\s*\(/],
-  ["source", "Process or event input", /\bprocess\.argv\b|\bevent\.(?:data|body|queryStringParameters|pathParameters)\b/],
-  ["sink", "SQL / persistence operation", /\.(?:query|execute|raw|\$queryRaw|\$executeRaw)\s*\(/, "database"],
-  ["sink", "Operating-system command", /\b(?:exec|execSync|spawn|spawnSync|fork)\s*\(|\bchild_process\./, "command"],
-  ["sink", "Dynamic JavaScript execution", /\b(?:eval|Function)\s*\(|setTimeout\s*\(\s*[^,]+\s*,/, "expression"],
-  ["sink", "Filesystem operation", /\bfs(?:\.promises)?\.(?:readFile|writeFile|appendFile|unlink|rename|copyFile|createReadStream|createWriteStream)\s*\(/, "file"],
-  ["sink", "Outbound network request", /\b(?:fetch|axios\.(?:get|post|put|patch|delete)|https?\.(?:get|request))\s*\(/, "network"],
-  ["sink", "Redirect target", /\b(?:res|response)\.redirect\s*\(/, "redirect"],
-  ["sink", "HTML or response output", /\.(?:innerHTML|outerHTML)\s*=|\b(?:res|response)\.(?:send|write|end)\s*\(/, "output"],
+const JAVASCRIPT_AUXILIARY_PATTERNS = [
   ["auth", "Authentication context", /\b(?:req\.user|request\.user|isAuthenticated|passport\.authenticate|verifyToken|jwt\.verify)\b/],
   ["auth", "Authorization decision", /\b(?:authorize|authorization|hasRole|hasPermission|can|ability\.can)\s*\(/],
-  ["sanitizer", "Schema or input validation", /\b(?:validate|sanitize|escape|parse|safeParse)\s*\(|\b(?:joi|zod|yup|validator)\b/i],
-  ["sanitizer", "HTML sanitization", /\b(?:DOMPurify\.sanitize|sanitizeHtml|encodeURIComponent|escapeHtml)\s*\(/],
-  ["sanitizer", "Canonical path check", /\bpath\.(?:normalize|resolve|basename)\s*\(/],
-  ["sanitizer", "Path confinement check", /\b(?:resolved|normalized|candidate|target|file|path)\w*\.startsWith\s*\(|\bpath\.relative\s*\(/i],
   ["sanitizer", "Parameterized SQL", /\.(?:query|execute)\s*\(\s*["'`][\s\S]*?(?:\?|\$\d+)/, undefined, true],
 ];
 
-const SIGNAL_PATTERNS = {
+// Review hints and compound SQL-shape proofs are frontend evidence, not an API
+// registry. All source/sink and callable guard knowledge comes from catalog.
+const AUXILIARY_SYNTAX_PATTERNS = {
   java: [
-    ["source", "HTTP parameter", /(?:getParameter|getHeader|getCookies|getQueryString|getInputStream|getReader|getPathInfo|getRequestURI)\s*\(/],
-    ["source", "Framework-bound request data", /@(?:RequestParam|PathVariable|RequestBody|CookieValue|RequestHeader|ModelAttribute)\b/],
-    ["sink", "SQL / persistence operation", /\.(?:prepareStatement|prepareCall|executeQuery|executeUpdate|execute|createNativeQuery|createQuery)\s*\(/, "database"],
-    ["sink", "Operating-system command", /(?:Runtime\.getRuntime\(\)\.exec|new\s+ProcessBuilder)\s*\(/, "command"],
-    ["sink", "Filesystem operation", /(?:new\s+File|Paths\.get|Path\.of|Files\.(?:read|write|delete|copy|move|newInputStream|newOutputStream))\s*\(/, "file"],
-    ["sink", "Outbound network request", /(?:new\s+(?:URL|URI)|URI\.create|\.getForObject|\.getForEntity|WebClient\.create|HttpRequest\.newBuilder)\s*\(/, "network"],
-    ["sink", "Native deserialization", /\.readObject\s*\(/, "deserialization"],
-    ["sink", "Dynamic expression", /\.parseExpression\s*\(/, "expression"],
-    ["sink", "Redirect target", /\.sendRedirect\s*\(/, "redirect"],
-    ["sink", "Directory lookup", /\.(?:lookup|search)\s*\(/, "directory"],
     ["auth", "Authorization annotation", /@(?:PreAuthorize|PostAuthorize|Secured|RolesAllowed|DenyAll|PermitAll)\b/],
     ["auth", "Security decision", /(?:hasRole|hasAuthority|checkPermission|isAuthenticated|SecurityContextHolder|AccessDecisionManager)\s*\(/],
-    ["sanitizer", "Parameterized statement binding", /\.set(?:String|Int|Long|Object)\s*\(/],
-    ["sanitizer", "Validation constraint", /@(?:Valid|Validated|Pattern|Size|Min|Max|NotNull)\b/],
-    ["sanitizer", "Canonical path check", /(?:normalize|toRealPath|getCanonicalPath)\s*\(/],
-    ["sanitizer", "Output encoding", /(?:Encode\.forHtml|HtmlUtils\.htmlEscape|StringEscapeUtils\.escapeHtml)\s*\(/],
   ],
   php: [
-    ["source", "HTTP request data", /\$_(?:GET|POST|REQUEST|COOKIE|FILES|SERVER)\b/],
-    ["source", "Raw request body", /php:\/\/input/],
-    ["sink", "SQL / persistence operation", /(?:mysqli_query\s*\(|->(?:query|exec)\s*\()/, "database"],
-    ["sink", "Operating-system command", /\b(?:system|exec|shell_exec|passthru|popen|proc_open)\s*\(/, "command"],
-    ["sink", "Dynamic PHP execution", /\b(?:eval|assert)\s*\(/, "expression"],
-    ["sink", "Filesystem operation", /\b(?:include|include_once|require|require_once|file_get_contents|readfile|fopen|unlink|copy|rename|move_uploaded_file)\s*\(?/, "file"],
-    ["sink", "Outbound network request", /(?:curl_init\s*\(\s*(?!\))\S|curl_setopt\s*\([^,]+,\s*CURLOPT_URL\s*,)/, "network"],
-    ["sink", "Object deserialization", /\bunserialize\s*\(/, "deserialization"],
-    ["sink", "HTTP response output", /\b(?:echo|print)\b/, "output"],
-    ["sink", "HTTP response header", /\bheader\s*\(/, "redirect"],
     ["auth", "Authentication check", /(?:Auth::(?:check|user|guard)|auth\(\)->|is_user_logged_in|wp_verify_nonce)\s*\(?/],
     ["auth", "Authorization decision", /(?:Gate::|->middleware\s*\(\s*["']auth|current_user_can|authorize\s*\(|->can\s*\()/],
     ["sanitizer", "Prepared query", /(?:->prepare\s*\(|mysqli_prepare\s*\(|->bindParam|->bindValue)/],
-    ["sanitizer", "Validated input", /(?:filter_input|filter_var|->validate\s*\(|Validator::make)\s*\(/],
-    ["sanitizer", "Output encoding", /\b(?:htmlspecialchars|htmlentities|esc_html|e)\s*\(/],
-    ["sanitizer", "Shell argument escaping", /\b(?:escapeshellarg|escapeshellcmd)\s*\(/],
-    ["sanitizer", "Canonical path check", /\b(?:realpath|basename)\s*\(/],
   ],
-  javascript: JAVASCRIPT_PATTERNS,
-  typescript: JAVASCRIPT_PATTERNS,
+  javascript: JAVASCRIPT_AUXILIARY_PATTERNS,
+  typescript: JAVASCRIPT_AUXILIARY_PATTERNS,
   python: [
-    ["source", "HTTP request data", /\brequest\.(?:args|form|values|json|data|files|cookies|headers|GET|POST|body)\b/],
-    ["source", "Framework-bound request data", /\b(?:Query|Path|Body|Form|Header|Cookie)\s*\(/],
-    ["source", "Process or console input", /\b(?:sys\.argv|os\.environ|getenv\s*\(|input\s*\()/],
-    ["sink", "SQL / persistence operation", /\.(?:execute|executemany|raw)\s*\(/, "database"],
-    ["sink", "Operating-system command", /\b(?:os\.(?:system|popen)|subprocess\.(?:run|Popen|call|check_output|check_call))\s*\(/, "command"],
-    ["sink", "Dynamic Python execution", /\b(?:eval|exec|compile)\s*\(/, "expression"],
-    ["sink", "Filesystem operation", /\b(?:open|Path)\s*\(|\.(?:read_text|write_text|read_bytes|write_bytes|unlink|rename)\s*\(/, "file"],
-    ["sink", "Outbound network request", /\b(?:requests|httpx)\.(?:get|post|put|patch|delete|request)\s*\(|\burllib\.request\.urlopen\s*\(|\b(?:driver|browser|page)\.(?:get|goto|navigate)\s*\(/, "network"],
-    ["sink", "Object deserialization", /\b(?:pickle|dill)\.loads?\s*\(|\byaml\.(?:load|unsafe_load)\s*\(/, "deserialization"],
-    ["sink", "Redirect target", /\bredirect\s*\(/, "redirect"],
     ["auth", "Authentication decorator", /@(?:login_required|permission_required|user_passes_test|requires_auth)\b/],
     ["auth", "Authentication context", /\b(?:current_user|request\.user|is_authenticated|has_perm|check_permission)\b/],
-    ["sanitizer", "Schema or form validation", /\.(?:is_valid|validate|model_validate)\s*\(|\b(?:BaseModel|Serializer|Form)\b/],
     ["sanitizer", "Parameterized SQL", /\.(?:execute|executemany)\s*\(\s*(?:[rub]{0,2})?["'][^"'\r\n]*(?:\?|%s|%\([^)]+\)s|:[A-Za-z_]\w*)[^"'\r\n]*["']\s*,/i, undefined, true],
-    ["sanitizer", "Output sanitization", /\b(?:bleach\.clean|html\.escape|markupsafe\.escape)\s*\(/],
-    ["sanitizer", "Safe filename or canonical path", /\b(?:secure_filename|resolve|normpath|basename)\s*\(/],
   ],
   csharp: [
-    ["source", "HTTP request data", /\bRequest\.(?:Query|Form|Headers|Cookies|Body|Path)\b/],
-    ["source", "Framework-bound request data", /\[(?:FromBody|FromQuery|FromRoute|FromForm|FromHeader)\b/],
-    ["sink", "SQL / persistence operation", /\b(?:SqlCommand|FromSqlRaw|ExecuteSqlRaw)\b|\.(?:ExecuteReader|ExecuteScalar|ExecuteNonQuery)\s*\(/, "database"],
-    ["sink", "Operating-system command", /\b(?:Process\.Start|new\s+ProcessStartInfo)\b/, "command"],
-    ["sink", "Filesystem operation", /\b(?:File|Directory)\.(?:Read|Write|Delete|Move|Copy|Open|Create)|\bPath\.Combine\s*\(/, "file"],
-    ["sink", "Outbound network request", /\bHttpClient\b|\.(?:GetAsync|PostAsync|SendAsync)\s*\(/, "network"],
-    ["sink", "Object deserialization", /\b(?:BinaryFormatter|LosFormatter|NetDataContractSerializer)\b|\.Deserialize\s*\(/, "deserialization"],
-    ["sink", "Redirect target", /\b(?:Redirect|RedirectToAction|Response\.Redirect)\s*\(/, "redirect"],
     ["auth", "Authorization attribute", /\[(?:Authorize|AllowAnonymous)\b/],
     ["auth", "Authorization decision", /\b(?:User\.Identity|User\.IsInRole|AuthorizeAsync|HasClaim|CheckAccess)\b/],
-    ["sanitizer", "Model validation", /\bModelState\.IsValid\b|\[(?:Required|RegularExpression|Range|StringLength)\b/],
-    ["sanitizer", "Output encoding", /\b(?:HtmlEncoder\.Default\.Encode|WebUtility\.HtmlEncode|HttpUtility\.HtmlEncode)\s*\(/],
-    ["sanitizer", "Canonical path check", /\bPath\.GetFullPath\s*\(/],
   ],
   go: [
-    ["source", "HTTP request data", /\br\.(?:FormValue|PostFormValue)\s*\(|\br\.URL\.Query\s*\(|\br\.Header\.Get\s*\(|json\.NewDecoder\s*\(\s*r\.Body/],
-    ["source", "Framework request parameter", /\b(?:c|ctx)\.(?:Param|Query|PostForm|GetHeader|Bind|ShouldBind)\s*\(/],
-    ["source", "Process input", /\bos\.(?:Args|Getenv)\b/],
-    ["sink", "SQL / persistence operation", /\b(?:db|tx)\.(?:Query|QueryRow|Exec|Prepare)(?:Context)?\s*\(/, "database"],
-    ["sink", "Operating-system command", /\bexec\.Command(?:Context)?\s*\(/, "command"],
-    ["sink", "Filesystem operation", /\bos\.(?:Open|OpenFile|ReadFile|WriteFile|Remove|Rename|Create)\s*\(/, "file"],
-    ["sink", "Outbound network request", /\bhttp\.(?:Get|Post|NewRequest)\s*\(|\bclient\.Do\s*\(/, "network"],
-    ["sink", "Template trust bypass", /\btemplate\.(?:HTML|JS|URL)\s*\(/, "output"],
-    ["sink", "Native deserialization", /\b(?:gob|xml)\.NewDecoder\b|\.Decode\s*\(/, "deserialization"],
     ["auth", "Authentication or claims context", /\b(?:jwt|claims|session|authenticated|currentUser)\b/i],
     ["auth", "Authorization decision", /\b(?:authorize|hasRole|hasPermission|CanAccess)\s*\(/],
-    ["sanitizer", "Typed input conversion", /\bstrconv\.(?:Atoi|ParseInt|ParseUint|ParseBool)\s*\(/],
-    ["sanitizer", "Path canonicalization", /\bfilepath\.(?:Clean|Abs|Base)\s*\(/],
-    ["sanitizer", "Output encoding", /\bhtml\.EscapeString\s*\(/],
   ],
 };
 
@@ -119,7 +45,7 @@ const ANNOTATION_LANGUAGES = new Set(["java", "python", "csharp", "typescript", 
 // the dominant handler style in JavaScript and TypeScript projects.
 const INLINE_CALLBACK = /\(\s*(?:"[^"]*"|'[^']*'|`[^`]*`|[^,()]+)\s*,\s*(?:async\s+)?(?:function\s+([A-Za-z_$][\w$]*)|function)?\s*\(([^)]*)\)\s*(?:=>|\{)/;
 
-function parseSourceStructure(lines, language, relativePath) {
+function parseSourceStructure(lines, language, relativePath, options = {}) {
   const commentFreeLines = maskNonCodeLines(lines, language, false);
   const signals = collectSignals(lines, language);
   const functions = findFunctions(lines, language);
@@ -127,11 +53,22 @@ function parseSourceStructure(lines, language, relativePath) {
     fn.signals = signals.filter(signal => signalBelongsToFunction(signal, fn, lines, language));
   }
   const entries = findEntries(commentFreeLines, functions, signals, language, relativePath);
-  return { signals, functions, entries };
+  return {
+    signals,
+    functions,
+    entries,
+    patternDifferential: options.differential ? compareCatalogPatternCoverage(lines, language) : undefined,
+  };
 }
 
-function collectSignals(lines, language) {
-  const patterns = SIGNAL_PATTERNS[language] || [];
+function collectSignals(lines, language, options = {}) {
+  const catalogPatterns = compileCatalogPatterns(language)
+    .map(entry => [entry.kind, entry.label, entry.pattern, entry.category, false, entry]);
+  const patternSource = options.patternSource || "all";
+  const patterns = [
+    ...(patternSource === "legacy" ? [] : catalogPatterns),
+    ...(patternSource === "catalog" ? [] : (AUXILIARY_SYNTAX_PATTERNS[language] || [])),
+  ];
   const signals = [];
   const searchableLines = maskNonCodeLines(lines, language);
   const commentFreeLines = patterns.some(pattern => pattern[4]) ? maskNonCodeLines(lines, language, false) : searchableLines;
@@ -139,9 +76,31 @@ function collectSignals(lines, language) {
     const searchable = searchableLines[index];
     const trimmed = code.trim();
     if (!searchable.trim()) return;
-    for (const [kind, label, pattern, category, includeStrings] of patterns) {
+    for (const [kind, label, pattern, category, includeStrings, catalogEntry] of patterns) {
       pattern.lastIndex = 0;
-      if (pattern.test(includeStrings ? commentFreeLines[index] : searchable)) signals.push({ kind, label, category: category || kind, line: index + 1, code: trimmed });
+      const candidate = includeStrings ? commentFreeLines[index] : searchable;
+      const match = pattern.exec(candidate);
+      if (match &&
+        !(kind === "sink" && matchesFunctionDeclaration(candidate, match.index, language)) &&
+        !isStaticPhpSink(language, kind, label, code, catalogEntry)) {
+        const resolvedCategory = category || kind;
+        const duplicate = signals.find(signal => signal.line === index + 1 && signal.kind === kind && signal.category === resolvedCategory);
+        // Catalog declarations are authoritative when both generations match.
+        // Keep distinct legacy labels only when no catalog model owns the hit.
+        if (duplicate && (catalogEntry || duplicate.catalogModelId)) continue;
+        signals.push({
+          kind,
+          label,
+          category: resolvedCategory,
+          line: index + 1,
+          code: trimmed,
+          ...(catalogEntry ? {
+            catalogModelId: catalogEntry.modelId,
+            confidence: catalogEntry.confidence,
+            semantic: catalogEntry.semantic,
+          } : {}),
+        });
+      }
     }
   });
   const seen = new Set();
@@ -153,50 +112,87 @@ function collectSignals(lines, language) {
   });
 }
 
+function compareCatalogPatternCoverage(lines, language) {
+  const legacy = collectSignals(lines, language, { patternSource: "legacy" });
+  const catalog = collectSignals(lines, language, { patternSource: "catalog" });
+  const legacyKeys = new Set(legacy.map(patternCoverageKey));
+  const catalogKeys = new Set(catalog.map(patternCoverageKey));
+  const summarize = signal => ({
+    kind: signal.kind,
+    category: signal.category,
+    line: signal.line,
+    label: signal.label,
+    modelId: signal.catalogModelId,
+  });
+  const legacyOnly = legacy.filter(signal => !catalogKeys.has(patternCoverageKey(signal)));
+  const catalogOnly = catalog.filter(signal => !legacyKeys.has(patternCoverageKey(signal)));
+  return {
+    legacySignals: legacy.length,
+    catalogSignals: catalog.length,
+    coveredLegacySignals: legacy.length - legacyOnly.length,
+    legacyOnlyCount: legacyOnly.length,
+    catalogOnlyCount: catalogOnly.length,
+    legacyOnly: legacyOnly.slice(0, 20).map(summarize),
+    catalogOnly: catalogOnly.slice(0, 20).map(summarize),
+  };
+}
+
+function patternCoverageKey(signal) {
+  return [signal.kind, signal.category, signal.line].join(":");
+}
+
+function isStaticPhpSink(language, kind, label, code, catalogEntry) {
+  if (language !== "php" || kind !== "sink") return false;
+  const sinkKind = catalogEntry?.semantic?.sinkKind;
+  if (label === "HTTP response output" || sinkKind === SinkKind.RESPONSE_OUTPUT) {
+    const output = String(code).match(/\b(?:echo|print)\b([\s\S]*?)(?:;|\?>|$)/i);
+    return Boolean(output && isStaticPhpExpression(output[1]));
+  }
+  if (label === "Filesystem operation" || sinkKind === SinkKind.FILE_ACCESS) {
+    const include = String(code).match(/\b(?:include|include_once|require|require_once)\b\s*\(?([\s\S]*?)(?:\)?\s*;|\?>|$)/i);
+    return Boolean(include && isStaticPhpExpression(include[1]));
+  }
+  if (label === "HTTP response header" || sinkKind === SinkKind.REDIRECT) {
+    const header = String(code).match(/\bheader\s*\(([\s\S]*?)\)\s*(?:;|\?>|$)/i);
+    return Boolean(header && isStaticPhpExpression(header[1]));
+  }
+  return false;
+}
+
+function isStaticPhpExpression(value) {
+  const input = String(value || "");
+  let masked = "";
+  let quote = "";
+  let escaped = false;
+  let interpolated = false;
+  for (let index = 0; index < input.length; index += 1) {
+    const character = input[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = "";
+      else if (quote === '"' && character === "$" && /[A-Za-z_{]/.test(input[index + 1] || "")) interpolated = true;
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      masked += "0";
+    } else {
+      masked += character;
+    }
+  }
+  if (quote || interpolated) return false;
+  const remainder = masked
+    .replace(/\b(?:true|false|null|__DIR__|__FILE__|DIRECTORY_SEPARATOR)\b/gi, "")
+    .replace(/\b[A-Z_][A-Z0-9_]*\b/g, "")
+    .replace(/[\d\s.(),+\-*/%?:\[\]]/g, "");
+  return remainder.length === 0;
+}
+
 function signalBelongsToFunction(signal, fn, lines, language) {
   if (signal.line >= fn.line && signal.line <= fn.endLine) return true;
   if (!ANNOTATION_LANGUAGES.has(language) || signal.line >= fn.line || signal.line < Math.max(1, fn.line - 8)) return false;
   return /^\s*(?:@|\[)/.test(lines[signal.line - 1] || "");
-}
-
-function traceIdentifier(text, identifier, signals = [], language = "javascript") {
-  if (!/^[A-Za-z_$][\w$]*$/.test(identifier || "")) return [];
-  const lines = String(text).split(/\r?\n/);
-  const searchableLines = maskNonCodeLines(lines, language);
-  const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const pattern = new RegExp(`(?<![\\w$])${escaped}(?![\\w$])`, "g");
-  const trace = [];
-  lines.forEach((code, index) => {
-    const searchable = searchableLines[index];
-    const trimmed = code.trim();
-    if (!searchable.trim()) return;
-    const lineSignals = signals.filter(signal => signal.line === index + 1);
-    let match;
-    while ((match = pattern.exec(searchable))) {
-      if (/(?:\.|->|::)\s*$/.test(searchable.slice(0, match.index))) continue;
-      trace.push({
-        line: index + 1,
-        column: match.index + 1,
-        endColumn: match.index + identifier.length + 1,
-        code: trimmed,
-        role: traceRole(code, identifier, lineSignals),
-        signals: lineSignals.map(signal => ({ kind: signal.kind, label: signal.label, category: signal.category })),
-      });
-    }
-  });
-  return trace;
-}
-
-function traceRole(code, identifier, signals) {
-  if (signals.some(signal => signal.kind === "source")) return "input";
-  if (signals.some(signal => signal.kind === "sink")) return "sensitive-use";
-  if (signals.some(signal => signal.kind === "sanitizer")) return "validation";
-  if (signals.some(signal => signal.kind === "auth")) return "security-decision";
-  const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  if (new RegExp(`(?:const|let|var|final|String|int|long|bool|boolean|:=)?\\s*(?<![\\w$])${escaped}(?![\\w$])\\s*(?::[^=]+)?=`).test(code)) return "assignment";
-  if (/\b(?:if|else if|while|switch|case|match)\b/.test(code)) return "condition";
-  if (new RegExp(`(?:function|def|func|public|private|protected|internal).*\\([^)]*(?<![\\w$])${escaped}(?![\\w$])`).test(code)) return "parameter";
-  return "reference";
 }
 
 function findFunctions(lines, language) {
@@ -235,6 +231,13 @@ function findFunctions(lines, language) {
   return functions;
 }
 
+function matchesFunctionDeclaration(code, matchIndex, language) {
+  const prefix = String(code || "").slice(0, matchIndex);
+  if (language === "python") return /^\s*(?:async\s+)?def\s+$/.test(prefix);
+  if (language === "php") return /^\s*(?:(?:public|protected|private|static|final|abstract)\s+)*function\s+&?\s*$/.test(prefix);
+  return false;
+}
+
 function attachEnclosingScopes(functions, lines, searchableLines, language) {
   const types = findTypeScopes(lines, searchableLines, language);
   for (const fn of functions) {
@@ -251,6 +254,7 @@ function attachEnclosingScopes(functions, lines, searchableLines, language) {
       receiver,
     ].filter(Boolean).join(".") || "<file>";
   }
+
 }
 
 function findTypeScopes(lines, searchableLines, language) {
@@ -466,4 +470,4 @@ function dedupeEntries(entries) {
   });
 }
 
-module.exports = { SIGNAL_PATTERNS, collectSignals, findEntries, findFunctions, parseSourceStructure, traceIdentifier };
+module.exports = { collectSignals, compareCatalogPatternCoverage, findEntries, findFunctions, parseSourceStructure };

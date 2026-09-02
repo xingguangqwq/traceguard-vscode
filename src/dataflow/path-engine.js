@@ -1,20 +1,20 @@
 "use strict";
 
 const { normalizePath, stableHash } = require("../identity");
-const { SourceKind } = require("../security/semantics");
+const { GuardCapability, SourceExposure, SourceKind, sourceExposureForKind } = require("../security/semantics");
 const callResolver = require("./call-resolver");
 const {
   appendAccessPath,
   normalizeAccessPath,
   pathFeeds,
   pathsOverlap,
-  propagatedAssignmentTargets,
   rebaseTaint,
   relativeAccessPath: accessPathSuffix,
-  removeAssignedTaint,
 } = require("../ir/access-path");
 const { functionsFromAnalyses } = require("./ir-adapter");
+const catalog = require("../security/catalog");
 const { assignmentFact, isReachableEvent } = require("./propagation");
+const { applyAssignment } = require("./taint-kernel");
 const { eventSequences } = require("./control-flow");
 
 const SOURCE_TOKEN = "<source>";
@@ -27,22 +27,57 @@ const NON_TAINTED_PARAMETER_ROLES = new Set([
 const TAINTED_PARAMETER_ROLES = new Set(["request", "body", "query", "path", "header"]);
 
 function findSourceSinkPaths(analyses, options = {}) {
+  const startedAt = performance.now();
+  const deadlineClock = typeof options._deadlineClock === "function" ? options._deadlineClock : () => performance.now();
+  const maxAnalysisMs = boundedInteger(options.maxAnalysisMs, 3000, 50, 60000);
+  const deadline = deadlineClock() + maxAnalysisMs;
   const functions = options._flowFunctions || functionsFromAnalyses(analyses, options);
   const index = options._functionIndex || callResolver.buildFunctionIndex(functions);
   const selectedFunctions = selectFunctions(functions, options);
+  const maxDepth = boundedInteger(options.maxDepth, 6, 1, 30);
   const potentialRanks = Array.isArray(options.rootFunctionIds)
     ? new Map()
-    : buildPotentialRanks(functions, index, Math.min(4, Math.max(1, options.maxDepth || 6)));
-  const roots = buildRoots(selectedFunctions, options)
-    .sort((left, right) => (potentialRanks.get(right.fn.id) || 0) - (potentialRanks.get(left.fn.id) || 0));
+    : buildPotentialRanks(functions, index, Math.min(4, maxDepth));
+  const roots = buildRoots(selectedFunctions, options, index)
+    .sort((left, right) => rootReviewRank(right, potentialRanks) - rootReviewRank(left, potentialRanks) ||
+      left.fn.relativePath.localeCompare(right.fn.relativePath) || left.line - right.line);
+  const rankingMs = performance.now() - startedAt;
   const paths = [];
-  const maxDepth = Math.max(1, options.maxDepth || 6);
   const maxPaths = Math.max(1, options.maxPaths || 80);
   const candidateLimit = Math.min(10000, Math.max(2000, maxPaths * 20));
-  const limits = { truncated: false };
+  const limits = {
+    truncated: false,
+    reasons: new Set(),
+    partialRoots: new Map(),
+    currentRoot: undefined,
+    exploredStates: 0,
+    visitedEvents: 0,
+    maxExploredStates: boundedInteger(options.maxFlowStates, Math.max(1000, Math.min(10000, maxPaths * 10)), 100, 50000),
+    maxVisitedEvents: boundedInteger(options.maxFlowEvents, Math.max(100000, Math.min(2000000, maxPaths * 1000)), 10000, 5000000),
+    maxCfgPathsPerFunction: boundedInteger(options.maxCfgPathsPerFunction, 24, 1, 96),
+    maxCallCandidates: boundedInteger(options.maxCallCandidates, 16, 1, 64),
+    maxHigherOrderDepth: boundedInteger(options.maxHigherOrderDepth, 8, 1, 64),
+    maxAsyncDepth: boundedInteger(options.maxAsyncDepth, 8, 1, 64),
+    maxStatesPerRoot: boundedInteger(options.maxFlowStatesPerRoot, 32, 1, 500),
+    maxEventsPerRoot: boundedInteger(options.maxFlowEventsPerRoot, 10000, 100, 100000),
+    maxTraceSteps: boundedInteger(options.maxTraceSteps, 30, 5, 200),
+    maxAnalysisMs,
+    deadline,
+    deadlineClock,
+    currentRootStates: 0,
+    currentRootEvents: 0,
+  };
 
-  for (const root of roots) {
-    if (paths.length >= candidateLimit) { limits.truncated = true; break; }
+  let processedRoots = 0;
+  for (let rootIndex = 0; rootIndex < roots.length; rootIndex += 1) {
+    if (analysisExpired(limits)) break;
+    const root = roots[rootIndex];
+    if (paths.length >= candidateLimit) { truncate(limits, "path-candidate-budget"); break; }
+    if (limits.exploredStates >= limits.maxExploredStates) { truncate(limits, "flow-state-budget"); break; }
+    if (limits.visitedEvents >= limits.maxVisitedEvents) { truncate(limits, "flow-event-budget"); break; }
+    limits.currentRootStates = 0;
+    limits.currentRootEvents = 0;
+    limits.currentRoot = flowRootIdentity(root);
     const rootVariables = root.variables.map(variable => normalizeAccessPath(variable) || variable);
     const visited = new Set([visitKey(root.fn, rootVariables)]);
     walkFlow({
@@ -53,7 +88,10 @@ function findSourceSinkPaths(analyses, options = {}) {
       startOperationId: root.step.operationId,
       steps: [root.step],
       evidence: new Map(rootVariables.map(variable => [variable, [root.step]])),
+      versions: new Map(),
       depth: 0,
+      higherOrderDepth: 0,
+      asyncDepth: 0,
       visited,
       index,
       paths,
@@ -61,7 +99,19 @@ function findSourceSinkPaths(analyses, options = {}) {
       maxPaths: candidateLimit,
       limits,
     });
+    processedRoots = rootIndex + 1;
   }
+
+  // Roots that were never entered are known incomplete traces. Retaining their
+  // identities keeps Scope honest and lets incremental analysis replace only
+  // the affected gaps instead of presenting the candidate count as a path count.
+  if (processedRoots < roots.length && limits.truncated) {
+    for (const root of roots.slice(processedRoots)) {
+      const identity = flowRootIdentity(root);
+      limits.partialRoots.set(identity.key, identity);
+    }
+  }
+  limits.currentRoot = undefined;
 
   const uniquePaths = new Map();
   for (const flowPath of paths) {
@@ -78,17 +128,64 @@ function findSourceSinkPaths(analyses, options = {}) {
     truncated: { value: limits.truncated || sorted.length > maxPaths, enumerable: false },
     explorationTruncated: { value: limits.truncated, enumerable: false },
     totalCandidates: { value: sorted.length, enumerable: false },
+    exploration: {
+      value: {
+        exploredStates: limits.exploredStates,
+        visitedEvents: limits.visitedEvents,
+        maxExploredStates: limits.maxExploredStates,
+        maxVisitedEvents: limits.maxVisitedEvents,
+        maxTraceSteps: limits.maxTraceSteps,
+        maxHigherOrderDepth: limits.maxHigherOrderDepth,
+        maxAsyncDepth: limits.maxAsyncDepth,
+        maxAnalysisMs: limits.maxAnalysisMs,
+        timedOut: limits.reasons.has("analysis-timeout"),
+        totalRoots: roots.length,
+        processedRoots,
+        partialPaths: limits.partialRoots.size,
+        partialRoots: [...limits.partialRoots.values()],
+        rankingMs: roundMetric(rankingMs),
+        explorationMs: roundMetric(performance.now() - startedAt - rankingMs),
+        truncationReasons: [...limits.reasons],
+      },
+      enumerable: false,
+    },
   });
   return result;
 }
 
 function walkFlow(state) {
-  if (state.depth > state.maxDepth) return;
-  if (state.paths.length >= state.maxPaths) { state.limits.truncated = true; return; }
-  const sequences = flowEventSequences(state.fn, state.startLine, state.startOperationId, Math.min(96, state.maxPaths));
-  if (sequences.truncated) state.limits.truncated = true;
+  if (analysisExpired(state.limits)) return;
+  if (state.depth > state.maxDepth) { truncate(state.limits, "call-depth-budget"); return; }
+  if (state.steps.length >= state.limits.maxTraceSteps) { truncate(state.limits, "trace-step-budget"); return; }
+  if (state.paths.length >= state.maxPaths) { truncate(state.limits, "path-candidate-budget"); return; }
+  if (state.limits.currentRootStates >= state.limits.maxStatesPerRoot) {
+    truncate(state.limits, "per-root-state-budget");
+    return;
+  }
+  if (state.limits.exploredStates >= state.limits.maxExploredStates) {
+    truncate(state.limits, "flow-state-budget");
+    return;
+  }
+  state.limits.exploredStates += 1;
+  state.limits.currentRootStates += 1;
+  const sequences = flowEventSequences(
+    state.fn,
+    state.startLine,
+    state.startOperationId,
+    Math.min(state.limits.maxCfgPathsPerFunction, state.maxPaths),
+  );
+  if (sequences.truncated) truncate(state.limits, "cfg-path-budget");
   for (const events of sequences) {
-    if (state.paths.length >= state.maxPaths) { state.limits.truncated = true; return; }
+    if (analysisExpired(state.limits)) return;
+    if (state.paths.length >= state.maxPaths) { truncate(state.limits, "path-candidate-budget"); return; }
+    if (state.limits.visitedEvents >= state.limits.maxVisitedEvents) {
+      truncate(state.limits, "flow-event-budget");
+      return;
+    }
+    if (state.limits.currentRootEvents >= state.limits.maxEventsPerRoot) {
+      truncate(state.limits, "per-root-event-budget");
+      return;
+    }
     walkLinearFlow({ ...state, events });
   }
 }
@@ -96,21 +193,39 @@ function walkFlow(state) {
 function walkLinearFlow(state) {
   const tainted = new Set(state.tainted);
   const evidence = new Map(state.evidence || [...tainted].map(variable => [variable, state.steps.slice()]));
+  const versions = new Map(state.versions || []);
   let activeSteps = state.steps.slice();
   const addedControls = new Set();
   const availableControls = [];
 
   for (const event of state.events) {
+    if (analysisExpired(state.limits)) return;
+    if (activeSteps.length >= state.limits.maxTraceSteps) {
+      truncate(state.limits, "trace-step-budget");
+      return;
+    }
+    if (state.limits.visitedEvents >= state.limits.maxVisitedEvents) {
+      truncate(state.limits, "flow-event-budget");
+      return;
+    }
+    if (state.limits.currentRootEvents >= state.limits.maxEventsPerRoot) {
+      truncate(state.limits, "per-root-event-budget");
+      return;
+    }
+    state.limits.visitedEvents += 1;
+    state.limits.currentRootEvents += 1;
     const functionAnnotationControl = event.line <= state.fn.line && (event.type === "control" || event.functionAnnotation);
-    if (state.paths.length >= state.maxPaths) { state.limits.truncated = true; return; }
+    if (state.paths.length >= state.maxPaths) { truncate(state.limits, "path-candidate-budget"); return; }
     if (event.line < state.startLine && !functionAnnotationControl) continue;
     if (event.type === "assignment") {
       if (sourceDefinesSameValue(state.fn, event) || evidenceDefinesSameValue(evidence, event)) continue;
+      advanceValueVersion(versions, event.target);
+      propagateOutputGuardAssignments(availableControls, event, tainted, versions);
       const propagated = assignmentEvidence(event, tainted, evidence, state.fn);
-      const remaining = removeAssignedTaint(tainted, event.target);
+      const transition = applyAssignment(tainted, event);
       removeAssignedEvidence(evidence, event.target);
       tainted.clear();
-      for (const value of remaining) tainted.add(value);
+      for (const value of transition.tainted) tainted.add(value);
       for (const item of propagated) {
         tainted.add(item.output);
         evidence.set(item.output, item.steps);
@@ -119,9 +234,17 @@ function walkLinearFlow(state) {
     }
     if (event.type === "control") {
       const controlKey = event.id || event.line + ":" + event.controlKind;
-      if (!addedControls.has(controlKey) && (intersects(event.variables, tainted) || !event.variables.length)) {
+      const guardedValues = [...(event.variables || []), event.guardBinding?.output].filter(Boolean);
+      if (!addedControls.has(controlKey) && (intersects(guardedValues, tainted) || !guardedValues.length)) {
+        const guardBinding = event.guardBinding ? {
+          ...event.guardBinding,
+          protectedOutputs: unique([...(event.guardBinding.protectedOutputs || []), event.guardBinding.output]),
+        } : undefined;
         availableControls.push({
-          event,
+          event: guardBinding ? {
+            ...event,
+            guardBinding: { ...guardBinding, valueVersions: captureGuardVersions(guardBinding, versions) },
+          } : event,
           step: makeStep(event.controlKind === "auth" ? "authorization" : "validation", event.label, state.fn, event, {
             guardCapabilities: event.guardCapabilities || [],
             guardDominance: event.guardDominance,
@@ -133,22 +256,28 @@ function walkLinearFlow(state) {
       continue;
     }
     if (event.type === "call") {
+      if (event.target && !guardDefinesSameValue(state.events, event)) advanceValueVersion(versions, event.target);
       const directlyTaintedArguments = [];
       event.argumentVariables.forEach((variables, index) => {
         if ((!event.taintArgumentIndexes || event.taintArgumentIndexes.includes(index)) && intersects(variables, tainted)) {
           directlyTaintedArguments.push(index);
         }
       });
+      const directlyTaintedReceiver = intersects(event.receiverVariables || [], tainted);
+      const boundaries = nextCallBoundaries(event, state, state.limits);
+      if (!boundaries) continue;
       const applicableControlSteps = availableControls
-        .map(control => ({ ...control, relation: controlRelation(control.event, event, state.fn) }))
+        .map(control => ({ ...control, relation: controlRelation(control.event, event, state.fn, versions, { deferSinkKind: true }) }))
         .filter(control => control.relation.status === "effective")
         .map(control => effectiveControlStep(control.step, control.relation));
-      const candidates = callResolver.resolveCandidates(state.index, event, state.fn);
+      const resolvedCandidates = callResolver.resolveCandidates(state.index, event, state.fn);
+      const candidates = resolvedCandidates.slice(0, state.limits.maxCallCandidates);
+      if (resolvedCandidates.length > candidates.length) truncate(state.limits, "call-candidate-budget");
       const candidateFlows = candidates.map(resolution => ({
         resolution,
         incoming: incomingParameterVariables(resolution.fn, event, tainted),
       }));
-      if (!directlyTaintedArguments.length && !candidateFlows.some(flow => flow.incoming.length)) continue;
+      if (!directlyTaintedArguments.length && !directlyTaintedReceiver && !candidateFlows.some(flow => flow.incoming.length)) continue;
       let returnedFlow;
       for (const { resolution, incoming } of candidateFlows) {
         const candidate = resolution.fn;
@@ -162,7 +291,7 @@ function walkLinearFlow(state) {
           state.fn,
           event,
           {
-            candidateCount: candidates.length,
+            candidateCount: resolvedCandidates.length,
             candidateMatch: resolution.quality,
             candidateReason: resolution.reason,
             calleePath: candidate.relativePath,
@@ -184,11 +313,23 @@ function walkLinearFlow(state) {
           startLine: candidate.line,
           startOperationId: undefined,
           steps: nextSteps,
+          versions: new Map(),
           depth: state.depth + 1,
+          higherOrderDepth: boundaries.higherOrderDepth,
+          asyncDepth: boundaries.asyncDepth,
           visited,
         });
         if (!returnedFlow && event.target) {
-          const returned = findTaintedReturn(candidate, incoming, state.index, new Set(state.visited), state.depth + 1, state.maxDepth);
+          const returned = findTaintedReturn(
+            candidate,
+            incoming,
+            state.index,
+            new Set(state.visited),
+            state.depth + 1,
+            state.maxDepth,
+            state.limits,
+            boundaries,
+          );
           if (returned) returnedFlow = { candidate, event: returned, callStep, applicableControlSteps };
         }
       }
@@ -201,14 +342,22 @@ function walkLinearFlow(state) {
           makeStep("return", `${returnedFlow.candidate.name}() → ${event.target}`, returnedFlow.candidate, returnedFlow.event),
         ];
         evidence.set(event.target, activeSteps);
-      } else if (event.target && !candidates.length && directlyTaintedArguments.length) {
+      } else if (event.target && !candidates.length && (directlyTaintedArguments.length || directlyTaintedReceiver)) {
+        const externalEvidence = modeledExternalCallEvidence(event);
         tainted.add(event.target);
         activeSteps = [...activeSteps, makeStep(
           "call",
-          `${state.fn.name}() → unresolved ${event.callee}()`,
+          externalEvidence.verified
+            ? `${state.fn.name}() → modeled ${event.callee}()`
+            : `${state.fn.name}() → unresolved ${event.callee}()`,
           state.fn,
           event,
-          { candidateCount: 0, candidateMatch: "opaque", candidateReason: "unresolved external or dynamic call" },
+          {
+            candidateCount: 0,
+            candidateMatch: externalEvidence.candidateMatch,
+            candidateReason: externalEvidence.reason,
+            analysisStatus: externalEvidence.analysisStatus,
+          },
         )];
         evidence.set(event.target, activeSteps);
       }
@@ -225,19 +374,38 @@ function walkLinearFlow(state) {
       });
       const evaluatedControls = availableControls.map(control => ({
         ...control,
-        relation: controlRelation(control.event, event, state.fn),
+        relation: controlRelation(control.event, event, state.fn, versions),
       }));
       const applicableControlSteps = evaluatedControls.filter(control => control.relation.status === "effective")
         .map(control => effectiveControlStep(control.step, control.relation));
-      const guardHints = evaluatedControls.flatMap(control => (control.relation.hints || []).map(hint => ({
-        label: control.step.label,
-        line: control.step.line,
-        relativePath: control.step.relativePath,
-        capabilities: [hint.capability],
-        reason: hint.reason,
-      })));
+      // Hint-level controls keep the trace honest: they show a validation or
+      // authorization call was nearby, but carry no suppressible capability.
+      const hintControlSteps = evaluatedControls.filter(control => control.relation.status === "hint")
+        .map(control => effectiveControlStep(control.step, control.relation));
       const sinkEvidence = bestEvidenceForValues(event.variables, evidence) || activeSteps;
-      const steps = [...sinkEvidence, ...applicableControlSteps, sinkStep];
+      const declarativeValidationSteps = declarativeValidationEvidence(sinkEvidence, [sinkStep]);
+      const guardHints = [
+        ...declarativeValidationSteps.map(step => step.guardHint),
+        ...evaluatedControls.flatMap(control => (control.relation.hints || []).map(hint => ({
+          label: control.step.label,
+          line: control.step.line,
+          relativePath: control.step.relativePath,
+          capabilities: [hint.capability],
+          reason: hint.reason,
+        }))),
+      ].filter(Boolean);
+      const steps = [
+        ...sinkEvidence.slice(0, 1),
+        ...declarativeValidationSteps,
+        ...sinkEvidence.slice(1),
+        ...applicableControlSteps,
+        ...hintControlSteps,
+        sinkStep,
+      ];
+      if (steps.length > state.limits.maxTraceSteps) {
+        truncate(state.limits, "trace-step-budget");
+        continue;
+      }
       const files = unique(steps.map(step => step.relativePath));
       const validationCount = steps.filter(step => step.kind === "validation").length;
       const authorizationCount = steps.filter(step => step.kind === "authorization").length;
@@ -249,7 +417,7 @@ function walkLinearFlow(state) {
         "unverified", "symbol-unverified", "regex-unverified", "ast-validated-symbol-unverified",
       ].includes(sinkStep.candidateStatus);
       const semanticMedium = sinkStep.certainty === "medium" || sinkStep.semanticVerification === "syntax";
-      const confidence = semanticReview || callMatches.includes("review") || propagationStatuses.some(status => ["heuristic", "unresolved"].includes(status)) ? "review" :
+      const confidence = semanticReview || callMatches.some(match => ["review", "opaque"].includes(match)) || propagationStatuses.some(status => ["heuristic", "unresolved"].includes(status)) ? "review" :
         semanticMedium || sourceConfidence !== "high" || !callMatches.every(match => match === "high") || propagationStatuses.includes("syntax-only") ? "medium" : "high";
       state.paths.push({
         id: `path_${stableHash(steps.map(step => [step.workspaceRoot, step.kind, step.operationId || step.label, step.functionId].join(":")).join("|"))}`,
@@ -262,6 +430,7 @@ function walkLinearFlow(state) {
         calls: steps.filter(step => step.kind === "call").length,
         category: event.category || "sensitive operation",
         sourceKind: steps[0].sourceKind || SourceKind.EXTERNAL_INPUT,
+        sourceExposure: steps[0].sourceExposure || sourceExposureForKind(steps[0].sourceKind || SourceKind.EXTERNAL_INPUT),
         sinkKind: event.sinkKind,
         guardCapabilities,
         guardHints,
@@ -271,6 +440,27 @@ function walkLinearFlow(state) {
       });
     }
   }
+}
+
+function modeledExternalCallEvidence(event) {
+  if (event.semanticModelId && event.semanticVerification === "verified") return {
+    verified: true,
+    candidateMatch: "high",
+    analysisStatus: "verified",
+    reason: `verified external semantic model ${event.semanticModelId}`,
+  };
+  if (event.semanticModelId && ["syntax", "structural"].includes(event.semanticVerification)) return {
+    verified: false,
+    candidateMatch: "medium",
+    analysisStatus: "syntax-only",
+    reason: `${event.semanticVerification} external semantic model ${event.semanticModelId}`,
+  };
+  return {
+    verified: false,
+    candidateMatch: "opaque",
+    analysisStatus: "unresolved",
+    reason: "unresolved external or dynamic call",
+  };
 }
 
 function flowEventSequences(fn, startLine, startOperationId, maxPaths = 64) {
@@ -313,54 +503,83 @@ function sinkReviewRank(value) {
   }[category] || 1;
 }
 
-function findTaintedReturn(fn, incoming, index, visited, depth, maxDepth) {
-  if (depth > maxDepth) return undefined;
+function rootReviewRank(root, potentialRanks) {
+  const sourceKind = root.step?.sourceKind;
+  const sourceExposure = root.step?.sourceExposure || sourceExposureForKind(sourceKind);
+  const entryRank = root.fn.isEntry || root.step?.parameterRoles ? 1000 : 0;
+  const sourceRank = sourceExposure === SourceExposure.REMOTE ? 500 : sourceKind === SourceKind.SELECTED_SYMBOL ? 400 : sourceExposure === SourceExposure.LOCAL ? 50 : 100;
+  const sourceConfidence = { high: 30, medium: 20, review: 10 }[root.step?.confidence] || 0;
+  return entryRank + sourceRank + sourceConfidence + (potentialRanks.get(root.fn.id) || 0) * 20;
+}
+
+function findTaintedReturn(fn, incoming, index, visited, depth, maxDepth, limits, boundaries = { higherOrderDepth: 0, asyncDepth: 0 }) {
+  if (analysisExpired(limits)) return undefined;
+  if (depth > maxDepth) { truncate(limits, "call-depth-budget"); return undefined; }
+  if (limits.currentRootStates >= limits.maxStatesPerRoot) {
+    truncate(limits, "per-root-state-budget");
+    return undefined;
+  }
+  if (limits.exploredStates >= limits.maxExploredStates) {
+    truncate(limits, "flow-state-budget");
+    return undefined;
+  }
+  limits.exploredStates += 1;
+  limits.currentRootStates += 1;
   const key = visitKey(fn, incoming);
   if (visited.has(key)) return undefined;
   visited.add(key);
-  const sequences = flowEventSequences(fn, fn.line, undefined, 64);
+  const sequences = flowEventSequences(fn, fn.line, undefined, limits.maxCfgPathsPerFunction);
+  if (sequences.truncated) truncate(limits, "cfg-path-budget");
   for (const events of sequences) {
-    const returned = findTaintedReturnOnPath(fn, events, incoming, index, visited, depth, maxDepth);
+    if (analysisExpired(limits)) return undefined;
+    const returned = findTaintedReturnOnPath(fn, events, incoming, index, visited, depth, maxDepth, limits, boundaries);
     if (returned) return returned;
   }
   return undefined;
 }
 
-function findTaintedReturnOnPath(fn, events, incoming, index, visited, depth, maxDepth) {
+function findTaintedReturnOnPath(fn, events, incoming, index, visited, depth, maxDepth, limits, boundaries) {
   const tainted = new Set(incoming);
   for (const event of events) {
+    if (analysisExpired(limits)) return undefined;
+    if (limits.visitedEvents >= limits.maxVisitedEvents) {
+      truncate(limits, "flow-event-budget");
+      return undefined;
+    }
+    limits.visitedEvents += 1;
+    limits.currentRootEvents += 1;
+    if (limits.currentRootEvents > limits.maxEventsPerRoot) {
+      truncate(limits, "per-root-event-budget");
+      return undefined;
+    }
     if (event.type === "assignment") {
       if (sourceDefinesSameValue(fn, event) || precedingCallDefinesSameValue(fn, event, tainted)) continue;
-      const propagated = propagatedAssignmentTargets(
-        event.target,
-        event.variables,
-        tainted,
-        event.assignmentMode || "expression",
-      );
-      const remaining = sourceDefinesSameValue(fn, event)
-        ? new Set(tainted)
-        : removeAssignedTaint(tainted, event.target);
+      const transition = applyAssignment(tainted, event, { preserveTarget: sourceDefinesSameValue(fn, event) });
       tainted.clear();
-      for (const value of remaining) tainted.add(value);
-      for (const value of propagated) tainted.add(value);
+      for (const value of transition.tainted) tainted.add(value);
       continue;
     }
     if (event.type === "call" && event.target) {
+      const nextBoundaries = nextCallBoundaries(event, boundaries, limits);
+      if (!nextBoundaries) continue;
       const directlyTaintedArguments = [];
       event.argumentVariables.forEach((variables, argumentIndex) => {
         if ((!event.taintArgumentIndexes || event.taintArgumentIndexes.includes(argumentIndex)) && intersects(variables, tainted)) {
           directlyTaintedArguments.push(argumentIndex);
         }
       });
-      const candidates = callResolver.resolveCandidates(index, event, fn);
+      const directlyTaintedReceiver = intersects(event.receiverVariables || [], tainted);
+      const resolvedCandidates = callResolver.resolveCandidates(index, event, fn);
+      const candidates = resolvedCandidates.slice(0, limits.maxCallCandidates);
+      if (resolvedCandidates.length > candidates.length) truncate(limits, "call-candidate-budget");
       if (!candidates.length) {
-        if (directlyTaintedArguments.length) tainted.add(event.target);
+        if (directlyTaintedArguments.length || directlyTaintedReceiver) tainted.add(event.target);
         continue;
       }
       for (const resolution of candidates) {
         const candidate = resolution.fn;
         const nextIncoming = incomingParameterVariables(candidate, event, tainted);
-        if (nextIncoming.length && findTaintedReturn(candidate, nextIncoming, index, new Set(visited), depth + 1, maxDepth)) {
+        if (nextIncoming.length && findTaintedReturn(candidate, nextIncoming, index, new Set(visited), depth + 1, maxDepth, limits, nextBoundaries)) {
           tainted.add(event.target);
           break;
         }
@@ -372,8 +591,58 @@ function findTaintedReturnOnPath(fn, events, incoming, index, visited, depth, ma
   return undefined;
 }
 
-function buildRoots(functions, options) {
+function nextCallBoundaries(event, state, limits) {
+  const higherOrderDepth = Number(state.higherOrderDepth || 0) + Number(Boolean(event.closure));
+  const asyncDepth = Number(state.asyncDepth || 0) + Number(isAsyncBoundary(event));
+  if (higherOrderDepth > limits.maxHigherOrderDepth) {
+    truncate(limits, "higher-order-depth-budget");
+    return undefined;
+  }
+  if (asyncDepth > limits.maxAsyncDepth) {
+    truncate(limits, "async-depth-budget");
+    return undefined;
+  }
+  return { higherOrderDepth, asyncDepth };
+}
+
+function isAsyncBoundary(event) {
+  const name = String(event.callee || "").replace(/[^A-Za-z0-9]/g, "").toLowerCase();
+  const asyncCalls = ["then", "catch", "finally", "settimeout", "setinterval", "queuemicrotask", "runasync", "supplyasync", "launch", "async", "go"];
+  return Boolean(event.asyncBoundary || asyncCalls.includes(name) || asyncCalls.some(call => name.startsWith(`${call}callback`)));
+}
+
+function truncate(limits, reason) {
+  limits.truncated = true;
+  if (reason) limits.reasons.add(reason);
+  if (limits.currentRoot) limits.partialRoots?.set(limits.currentRoot.key, limits.currentRoot);
+}
+
+function flowRootIdentity(root) {
+  const functionId = root.fn.id;
+  const operationId = root.step.operationId || `${root.line}:${root.variables.join(",")}`;
+  return { key: `${functionId}:${operationId}`, functionId };
+}
+
+function analysisExpired(limits) {
+  if (!limits?.deadline || (limits.deadlineClock || performance.now)() < limits.deadline) return false;
+  truncate(limits, "analysis-timeout");
+  return true;
+}
+
+function boundedInteger(value, fallback, minimum, maximum) {
+  const parsed = Number(value);
+  const selected = Number.isFinite(parsed) ? Math.floor(parsed) : fallback;
+  return Math.min(maximum, Math.max(minimum, selected));
+}
+
+function roundMetric(value) {
+  return Math.round(Math.max(0, Number(value) || 0) * 100) / 100;
+}
+
+function buildRoots(functions, options, functionIndex) {
   const roots = [];
+  const strutsProperties = javaStrutsBoundProperties(functions);
+  const transferredRequestParams = collectTransferredRequestParams(functions, functionIndex, options);
   const selectedIdentifier = /^[$A-Za-z_][\w$]*$/.test(options.identifier || "") ? options.identifier : "";
   if (selectedIdentifier) {
     for (const fn of functions) {
@@ -384,7 +653,8 @@ function buildRoots(functions, options) {
         step: makeStep("source", "Selected variable " + selectedIdentifier, fn, {
           line: options.line || fn.line,
           code: options.code || selectedIdentifier,
-        }, { sourceKind: SourceKind.SELECTED_SYMBOL }),
+          variables: [selectedIdentifier],
+        }, { sourceKind: SourceKind.SELECTED_SYMBOL, sourceExposure: SourceExposure.REVIEWER }),
       });
     }
     return dedupeRoots(roots);
@@ -398,7 +668,10 @@ function buildRoots(functions, options) {
         fn,
         line: event.line,
         variables: inputVariables,
-        step: makeStep("source", event.label || "External input", fn, event, { sourceKind: event.sourceKind }),
+        step: makeStep("source", event.label || "External input", fn, event, {
+          sourceKind: event.sourceKind,
+          sourceExposure: event.sourceExposure || sourceExposureForKind(event.sourceKind),
+        }),
       });
     }
     for (const entry of fn.entryPoints || (fn.isEntry ? [{ title: fn.entryTitle }] : [])) {
@@ -427,16 +700,224 @@ function buildRoots(functions, options) {
           step: makeStep("source", entry.title ? "Entry parameters · " + entry.title : "Entry parameters", fn, {
             line: fn.line,
             code: variables.join(", "),
+            variables,
           }, {
             sourceKind: SourceKind.HTTP_INPUT,
+            sourceExposure: SourceExposure.REMOTE,
             confidence,
             parameterRoles: roles,
+            validationFacts: entryValidationFacts(fn, variables),
+          }),
+        });
+      }
+    }
+    const boundProperties = strutsProperties.get(fn) || [];
+    const usedProperties = boundProperties.filter(property => functionUsesAccessPath(fn, property));
+    if (usedProperties.length) {
+      roots.push({
+        fn,
+        line: fn.line,
+        variables: usedProperties,
+        step: makeStep("source", `Struts-bound action properties · ${fn.enclosingScope} (route unresolved)`, fn, {
+          line: fn.line,
+          code: usedProperties.join(", "),
+          variables: usedProperties,
+        }, {
+          sourceKind: SourceKind.HTTP_INPUT,
+          sourceExposure: SourceExposure.REMOTE,
+          confidence: "medium",
+          analysisStatus: "syntax-only",
+          framework: "struts2-convention",
+          parameterRoles: usedProperties.map(() => "body"),
+        }),
+      });
+    }
+    const transferredIndexes = transferredRequestParams.get(fn.id);
+    if (transferredIndexes?.size) {
+      const variables = [...transferredIndexes].map(index => fn.parameters[index]).filter(Boolean);
+      if (variables.length) {
+        roots.push({
+          fn,
+          line: fn.line,
+          variables,
+          step: makeStep("source", "Inferred request parameter · transferred from a call-site argument", fn, {
+            line: fn.line,
+            code: variables.join(", "),
+            variables,
+          }, {
+            sourceKind: SourceKind.HTTP_INPUT,
+            sourceExposure: SourceExposure.REMOTE,
+            confidence: "medium",
+            analysisStatus: "heuristic",
           }),
         });
       }
     }
   }
   return dedupeRoots(roots);
+}
+
+function requestRootName(variable) {
+  return String(variable || "").split(/[.[]/)[0].replace(/^\$/, "");
+}
+
+function collectRequestRootNames(functions) {
+  const names = new Set(catalog.CONVENTIONAL_REQUEST_ROOTS);
+  for (const fn of functions) {
+    for (const event of fn.events.filter(event => event.type === "source" && event.variables.length)) {
+      for (const variable of event.variables) {
+        const root = requestRootName(variable);
+        if (root) names.add(root);
+      }
+    }
+  }
+  return names;
+}
+
+// Functions that receive a request-shaped value (an argument whose root is an
+// observed request source root) become heuristic HTTP-input roots themselves
+// when the function also reads properties of that parameter, so helper
+// extraction patterns surface as review candidates instead of being silently
+// dropped by exact access-path matching.
+const transferredRequestCache = new WeakMap();
+function collectTransferredRequestParams(functions, functionIndex, options) {
+  if (!functionIndex || options.rootFunctionIds) return new Map();
+  const cached = transferredRequestCache.get(functions);
+  if (cached) return cached;
+  const globalRoots = collectRequestRootNames(functions);
+  const transferred = new Map();
+  if (globalRoots.size) {
+    const edges = [];
+    for (const fn of functions) {
+      for (const event of fn.events.filter(event => event.type === "call" && event.callee)) {
+        const argumentGroups = event.argumentVariables || [];
+        if (!argumentGroups.some(group => (group || []).some(variable => globalRoots.has(requestRootName(variable))))) continue;
+        edges.push({ fn, argumentGroups, resolutions: [...callResolver.resolveCandidates(functionIndex, event, fn)] });
+      }
+    }
+    let changed = true;
+    for (let round = 0; changed && round < 8; round += 1) {
+      changed = false;
+      for (const edge of edges) {
+        const requestNames = new Set(globalRoots);
+        const own = transferred.get(edge.fn.id);
+        if (own) for (const index of own.keys()) requestNames.add(requestRootName(edge.fn.parameters[index]));
+        for (const resolution of edge.resolutions) {
+          edge.argumentGroups.forEach((group, argumentIndex) => {
+            if (!(group || []).some(variable => requestNames.has(requestRootName(variable)))) return;
+            const callee = resolution.fn;
+            if (argumentIndex >= (callee.parameters || []).length) return;
+            if (!transferred.has(callee.id)) transferred.set(callee.id, new Map());
+            const indexes = transferred.get(callee.id);
+            if (!indexes.has(argumentIndex)) {
+              indexes.set(argumentIndex, true);
+              changed = true;
+            }
+          });
+        }
+      }
+    }
+    // Seeding a whole-object root for every receiver of a request-shaped value
+    // would flood exploration; keep only callees that actually dereference the
+    // parameter (read `<param>.member`), where helper extraction matters.
+    for (const [calleeId, indexes] of [...transferred]) {
+      const callee = functions.find(fn => fn.id === calleeId);
+      if (!callee) { transferred.delete(calleeId); continue; }
+      for (const [index] of [...indexes]) {
+        const parameter = callee.parameters[index];
+        if (!parameter || functionReadsParameterProperties(callee, parameter)) continue;
+        indexes.delete(index);
+      }
+      if (!indexes.size) transferred.delete(calleeId);
+    }
+  }
+  transferredRequestCache.set(functions, transferred);
+  return transferred;
+}
+
+function functionReadsParameterProperties(fn, parameter) {
+  const prefix = `${parameter}.`;
+  const indexPrefix = `${parameter}[`;
+  return fn.events.some(event => [...(event.variables || []), ...(event.argumentVariables || []).flat()]
+    .some(variable => {
+      const path = normalizeAccessPath(variable) || String(variable);
+      return path.startsWith(prefix) || path.startsWith(indexPrefix);
+    }));
+}
+
+function javaStrutsBoundProperties(functions) {
+  const javaFunctions = functions.filter(fn => fn.language === "java" && fn.qualifiedEnclosingScope);
+  const groups = new Map();
+  for (const fn of javaFunctions) {
+    const key = fn.typeRelations || javaFunctions;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(fn);
+  }
+  const result = new Map();
+  for (const scopedFunctions of groups.values()) {
+    const relations = scopedFunctions[0]?.typeRelations || [];
+    const parents = new Map(relations.filter(relation => relation.language === "java")
+      .map(relation => [relation.type, relation.extends || []]));
+    const functionsByType = new Map();
+    for (const fn of scopedFunctions) {
+      if (!functionsByType.has(fn.qualifiedEnclosingScope)) functionsByType.set(fn.qualifiedEnclosingScope, []);
+      functionsByType.get(fn.qualifiedEnclosingScope).push(fn);
+    }
+    for (const type of functionsByType.keys()) {
+      if (!javaTypeExtends(type, parents, candidate => [
+        "com.opensymphony.xwork2.Action",
+        "com.opensymphony.xwork2.ActionSupport",
+        "org.apache.struts.action.Action",
+      ].includes(candidate))) continue;
+      const properties = new Set();
+      for (const candidateType of javaTypeAncestors(type, parents)) {
+        for (const setter of functionsByType.get(candidateType) || []) {
+          const match = /^set([A-Z][A-Za-z0-9_$]*)$/.exec(setter.name || "");
+          const parameter = setter.parameterDetails?.[0];
+          if (!match || setter.parameterDetails?.length !== 1 || !strutsBindableParameter(parameter)) continue;
+          properties.add(javaBeanPropertyName(match[1]));
+        }
+      }
+      if (properties.size) {
+        for (const fn of functionsByType.get(type) || []) result.set(fn, [...properties]);
+      }
+    }
+  }
+  return result;
+}
+
+function javaTypeExtends(type, parents, predicate) {
+  return javaTypeAncestors(type, parents).some(predicate);
+}
+
+function javaTypeAncestors(type, parents) {
+  const pending = [type];
+  const visited = new Set();
+  while (pending.length) {
+    const current = pending.shift();
+    if (!current || visited.has(current)) continue;
+    visited.add(current);
+    pending.push(...(parents.get(current) || []));
+  }
+  return [...visited];
+}
+
+function strutsBindableParameter(parameter) {
+  const type = String(parameter?.type || "").replace(/<.*>/g, "").replace(/\[\]$/g, "");
+  if (!type || type === "?") return false;
+  return !/(?:^|\.)(?:HttpServletRequest|ServletRequest|HttpServletResponse|ServletResponse|ActionContext|ServletContext|Session|Map|Logger|EntityManager|DataSource|ApplicationContext|[A-Za-z0-9_$]*(?:Service|Repository|Dao|Client))$/.test(type);
+}
+
+function functionUsesAccessPath(fn, accessPath) {
+  return (fn.events || []).some(event => [
+    ...(event.variables || []),
+    ...(event.receiverVariables || []),
+    ...(event.argumentVariables || []).flat(),
+  ].some(value => pathsOverlap(value, accessPath)));
+}
+
+function javaBeanPropertyName(value) {
+  return /^[A-Z]{2}/.test(value) ? value : value.charAt(0).toLowerCase() + value.slice(1);
 }
 
 function selectFunctions(functions, options) {
@@ -459,6 +940,14 @@ function confidenceRank(value) {
 }
 
 function makeStep(kind, label, fn, event, extra = {}) {
+  const accessPaths = unique([
+    ...(event.variables || []),
+    event.target,
+    event.receiver,
+    ...(event.argumentVariables || []).flat(),
+    extra.inputAccessPath,
+    extra.outputAccessPath,
+  ].map(value => normalizeAccessPath(value) || value));
   return {
     kind,
     label,
@@ -471,8 +960,186 @@ function makeStep(kind, label, fn, event, extra = {}) {
     relativePath: fn.relativePath,
     line: event.line || fn.line,
     code: event.code || "",
+    accessPaths,
     ...extra,
   };
+}
+
+function entryValidationFacts(fn, variables) {
+  if (fn.language !== "java") return [];
+  const facts = [];
+  for (const detail of fn.parameterDetails || []) {
+    if (!detail.cascadedValidation || !variables.some(variable => pathsOverlap(variable, detail.name))) continue;
+    const relation = javaTypeRelation(fn, detail.type);
+    for (const constraint of relation?.validationConstraints || []) {
+      facts.push({
+        ...constraint,
+        parameter: detail.name,
+        parameterType: relation.type,
+        enforcement: javaBeanValidationEnforcement(fn, detail, constraint),
+        accessPaths: unique([
+          `${detail.name}.${constraint.property}`,
+          `${detail.name}.${constraint.accessor}`,
+        ]),
+      });
+    }
+  }
+  return facts;
+}
+
+function javaTypeRelation(fn, declaredType) {
+  const type = String(declaredType || "")
+    .replace(/<.*>/g, "")
+    .replace(/\[\]/g, "")
+    .trim();
+  if (!type || type === "?") return undefined;
+  const relations = (fn.typeRelations || []).filter(relation => relation.language === "java");
+  if (type.includes(".")) return relations.find(relation => relation.type === type);
+  const imported = (fn.references || []).find(reference => reference.kind === "import" &&
+    reference.local !== "*" && reference.local === type)?.target;
+  if (imported) return relations.find(relation => relation.type === imported);
+  const localType = fn.packageName ? `${fn.packageName}.${type}` : type;
+  const local = relations.find(relation => relation.type === localType);
+  if (local) return local;
+  const simpleMatches = relations.filter(relation => relation.type === type || relation.type.endsWith(`.${type}`));
+  return simpleMatches.length === 1 ? simpleMatches[0] : undefined;
+}
+
+function javaBeanValidationEnforcement(fn, validatedParameter, constraint) {
+  if (!(fn.entryPoints || []).some(entry => entry.framework === "spring")) return undefined;
+  if (!constraint.defaultValidationGroup || !validatedParameter.annotations?.includes("Valid")) return undefined;
+  const validTarget = javaImportedType(fn, "Valid");
+  if (!/^(?:jakarta|javax)\.validation\.Valid$/.test(validTarget || "")) return undefined;
+  const parameterIndex = (fn.parameterDetails || []).indexOf(validatedParameter);
+  const bindingResult = fn.parameterDetails?.[parameterIndex + 1];
+  if (!bindingResult || !/(?:^|\.)(?:BindingResult|Errors)$/.test(String(bindingResult.type || ""))) return undefined;
+  const bindingTarget = bindingResult.type.includes(".") ? bindingResult.type : javaImportedType(fn, bindingResult.type);
+  if (!/^org\.springframework\.validation\.(?:BindingResult|Errors)$/.test(bindingTarget || "")) return undefined;
+  const cfg = fn.cfg;
+  if (!cfg?.edges?.length || !cfg.dominators) return undefined;
+  const checks = (fn.events || []).filter(event => event.type === "call" && event.callee === "hasErrors" &&
+    (event.receiverVariables || []).some(receiver => pathsOverlap(receiver, bindingResult.name)) &&
+    positiveBindingResultCheck(event.code, bindingResult.name));
+  for (const check of checks) {
+    const trueEdge = cfg.edges.find(edge => edge.from === check.blockId && edge.kind === "true");
+    const falseEdge = cfg.edges.find(edge => edge.from === check.blockId && edge.kind === "false");
+    if (!trueEdge || !falseEdge) continue;
+    const rejected = cfgReachableBlocks(cfg, trueEdge.to);
+    const accepted = cfgReachableBlocks(cfg, falseEdge.to);
+    const acceptedOnly = new Set([...accepted].filter(block => !rejected.has(block) &&
+      (cfg.dominators[block] || []).includes(check.blockId)));
+    const mutationBlocks = new Set((fn.events || [])
+      .filter(event => event.id !== check.id && eventCouldMutateValidatedProperty(event, validatedParameter, constraint))
+      .map(event => event.blockId)
+      .filter(block => accepted.has(block)));
+    const safeOperationIds = (fn.events || []).filter(event => acceptedOnly.has(event.blockId) &&
+      ![...mutationBlocks].some(block => block !== event.blockId && cfgCanReach(cfg, block, event.blockId)))
+      .map(event => event.id);
+    if (!safeOperationIds.length) continue;
+    return {
+      kind: "spring-binding-result-rejection",
+      verification: "cfg",
+      functionId: fn.id,
+      bindingResult: bindingResult.name,
+      conditionOperationId: check.id,
+      line: check.line,
+      code: check.code,
+      safeOperationIds,
+    };
+  }
+  return undefined;
+}
+
+function javaImportedType(fn, local) {
+  return (fn.references || []).find(reference => reference.kind === "import" && reference.local === local)?.target;
+}
+
+function positiveBindingResultCheck(code, receiver) {
+  const target = escapeRegex(receiver);
+  return new RegExp(`\\bif\\s*\\(\\s*${target}\\s*\\.\\s*hasErrors\\s*\\(\\s*\\)\\s*\\)`).test(String(code || ""));
+}
+
+function eventCouldMutateValidatedProperty(event, parameter, constraint) {
+  const root = parameter.name;
+  const property = `${root}.${constraint.property}`;
+  if (event.type === "assignment" && [root, property].some(value => pathsOverlap(event.target, value))) return true;
+  if (event.type !== "call") return false;
+  const receiverTouchesRoot = (event.receiverVariables || []).some(value => pathsOverlap(value, root));
+  const pureAccessors = new Set(constraint.generatedPureAccessors || []);
+  if (receiverTouchesRoot && !pureAccessors.has(event.callee)) return true;
+  return (event.argumentVariables || []).some(group => group.some(value => normalizeAccessPath(value) === normalizeAccessPath(root)));
+}
+
+function cfgReachableBlocks(cfg, start) {
+  const reachable = new Set();
+  const pending = [start];
+  while (pending.length) {
+    const block = pending.pop();
+    if (!block || reachable.has(block)) continue;
+    reachable.add(block);
+    for (const edge of cfg.edges || []) if (edge.from === block) pending.push(edge.to);
+  }
+  return reachable;
+}
+
+function cfgCanReach(cfg, start, target) {
+  return start === target || cfgReachableBlocks(cfg, start).has(target);
+}
+
+function declarativeValidationEvidence(evidenceSteps, terminalSteps = []) {
+  const facts = evidenceSteps.flatMap(step => step.validationFacts || []);
+  if (!facts.length) return [];
+  const useSteps = [...evidenceSteps, ...terminalSteps];
+  const accessPaths = useSteps.flatMap(step => step.accessPaths || []);
+  const code = useSteps.map(step => step.code || "").join("\n");
+  const seen = new Set();
+  return facts.filter(fact => {
+    const key = `${fact.parameterType}:${fact.property}:${fact.kind}:${fact.annotation}`;
+    if (seen.has(key) || !declarativeFactTouchesEvidence(fact, accessPaths, code)) return false;
+    seen.add(key);
+    return true;
+  }).map(fact => {
+    const enforced = fact.enforcement?.safeOperationIds?.some(operationId => useSteps.some(step =>
+      step.functionId === fact.enforcement.functionId && step.operationId === operationId));
+    const regexp = fact.regexp ? ` /${fact.regexp}/` : "";
+    const reason = enforced
+      ? `Spring BindingResult rejection at line ${fact.enforcement.line} dominates this use, so the declared constraint is enforced on this path.`
+      : "The Bean Validation constraint is declared and cascaded validation is requested, but validator activation and the rejecting control-flow branch were not proven. It cannot suppress this finding.";
+    return {
+      kind: "validation",
+      label: `${enforced ? "Enforced" : "Declared"} @Pattern${regexp} for ${fact.parameterType}.${fact.property}`,
+      operationId: `declarative-validation:${fact.parameterType}:${fact.property}`,
+      functionId: evidenceSteps[0]?.functionId,
+      symbolKey: evidenceSteps[0]?.symbolKey,
+      workspaceRoot: evidenceSteps[0]?.workspaceRoot,
+      absolutePath: fact.location?.absolutePath || evidenceSteps[0]?.absolutePath,
+      relativePath: fact.location?.relativePath || evidenceSteps[0]?.relativePath,
+      line: fact.location?.line || evidenceSteps[0]?.line,
+      code: fact.annotation || "@Pattern",
+      accessPaths: fact.accessPaths || [],
+      analysisStatus: enforced ? "verified" : "syntax-only",
+      declarationOnly: true,
+      guardCapabilities: enforced ? [GuardCapability.INPUT_VALIDATION] : [],
+      enforcement: enforced ? fact.enforcement : undefined,
+      reason,
+      guardHint: enforced ? undefined : {
+        label: `Declared @Pattern for ${fact.parameterType}.${fact.property}`,
+        line: fact.location?.line || evidenceSteps[0]?.line,
+        relativePath: fact.location?.relativePath || evidenceSteps[0]?.relativePath,
+        capabilities: [GuardCapability.INPUT_VALIDATION],
+        reason,
+      },
+    };
+  });
+}
+
+function declarativeFactTouchesEvidence(fact, accessPaths, code) {
+  if ((fact.accessPaths || []).some(expected => accessPaths.some(actual => pathsOverlap(expected, actual)))) return true;
+  return Boolean(fact.accessor && new RegExp(`\\.${escapeRegex(fact.accessor)}\\s*\\(`).test(code));
+}
+
+function escapeRegex(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function dedupeRoots(roots) {
@@ -533,14 +1200,26 @@ function bestEvidenceForValues(values, evidence) {
 
 function sourceDefinesSameValue(fn, assignment) {
   return fn.events.some(event => event.type === "source" && event.line === assignment.line &&
+    sameOperationRange(event, assignment) &&
     [event.target, ...(event.variables || [])].some(value =>
       normalizeAccessPath(value) === normalizeAccessPath(assignment.target)));
+}
+
+function sameOperationRange(source, assignment) {
+  if (![source.startOffset, source.endOffset, assignment.startOffset, assignment.endOffset].every(Number.isFinite)) return true;
+  return source.startOffset >= assignment.startOffset && source.endOffset <= assignment.endOffset;
 }
 
 function evidenceDefinesSameValue(evidence, assignment) {
   const target = normalizeAccessPath(assignment.target);
   const steps = evidence.get(target) || [];
   return steps.some(step => step.kind === "call" && step.line === assignment.line);
+}
+
+function guardDefinesSameValue(events, call) {
+  const target = normalizeAccessPath(call.target);
+  return Boolean(target && events.some(event => event.type === "control" && event.line === call.line &&
+    normalizeAccessPath(event.guardBinding?.output || event.target) === target));
 }
 
 function precedingCallDefinesSameValue(fn, assignment, tainted) {
@@ -641,14 +1320,41 @@ function isPropertyDescendant(value, parent) {
 
 function controlScopeApplies(control, target, fn) {
   if (Array.isArray(control.guardAppliesToBlocks)) return control.guardAppliesToBlocks.includes(target.blockId);
-  if (control.blockId && target.blockId && fn.cfg?.dominators?.[target.blockId]) {
+  if (control.guardDominance && control.blockId && target.blockId && fn.cfg?.dominators?.[target.blockId]) {
     return fn.cfg.dominators[target.blockId].includes(control.blockId);
   }
+  // Without branch dominance, only guards whose soundness is enforced
+  // elsewhere may apply by line order: value-transforming guards
+  // (outputScoped — guardCapabilityFailures requires the sink to consume the
+  // guard's fresh output), receiver-typed guards and trusted-operand guards.
+  // A plain predicate guard checked outside any condition proves nothing and
+  // stays a hint.
+  const binding = control.guardBinding;
+  const selfProving = Boolean(
+    binding?.outputScoped || binding?.receiverScoped || binding?.requiresTrustedOperand,
+  );
+  if (!selfProving) return false;
   return control.line <= target.line;
 }
 
-function controlRelation(control, target, fn) {
-  if (!controlScopeApplies(control, target, fn)) return { status: "none", reason: "The guard does not control this sink path." };
+function controlRelation(control, target, fn, versions = new Map(), options = {}) {
+  if (!controlScopeApplies(control, target, fn)) {
+    // A guard that is a plain call with no branch-dominance proof and no
+    // self-proving scope is still review context: keep it as a hint step
+    // (no capabilities) instead of dropping it from the trace entirely.
+    const bare = !control.guardDominance && !Array.isArray(control.guardAppliesToBlocks) &&
+      !(control.guardBinding?.outputScoped || control.guardBinding?.receiverScoped ||
+        control.guardBinding?.requiresTrustedOperand);
+    if (bare) return {
+      status: "hint",
+      effectiveCapabilities: [],
+      hints: (control.guardCapabilities || []).map(capability => ({
+        capability,
+        reason: "The guard is a plain call with no branch-dominance proof; recorded as review context and it cannot suppress findings.",
+      })),
+    };
+    return { status: "none", reason: "The guard does not control this sink path." };
+  }
   const binding = control.guardBinding;
   const capabilities = control.guardCapabilities || [];
   if (!binding) return {
@@ -667,16 +1373,16 @@ function controlRelation(control, target, fn) {
       requiresSemanticProof: binding.requiresSemanticProof,
       forbidsDirectSinkInput: binding.forbidsDirectSinkInput,
     };
-    const reasons = guardCapabilityFailures(scope, binding, target);
+    const reasons = guardCapabilityFailures(scope, binding, target, versions, options);
     if (reasons.length) reasons.forEach(reason => hints.push({ capability, reason }));
     else effectiveCapabilities.push(capability);
   }
   return { status: effectiveCapabilities.length ? "effective" : "hint", effectiveCapabilities, hints };
 }
 
-function guardCapabilityFailures(scope, binding, target) {
+function guardCapabilityFailures(scope, binding, target, versions, options = {}) {
   const reasons = [];
-  if (scope.applicableSinkKinds?.length && !scope.applicableSinkKinds.includes(target.sinkKind)) {
+  if (!options.deferSinkKind && scope.applicableSinkKinds?.length && !scope.applicableSinkKinds.includes(target.sinkKind)) {
     reasons.push(`The guard capability does not apply to ${target.sinkKind || "this sink"}.`);
   }
   if (scope.receiverScoped && (!binding.receiver || !target.receiver || canonicalReceiver(binding.receiver) !== canonicalReceiver(target.receiver))) {
@@ -693,16 +1399,58 @@ function guardCapabilityFailures(scope, binding, target) {
     reasons.push("The sink still consumes the raw value observed by the guard.");
   }
   if (scope.outputScoped) {
+    const protectedOutputs = unique([...(binding.protectedOutputs || []), binding.output]);
+    const consumedOutputs = protectedOutputs.filter(output => intersects(target.variables, new Set([output])));
     if (!binding.output) reasons.push("The guard return value is not captured, so the protected value cannot be proven.");
-    else if (!intersects(target.variables, new Set([binding.output]))) reasons.push("The sink does not consume the value produced by the guard.");
+    else if (!consumedOutputs.length) reasons.push("The sink does not consume the value produced by the guard or a value derived only from it.");
+    else if (consumedOutputs.every(output => guardVersionChanged(binding, output, versions))) {
+      reasons.push("The protected value was reassigned after the guard proof was established.");
+    }
   }
   if (!scope.receiverScoped && !scope.outputScoped) {
     const protectedValues = binding.inputs || [];
     if (protectedValues.length && !intersects(target.variables, new Set(protectedValues))) {
       reasons.push("The guard validates a different value from the one consumed by the sink.");
+    } else if (protectedValues.some(value => guardVersionChanged(binding, value, versions))) {
+      reasons.push("A validated value was reassigned after the guard proof was established.");
     }
   }
   return [...new Set(reasons)];
+}
+
+function advanceValueVersion(versions, value) {
+  const key = normalizeAccessPath(value);
+  if (!key) return;
+  versions.set(key, (versions.get(key) || 0) + 1);
+}
+
+function captureGuardVersions(binding, versions) {
+  return Object.fromEntries([...(binding.inputs || []), ...(binding.protectedOutputs || []), binding.output]
+    .map(normalizeAccessPath)
+    .filter(Boolean)
+    .map(value => [value, versions.get(value) || 0]));
+}
+
+function propagateOutputGuardAssignments(controls, assignment, tainted, versions) {
+  const target = normalizeAccessPath(assignment.target);
+  const taintedInputs = unique((assignment.variables || []).filter(value => intersects([value], tainted)));
+  if (!target || !taintedInputs.length) return;
+  for (const control of controls) {
+    const binding = control.event?.guardBinding;
+    if (!binding || !Object.values(binding.capabilityScopes || {}).some(scope => scope.outputScoped)) continue;
+    const protectedOutputs = unique([...(binding.protectedOutputs || []), binding.output])
+      .filter(value => !guardVersionChanged(binding, value, versions));
+    if (!protectedOutputs.length || !taintedInputs.every(input => intersects([input], new Set(protectedOutputs)))) continue;
+    binding.protectedOutputs = unique([...protectedOutputs, target]);
+    binding.valueVersions ||= {};
+    binding.valueVersions[target] = versions.get(target) || 0;
+  }
+}
+
+function guardVersionChanged(binding, value, versions) {
+  const key = normalizeAccessPath(value);
+  if (!key || !binding.valueVersions || binding.valueVersions[key] === undefined) return false;
+  return binding.valueVersions[key] !== (versions.get(key) || 0);
 }
 
 function effectiveControlStep(step, relation) {

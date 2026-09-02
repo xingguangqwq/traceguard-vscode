@@ -3,38 +3,40 @@
 const ts = require("typescript");
 const path = require("node:path");
 const { normalizePath } = require("../identity");
+const MAX_CACHED_PROJECT_PROGRAMS = 8;
 
 class TypeScriptProject {
   constructor() {
     this.files = new Map();
-    this.program = undefined;
-    this.dirty = true;
+    this.programs = new Map();
     this.generation = 0;
     this.moduleDependencies = new Map();
     this.moduleDependents = new Map();
+    this.standardLibraryPath = undefined;
   }
 
-  initialize(files = []) {
+  initialize(files = [], options = {}) {
+    this.standardLibraryPath = options.standardLibraryPath;
     this.files.clear();
     for (const file of files) this._store(file);
-    this.program = undefined;
-    this.dirty = true;
+    this.programs.clear();
     this.generation = 0;
-    this.moduleDependencies.clear();
-    this.moduleDependents.clear();
+    this._rebuildModuleDependencies();
   }
 
   update(file) {
     const key = compilerFileKey(file?.absolutePath);
     if (!isJavaScriptOrTypeScript(file) || !key) {
-      if (key && this.files.delete(key)) this.dirty = true;
+      if (key) this.remove(file?.absolutePath);
       return;
     }
     const previous = this.files.get(key);
     const next = compilerRecord(file);
     if (previous?.version === next.version && previous.text === next.text && previous.fileName === next.fileName) return;
     this.files.set(key, next);
-    this.dirty = true;
+    this.programs.clear();
+    if (previous) this._replaceModuleDependencies(key);
+    else this._rebuildModuleDependencies();
   }
 
   canAnalyzeIsolated(absolutePath, text) {
@@ -42,30 +44,44 @@ class TypeScriptProject {
     if (!key || !this.files.has(key)) return false;
     if ((this.moduleDependencies.get(key) || new Set()).size) return false;
     if ((this.moduleDependents.get(key) || new Set()).size) return false;
-    const record = this.files.get(key);
-    const sourceFile = ts.createSourceFile(record.fileName, String(text || ""), ts.ScriptTarget.Latest, true, scriptKindFor(record.fileName, record.language));
-    return moduleNamesFromSourceFile(sourceFile).length === 0;
+    return moduleNamesFromText(String(text || this.files.get(key)?.text || "")).length === 0;
   }
 
   remove(absolutePath) {
-    if (this.files.delete(compilerFileKey(absolutePath))) this.dirty = true;
+    const key = compilerFileKey(absolutePath);
+    if (!key || !this.files.delete(key)) return;
+    this.programs.clear();
+    this._rebuildModuleDependencies();
+  }
+
+  releasePrograms() {
+    this.programs.clear();
+  }
+
+  setStandardLibraryPath(value) {
+    const normalized = value ? path.resolve(value) : undefined;
+    if (normalized === this.standardLibraryPath) return false;
+    this.standardLibraryPath = normalized;
+    this.programs.clear();
+    return true;
   }
 
   modelFor(absolutePath) {
     const record = this.files.get(compilerFileKey(absolutePath));
     if (!record) return undefined;
-    this._build();
-    const sourceFile = this.program.getSourceFile(record.fileName) ||
-      this.program.getSourceFiles().find(candidate => compilerFileKey(candidate.fileName) === compilerFileKey(record.fileName));
+    const component = this._componentFor(absolutePath);
+    const project = this._buildComponent(component);
+    const sourceFile = project.program.getSourceFile(record.fileName) ||
+      project.program.getSourceFiles().find(candidate => compilerFileKey(candidate.fileName) === compilerFileKey(record.fileName));
     if (!sourceFile) return undefined;
     return {
       sourceFile,
-      program: this.program,
-      checker: this.program.getTypeChecker(),
+      program: project.program,
+      checker: project.program.getTypeChecker(),
       projectMode: true,
-      projectFileCount: this.files.size,
-      projectGeneration: this.generation,
-      standardLibrary: true,
+      projectFileCount: component.length,
+      projectGeneration: project.generation,
+      standardLibrary: Boolean(this.standardLibraryPath),
       fileInfoFor: fileName => this.fileInfoFor(fileName),
     };
   }
@@ -73,7 +89,6 @@ class TypeScriptProject {
   dependentsOf(absolutePath) {
     const target = compilerFileKey(absolutePath);
     if (!target) return [];
-    this._build();
     const result = new Set();
     const queue = [...(this.moduleDependents.get(target) || [])];
     while (queue.length) {
@@ -99,70 +114,106 @@ class TypeScriptProject {
     this.files.set(compilerFileKey(file.absolutePath), compilerRecord(file));
   }
 
-  _build() {
-    if (!this.dirty && this.program) return;
+  _componentFor(absolutePath) {
+    const target = compilerFileKey(absolutePath);
+    if (!target || !this.files.has(target)) return [];
+    const result = new Set();
+    const queue = [target];
+    while (queue.length) {
+      const current = queue.shift();
+      if (!current || result.has(current)) continue;
+      result.add(current);
+      queue.push(...(this.moduleDependencies.get(current) || []));
+      queue.push(...(this.moduleDependents.get(current) || []));
+    }
+    return [...result].sort();
+  }
+
+  _buildComponent(component) {
+    const componentId = `${this.standardLibraryPath || "<no-lib>"}\n${component.join("\n")}`;
+    const cached = this.programs.get(componentId);
+    if (cached) {
+      this.programs.delete(componentId);
+      this.programs.set(componentId, cached);
+      return cached;
+    }
+    const componentFiles = new Map(component.map(key => [key, this.files.get(key)]).filter(([, record]) => record));
     const options = compilerOptions({ projectMode: true });
     const baseHost = ts.createCompilerHost(options, true);
     const host = {
       ...baseHost,
-      fileExists: candidate => this.files.has(compilerFileKey(candidate)) || baseHost.fileExists(candidate),
-      readFile: candidate => this.files.get(compilerFileKey(candidate))?.text ?? baseHost.readFile(candidate),
+      fileExists: candidate => componentFiles.has(compilerFileKey(candidate)) || baseHost.fileExists(candidate),
+      readFile: candidate => componentFiles.get(compilerFileKey(candidate))?.text ?? baseHost.readFile(candidate),
       getSourceFile: (candidate, languageVersion, onError, shouldCreateNewSourceFile) => {
-        const current = this.files.get(compilerFileKey(candidate));
+        const current = componentFiles.get(compilerFileKey(candidate));
         if (current) {
-          if (!current.sourceFile || shouldCreateNewSourceFile) {
-            current.sourceFile = ts.createSourceFile(current.fileName, current.text, languageVersion, true, scriptKindFor(current.fileName, current.language));
-            current.sourceFile.version = current.version;
-          }
-          return current.sourceFile;
+          const sourceFile = ts.createSourceFile(current.fileName, current.text, languageVersion, true, scriptKindFor(current.fileName, current.language));
+          sourceFile.version = current.version;
+          return sourceFile;
         }
         return baseHost.getSourceFile(candidate, languageVersion, onError, shouldCreateNewSourceFile);
       },
       writeFile: () => {},
     };
     host.resolveModuleNames = (moduleNames, containingFile) => moduleNames.map(moduleName =>
-      resolveVirtualModule(this.files, moduleName, containingFile) || ts.resolveModuleName(moduleName, containingFile, options, host).resolvedModule,
+      resolveVirtualModule(componentFiles, moduleName, containingFile) || ts.resolveModuleName(moduleName, containingFile, options, host).resolvedModule,
     );
     host.resolveModuleNameLiterals = (moduleLiterals, containingFile) => moduleLiterals.map(moduleLiteral => {
-      const resolvedModule = resolveVirtualModule(this.files, moduleLiteral.text, containingFile);
+      const resolvedModule = resolveVirtualModule(componentFiles, moduleLiteral.text, containingFile);
       return resolvedModule ? { resolvedModule } : ts.resolveModuleName(moduleLiteral.text, containingFile, options, host);
     });
-    const rootNames = [...this.files.values()].map(record => record.fileName);
-    this.program = ts.createProgram({ rootNames, options, host, oldProgram: this.program });
-    this.dirty = false;
+    const rootNames = [
+      ...(this.standardLibraryPath ? [this.standardLibraryPath] : []),
+      ...[...componentFiles.values()].map(record => record.fileName),
+    ];
+    const program = ts.createProgram({ rootNames, options, host });
     this.generation += 1;
-    this._rebuildModuleDependencies();
+    const result = { program, generation: this.generation };
+    this.programs.set(componentId, result);
+    while (this.programs.size > MAX_CACHED_PROJECT_PROGRAMS) this.programs.delete(this.programs.keys().next().value);
+    return result;
   }
 
   _rebuildModuleDependencies() {
     this.moduleDependencies = new Map();
     this.moduleDependents = new Map();
-    for (const [sourceKey, record] of this.files) {
-      const sourceFile = this.program.getSourceFile(record.fileName) ||
-        this.program.getSourceFiles().find(candidate => compilerFileKey(candidate.fileName) === sourceKey);
-      if (!sourceFile) continue;
-      const dependencies = new Set();
-      for (const moduleName of moduleNamesFromSourceFile(sourceFile)) {
-        if (!moduleName) continue;
-        const resolved = resolveVirtualModule(this.files, moduleName, sourceFile.fileName);
-        const dependencyKey = compilerFileKey(resolved?.resolvedFileName);
-        if (dependencyKey && dependencyKey !== sourceKey) dependencies.add(dependencyKey);
-      }
-      this.moduleDependencies.set(sourceKey, dependencies);
-      for (const dependency of dependencies) {
-        if (!this.moduleDependents.has(dependency)) this.moduleDependents.set(dependency, new Set());
-        this.moduleDependents.get(dependency).add(sourceKey);
-      }
+    for (const sourceKey of this.files.keys()) this._replaceModuleDependencies(sourceKey);
+  }
+
+  _replaceModuleDependencies(sourceKey) {
+    this._removeModuleDependencies(sourceKey);
+    const record = this.files.get(sourceKey);
+    if (!record) return;
+    const dependencies = new Set();
+    for (const moduleName of moduleNamesFromText(record.text)) {
+      const resolved = resolveVirtualModule(this.files, moduleName, record.fileName);
+      const dependencyKey = compilerFileKey(resolved?.resolvedFileName);
+      if (dependencyKey && dependencyKey !== sourceKey) dependencies.add(dependencyKey);
     }
+    this.moduleDependencies.set(sourceKey, dependencies);
+    for (const dependency of dependencies) {
+      if (!this.moduleDependents.has(dependency)) this.moduleDependents.set(dependency, new Set());
+      this.moduleDependents.get(dependency).add(sourceKey);
+    }
+  }
+
+  _removeModuleDependencies(sourceKey) {
+    for (const dependency of this.moduleDependencies.get(sourceKey) || []) {
+      const dependents = this.moduleDependents.get(dependency);
+      dependents?.delete(sourceKey);
+      if (!dependents?.size) this.moduleDependents.delete(dependency);
+    }
+    this.moduleDependencies.delete(sourceKey);
   }
 }
 
-function createCompilerModel(text, absolutePath, language) {
+function createCompilerModel(text, absolutePath, language, options = {}) {
   const fileName = absolutePath || (language === "typescript" ? "file.ts" : "file.js");
-  const options = compilerOptions({ projectMode: false, language });
+  const compilerConfiguration = compilerOptions({ projectMode: false, language });
+  const standardLibraryPath = options.standardLibraryPath ? path.resolve(options.standardLibraryPath) : undefined;
   const scriptKind = scriptKindFor(fileName, language);
   const sourceFile = ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, true, scriptKind);
-  const baseHost = ts.createCompilerHost(options, true);
+  const baseHost = ts.createCompilerHost(compilerConfiguration, true);
   const host = {
     ...baseHost,
     fileExists: candidate => compilerFileKey(candidate) === compilerFileKey(fileName) || baseHost.fileExists(candidate),
@@ -173,7 +224,7 @@ function createCompilerModel(text, absolutePath, language) {
         : baseHost.getSourceFile(candidate, languageVersion, onError, shouldCreateNewSourceFile),
     writeFile: () => {},
   };
-  const program = ts.createProgram([fileName], options, host);
+  const program = ts.createProgram([...(standardLibraryPath ? [standardLibraryPath] : []), fileName], compilerConfiguration, host);
   return {
     sourceFile: program.getSourceFile(fileName) || sourceFile,
     program,
@@ -181,7 +232,21 @@ function createCompilerModel(text, absolutePath, language) {
     projectMode: false,
     projectFileCount: 1,
     projectGeneration: 0,
+    standardLibrary: Boolean(standardLibraryPath),
+  };
+}
+
+function createSyntaxModel(text, absolutePath, language) {
+  const fileName = absolutePath || (language === "typescript" ? "file.ts" : "file.js");
+  return {
+    sourceFile: ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, true, scriptKindFor(fileName, language)),
+    program: undefined,
+    checker: undefined,
+    projectMode: false,
+    projectFileCount: 1,
+    projectGeneration: 0,
     standardLibrary: false,
+    syntaxOnly: true,
   };
 }
 
@@ -189,7 +254,9 @@ function compilerOptions({ projectMode, language } = {}) {
   return {
     allowJs: projectMode || language === "javascript",
     checkJs: false,
-    noLib: !projectMode,
+    // Project programs receive TraceGuard's explicit minimal library asset as
+    // a root file. Never let TypeScript pull the full lib.*.d.ts graph.
+    noLib: true,
     noResolve: !projectMode,
     skipLibCheck: true,
     target: ts.ScriptTarget.Latest,
@@ -219,7 +286,6 @@ function compilerRecord(file) {
     language: file.language,
     text: String(file.text || ""),
     version: String(file.version || ""),
-    sourceFile: undefined,
   };
 }
 
@@ -261,11 +327,14 @@ function compilerExtension(fileName) {
 }
 
 function moduleNameFromStatement(statement) {
-  if ((ts.isImportDeclaration(statement) || ts.isExportDeclaration(statement)) && ts.isStringLiteralLike(statement.moduleSpecifier)) {
+  if ((ts.isImportDeclaration(statement) || ts.isExportDeclaration(statement)) &&
+      statement.moduleSpecifier && ts.isStringLiteralLike(statement.moduleSpecifier)) {
     return statement.moduleSpecifier.text;
   }
   if (ts.isImportEqualsDeclaration(statement) && ts.isExternalModuleReference(statement.moduleReference) &&
-      ts.isStringLiteralLike(statement.moduleReference.expression)) return statement.moduleReference.expression.text;
+      statement.moduleReference.expression && ts.isStringLiteralLike(statement.moduleReference.expression)) {
+    return statement.moduleReference.expression.text;
+  }
   return undefined;
 }
 
@@ -285,4 +354,16 @@ function moduleNamesFromSourceFile(sourceFile) {
   return [...result];
 }
 
-module.exports = { TypeScriptProject, compilerOptions, createCompilerModel, moduleNamesFromSourceFile, scriptKindFor };
+function moduleNamesFromText(text) {
+  return [...new Set(ts.preProcessFile(String(text || ""), true, true).importedFiles.map(file => file.fileName).filter(Boolean))];
+}
+
+module.exports = {
+  TypeScriptProject,
+  compilerOptions,
+  createCompilerModel,
+  createSyntaxModel,
+  moduleNamesFromSourceFile,
+  moduleNamesFromText,
+  scriptKindFor,
+};

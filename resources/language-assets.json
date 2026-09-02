@@ -1,0 +1,47 @@
+{
+  "schema": "traceguard-language-assets",
+  "version": 1,
+  "release": "1.0.0",
+  "baseUrl": "https://github.com/xingguangqwq/traceguard-vscode/releases/download/v1.0.0",
+  "assets": {
+    "javascript-typescript": {
+      "fileName": "traceguard-assets-javascript-typescript-v1.0.0.json.gz",
+      "sha256": "e697461afff553af4a5b313a2cc8a483d25d9866f309267cc9f2596379e0698d",
+      "bytes": 459236,
+      "files": {
+        "grammars/tree-sitter-javascript.wasm": "5fb488d0cabb4775a594bab85682de5ad6ce83c0d6ac997a9f82dd084d571240",
+        "grammars/tree-sitter-typescript.wasm": "778025db5a8be0e70f8ccc3671e486dfeddd048c25d9e8a70c26de2e1bf6f97d",
+        "grammars/tree-sitter-tsx.wasm": "79e5da75ea62855a0cd67177685f0164eac87d5f630b3cbe1e0a099751ad30f8",
+        "typescript/traceguard-minimal-lib.d.ts": "652ae6e2cf5c14705b76ee113c2d23f55778157e2341261a299cc33fa49d845b"
+      },
+      "grammars": {
+        "javascript": "grammars/tree-sitter-javascript.wasm",
+        "typescript": "grammars/tree-sitter-typescript.wasm",
+        "tsx": "grammars/tree-sitter-tsx.wasm"
+      },
+      "typeLibrary": "typescript/traceguard-minimal-lib.d.ts"
+    },
+    "csharp": {
+      "fileName": "traceguard-assets-csharp-v1.0.0.json.gz",
+      "sha256": "620b7ca0c49caa34d3050339c6adeb34cb9db6b00d44d4c31b1fef0472738689",
+      "bytes": 539649,
+      "files": {
+        "grammars/tree-sitter-c_sharp.wasm": "6f69e1cae44e1c32c1eccc170dc5a9778fb94ff716f71113fe1f8c4299aa2f40"
+      },
+      "grammars": {
+        "csharp": "grammars/tree-sitter-c_sharp.wasm"
+      }
+    },
+    "go": {
+      "fileName": "traceguard-assets-go-v1.0.0.json.gz",
+      "sha256": "cff02e276e59bcafdd930ba39e87d6cb6b364bc24ee224b08acc2ec590b50df4",
+      "bytes": 53827,
+      "files": {
+        "grammars/tree-sitter-go.wasm": "9504573f352b20be7f2f1911754d710622aedc15afff16d5ed8fb5645681aee7"
+      },
+      "grammars": {
+        "go": "grammars/tree-sitter-go.wasm"
+      }
+    }
+  }
+}

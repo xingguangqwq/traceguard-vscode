@@ -47,6 +47,9 @@ jobs:
       - name: Enforce TypeScript dependency invalidation baseline
         run: npm run benchmark -- --fixture=typescript-dependents --files=100 --max-incremental-ms=500 --max-rss-mib=500
 
+      - name: Enforce 8000-file Worker stress baseline
+        run: npm run benchmark:stress
+
       - name: Compare evaluation baseline
         run: npm run eval:compare
 
@@ -61,7 +64,7 @@ jobs:
         run: |
           package_root=$(mktemp -d)
           unzip -q traceguard-*.vsix -d "$package_root"
-          node scripts/verify-packaged-runtime.js "$package_root/extension"
+          node scripts/verify-packaged-runtime.js "$package_root/extension" "$PWD/dist-assets"
 
       - name: Upload VSIX
         uses: actions/upload-artifact@v4

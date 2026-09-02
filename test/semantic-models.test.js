@@ -128,9 +128,9 @@ export function run() {
   assert.ok(operations.some(item => item.semantic.modelId === "javascript.deno.environment" && item.kind === "source"));
   assert.ok(operations.some(item => item.semantic.modelId === "node.path.value-propagation" && item.kind === "call"));
   assert.ok(operations.some(item => item.semantic.modelId === "javascript.global.string-conversion" && item.kind === "call"));
-  assert.equal(finding?.confidence, "medium");
+  assert.equal(finding?.confidence, "high");
   assert.equal(finding?.path.source.kind, "source");
-  assert.ok(finding?.explanation.propagation.some(step => step.kind === "call" && /unresolved external/.test(step.reason)));
+  assert.ok(finding?.explanation.propagation.every(step => !step.heuristic));
 });
 
 test("a variable alias of a modeled global keeps its symbol identity", async () => {

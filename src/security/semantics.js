@@ -8,6 +8,13 @@ const SourceKind = Object.freeze({
   SELECTED_SYMBOL: "SELECTED_SYMBOL",
 });
 
+const SourceExposure = Object.freeze({
+  REMOTE: "remote",
+  LOCAL: "local",
+  UNKNOWN: "unknown",
+  REVIEWER: "reviewer",
+});
+
 const SinkKind = Object.freeze({
   SQL_QUERY: "SQL_QUERY",
   COMMAND_EXEC: "COMMAND_EXEC",
@@ -23,6 +30,7 @@ const SinkKind = Object.freeze({
 
 const GuardCapability = Object.freeze({
   INPUT_VALIDATION: "INPUT_VALIDATION",
+  WHITELIST_PATTERN: "WHITELIST_PATTERN",
   VALIDATE_SCHEME: "VALIDATE_SCHEME",
   VALIDATE_IP: "VALIDATE_IP",
   BLOCK_PRIVATE_IP: "BLOCK_PRIVATE_IP",
@@ -35,6 +43,10 @@ const GuardCapability = Object.freeze({
   AUTHENTICATION: "AUTHENTICATION",
   AUTHORIZATION: "AUTHORIZATION",
   DESERIALIZATION_ALLOWLIST: "DESERIALIZATION_ALLOWLIST",
+  NUMERIC_ONLY: "NUMERIC_ONLY",
+  FIXED_COLLECTION: "FIXED_COLLECTION",
+  ALL_ELEMENTS: "ALL_ELEMENTS",
+  SAFE_JOIN: "SAFE_JOIN",
 });
 
 const SINK_BY_CATEGORY = Object.freeze({
@@ -60,12 +72,17 @@ const GUARD_SINK_KINDS = Object.freeze({
   [GuardCapability.SQL_PARAMETERIZATION]: [SinkKind.SQL_QUERY],
   [GuardCapability.SHELL_ESCAPE]: [SinkKind.COMMAND_EXEC],
   [GuardCapability.DESERIALIZATION_ALLOWLIST]: [SinkKind.DESERIALIZATION],
+  [GuardCapability.NUMERIC_ONLY]: [SinkKind.COMMAND_EXEC, SinkKind.SQL_QUERY],
+  [GuardCapability.SAFE_JOIN]: [SinkKind.COMMAND_EXEC],
+  [GuardCapability.WHITELIST_PATTERN]: [SinkKind.COMMAND_EXEC, SinkKind.SQL_QUERY, SinkKind.FILE_ACCESS, SinkKind.DYNAMIC_EXEC],
 });
 
 const OUTPUT_SCOPED_GUARDS = new Set([
   GuardCapability.OUTPUT_ENCODING,
   GuardCapability.PATH_CANONICALIZATION,
   GuardCapability.SHELL_ESCAPE,
+  GuardCapability.NUMERIC_ONLY,
+  GuardCapability.SAFE_JOIN,
 ]);
 
 const RECEIVER_SCOPED_GUARDS = new Set([GuardCapability.SQL_PARAMETERIZATION]);
@@ -76,6 +93,8 @@ const SEMANTIC_PROOF_GUARDS = new Set([
   GuardCapability.SQL_PARAMETERIZATION,
   GuardCapability.SHELL_ESCAPE,
   GuardCapability.DESERIALIZATION_ALLOWLIST,
+  GuardCapability.NUMERIC_ONLY,
+  GuardCapability.SAFE_JOIN,
 ]);
 const INDIRECT_SINK_GUARDS = new Set([GuardCapability.SQL_PARAMETERIZATION]);
 
@@ -85,6 +104,13 @@ function sourceKindFor(signal) {
   if (/argv|console|process|event input|environment|Getenv/i.test(text)) return SourceKind.PROCESS_INPUT;
   if (/upload|files?/i.test(text)) return SourceKind.FILE_UPLOAD;
   return SourceKind.EXTERNAL_INPUT;
+}
+
+function sourceExposureForKind(sourceKind) {
+  if ([SourceKind.HTTP_INPUT, SourceKind.FILE_UPLOAD].includes(sourceKind)) return SourceExposure.REMOTE;
+  if (sourceKind === SourceKind.PROCESS_INPUT) return SourceExposure.LOCAL;
+  if (sourceKind === SourceKind.SELECTED_SYMBOL) return SourceExposure.REVIEWER;
+  return SourceExposure.UNKNOWN;
 }
 
 function sinkKindFor(signal) {
@@ -112,20 +138,27 @@ function guardCapabilitiesFor(signal) {
 }
 
 function semanticForSignal(signal) {
-  if (signal.kind === "source") return { sourceKind: sourceKindFor(signal), label: signal.label };
+  if (signal?.semantic) return { ...signal.semantic, label: signal.semantic.label || signal.label };
+  if (signal.kind === "source") {
+    const sourceKind = sourceKindFor(signal);
+    return { sourceKind, exposure: sourceExposureForKind(sourceKind), label: signal.label };
+  }
   if (signal.kind === "sink") return { sinkKind: sinkKindFor(signal), category: signal.category, label: signal.label };
   if (signal.kind === "auth" || signal.kind === "sanitizer") return { guardCapabilities: guardCapabilitiesFor(signal), label: signal.label };
   return { label: signal.label };
 }
 
-function guardAssociation(capabilities = []) {
+function guardAssociation(capabilities = [], options = {}) {
+  const declaredSinkKinds = Array.isArray(options.applicableSinkKinds) && options.applicableSinkKinds.length
+    ? [...new Set(options.applicableSinkKinds)]
+    : undefined;
   return {
-    applicableSinkKinds: [...new Set(capabilities.flatMap(capability => GUARD_SINK_KINDS[capability] || []))],
+    applicableSinkKinds: declaredSinkKinds || [...new Set(capabilities.flatMap(capability => GUARD_SINK_KINDS[capability] || []))],
     outputScoped: capabilities.some(capability => OUTPUT_SCOPED_GUARDS.has(capability)),
     receiverScoped: capabilities.some(capability => RECEIVER_SCOPED_GUARDS.has(capability)),
     requiresTrustedOperand: capabilities.some(capability => TRUSTED_OPERAND_GUARDS.has(capability)),
     capabilityScopes: Object.fromEntries(capabilities.map(capability => [capability, {
-      applicableSinkKinds: GUARD_SINK_KINDS[capability] || [],
+      applicableSinkKinds: declaredSinkKinds || GUARD_SINK_KINDS[capability] || [],
       outputScoped: OUTPUT_SCOPED_GUARDS.has(capability),
       receiverScoped: RECEIVER_SCOPED_GUARDS.has(capability),
       requiresTrustedOperand: TRUSTED_OPERAND_GUARDS.has(capability),
@@ -135,13 +168,23 @@ function guardAssociation(capabilities = []) {
   };
 }
 
+function guardCapabilityAppliesToSink(capability, sinkKind, applicableSinkKinds) {
+  const declared = Array.isArray(applicableSinkKinds) && applicableSinkKinds.length
+    ? applicableSinkKinds
+    : GUARD_SINK_KINDS[capability] || [];
+  return !declared.length || declared.includes(sinkKind);
+}
+
 module.exports = {
   GuardCapability,
   SinkKind,
+  SourceExposure,
   SourceKind,
   guardCapabilitiesFor,
+  guardCapabilityAppliesToSink,
   guardAssociation,
   semanticForSignal,
   sinkKindFor,
+  sourceExposureForKind,
   sourceKindFor,
 };

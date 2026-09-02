@@ -9,7 +9,10 @@ const { collectSignals, findEntries } = require("./pattern-parser");
 const { extractFileReferences, extractIdentifiers, splitArguments } = require("./syntax-tools");
 const { runtime } = require("./tree-sitter-runtime");
 const { classifyFrameworkCall, dedupeFrameworkEntries, frameworkEntry, frameworkParameterRoles, inferParameterRoles, mergeFrameworkEntries, stringLiterals } = require("./framework-entries");
-const { resolveSemanticCall, SemanticRole } = require("../security/semantic-models");
+const { resolveSemanticCall, resolveStructuralSemantic, SemanticRole } = require("../security/catalog");
+const { interpretCollectionCall } = require("../security/collection-semantics");
+const { expressionInputs, javaBeanGetterRead } = require("./expression-inputs");
+const { fixedNumericCollectionJoinFact } = require("./collection-predicates");
 
 const FUNCTION_TYPES = Object.freeze({
   java: new Set(["method_declaration", "constructor_declaration", "lambda_expression"]),
@@ -20,7 +23,7 @@ const FUNCTION_TYPES = Object.freeze({
 });
 
 const TYPE_TYPES = new Set([
-  "class_declaration", "interface_declaration", "enum_declaration", "record_declaration", "struct_declaration", "namespace_declaration",
+  "class_declaration", "class_definition", "interface_declaration", "enum_declaration", "record_declaration", "struct_declaration", "namespace_declaration",
 ]);
 const CALL_TYPES = new Set([
   "call", "call_expression", "function_call_expression", "member_call_expression", "scoped_call_expression", "method_invocation", "invocation_expression", "object_creation_expression",
@@ -34,6 +37,11 @@ const LOOP_TYPES = new Set([
 const BRANCH_TYPES = new Set(["if_statement", "switch_statement", "conditional_expression", ...LOOP_TYPES]);
 const TRY_TYPES = new Set(["try_statement", "try_expression"]);
 const THROW_TYPES = new Set(["throw_statement", "throw_expression", "raise_statement"]);
+const JAVA_LANG_TYPES = new Set([
+  "Boolean", "Byte", "Character", "Class", "ClassLoader", "Double", "Enum", "Float", "Integer", "Long",
+  "Math", "Number", "Object", "Process", "ProcessBuilder", "Runtime", "Short", "String", "StringBuffer",
+  "StringBuilder", "System", "Thread", "ThreadLocal", "Throwable", "Void",
+]);
 
 class TreeSitterLanguageFrontend {
   constructor(language, capability) {
@@ -52,7 +60,7 @@ class TreeSitterLanguageFrontend {
     stabilizeDuplicateSymbols(records);
     assignSignals(records, signals, lines);
     const references = extractFileReferences(lines, this.language);
-    const typeRelations = this.language === "java" ? javaTypeRelations(root, text, references) : [];
+    const typeRelations = this.language === "java" ? javaTypeRelations(root, text, references, input) : [];
     const functions = records.map(record => buildFunction(record, input, lines, references, text));
     const covered = new Set(records.flatMap(record => record.signals.map(signalKey)));
     const globalSignals = signals.filter(signal => !covered.has(signalKey(signal)));
@@ -72,6 +80,7 @@ class TreeSitterLanguageFrontend {
       ...treeFrameworkEntries(root, records, this.language, text, references),
       ...(this.language === "java" ? javaFrameworkEntries(records, text) : []),
       ...(this.language === "php" ? phpFrameworkEntries(records, text) : []),
+      ...(this.language === "python" ? pythonFrameworkEntries(records, text) : []),
     ]);
     const entries = mergeFrameworkEntries(
       astEntries,
@@ -174,6 +183,11 @@ function externalHandlerDescriptor(language, argumentText, references = []) {
       className = legacy?.[1];
       functionName = legacy?.[2];
     }
+    if (!className || !functionName) {
+      const invokable = value.match(/^([A-Za-z_\\][\w\\]*)\s*::\s*class$/i);
+      className = invokable?.[1];
+      functionName = invokable ? "__invoke" : undefined;
+    }
     if (!className || !functionName) return undefined;
     const simple = className.split("\\").at(-1);
     const imported = references.find(reference => reference.kind === "import" && canonicalSymbolName(reference.local) === canonicalSymbolName(simple));
@@ -186,7 +200,9 @@ function externalHandlerDescriptor(language, argumentText, references = []) {
     if (member) {
       const imported = references.find(reference => ["import", "require"].includes(reference.kind) && canonicalSymbolName(reference.local) === canonicalSymbolName(member[1]));
       if (!imported) return undefined;
-      const moduleName = imported.target.endsWith(`.${member[1]}`) ? imported.target : `${imported.target}.${member[1]}`;
+      const moduleName = imported.target === member[1] || imported.target.endsWith(`.${member[1]}`)
+        ? imported.target
+        : `${imported.target}.${member[1]}`;
       return { language, moduleName, functionName: member[2] };
     }
     const imported = references.find(reference => reference.kind === "import" && canonicalSymbolName(reference.local) === canonicalSymbolName(value));
@@ -312,7 +328,13 @@ function buildFunction(record, input, lines, references, text) {
     executable: record.executable,
     signature: `${record.name}(${record.parameterDescriptors.map(parameter => parameter.type).join(",")})`,
     location: location({ ...input, ...treeSourceLocation(record.node), code: lines[record.line - 1] }),
-    parameters: record.parameterDescriptors.map(parameter => symbol(parameter.name, parameter.type, parameter.role)),
+    parameters: record.parameterDescriptors.map(parameter => {
+      const annotations = input.language === "java" ? javaParameterAnnotationNames(parameter.raw) : [];
+      return symbol(parameter.name, parameter.type, parameter.role, {
+        annotations,
+        cascadedValidation: annotations.some(name => ["Valid", "Validated"].includes(name)),
+      });
+    }),
     operations,
     cfg: buildOperationCFG(operations),
     references,
@@ -321,6 +343,9 @@ function buildFunction(record, input, lines, references, text) {
 
 function buildOperations(record, input, lines, text, references = []) {
   const operations = signalOperations(record, input, lines, text, references);
+  const constantValues = new Map();
+  const inferredTypes = new Map();
+  const collectionStates = new Map();
   const seen = new Set(operations.map(item => `${item.kind}:${item.location.startOffset ?? item.location.line}:${item.output?.name || item.call?.function || ""}`));
   const add = (kind, node, fields = {}) => {
     const line = node.startPosition.row + 1;
@@ -364,25 +389,85 @@ function buildOperations(record, input, lines, text, references = []) {
   }
   const visit = node => {
     if (node !== record.node && FUNCTION_TYPES[input.language]?.has(node.type)) return;
-    if (ASSIGNMENT_TYPES.has(node.type)) {
+    if (ASSIGNMENT_TYPES.has(node.type) && !(input.language === "java" && node.type === "enhanced_for_statement")) {
       const left = node.childForFieldName("left") || node.childForFieldName("name") || node.namedChildren?.[0];
-      const right = node.childForFieldName("right") || node.childForFieldName("value") || node.namedChildren?.at(-1);
+      const explicitRight = node.childForFieldName("right") || node.childForFieldName("value");
+      const right = explicitRight || node.namedChildren?.at(-1);
       const target = assignmentTarget(nodeText(left, text));
-      if (target && right && right !== left) add(OperationKind.ASSIGNMENT, node, {
-        inputs: expressionInputs(nodeText(right, text), input.language).map(symbol),
+      if (target && right && right !== left) {
+        const inputs = assignmentExpressionInputs(right, text, input.language);
+        const constant = constantExpressionValue(right, text, constantValues);
+        const uninitializedSelfReference = !explicitRight && inputs.length === 1 && inputs[0] === target;
+        if (!hasBranchAncestor(node, record.node) && constant !== NO_CONSTANT) constantValues.set(target, constant);
+        else if (!hasBranchAncestor(node, record.node) && explicitRight) constantValues.delete(target);
+        if (!uninitializedSelfReference && (inputs.length || explicitRight && constant !== NO_CONSTANT)) add(OperationKind.ASSIGNMENT, node, {
+          inputs: inputs.map(symbol),
+          output: symbol(target),
+          metadata: { assignmentMode: inputs.length ? (normalizeAccessPath(nodeText(right, text)) ? "alias" : "aggregate") : "constant" },
+        });
+        const guardFact = fixedNumericCollectionJoinFact(node, input.language, text, {
+          parseCall: genericCall,
+          callTypes: CALL_TYPES,
+          functionTypes: FUNCTION_TYPES,
+        });
+        const guardModel = guardFact && resolveStructuralSemantic("fixed-numeric-collection-join", input.language);
+        if (guardFact && guardModel) add(OperationKind.GUARD, node, {
+          inputs: guardFact.inputs.map(symbol),
+          output: symbol(guardFact.output),
+          semantic: {
+            modelId: guardModel.id,
+            modelRole: guardModel.role,
+            guardCapabilities: guardModel.guardCapabilities,
+            label: guardModel.label,
+          },
+          certainty: Certainty.HIGH,
+          metadata: {
+            semanticVerification: "structural",
+            controlKind: "sanitizer",
+            guardBinding: {
+              capabilities: guardModel.guardCapabilities,
+              inputs: guardFact.inputs,
+              output: guardFact.output,
+              semanticVerification: "structural",
+              collectionFacts: guardFact.facts,
+              ...guardAssociation(guardModel.guardCapabilities, guardModel),
+            },
+          },
+        });
+      }
+    }
+    if (input.language === "java" && node.type === "enhanced_for_statement") {
+      const nameNode = node.childForFieldName("name") || node.childForFieldName("variable");
+      const valueNode = node.childForFieldName("value") || node.childForFieldName("iterable");
+      const target = assignmentTarget(nodeText(nameNode, text));
+      const collection = normalizeAccessPath(nodeText(valueNode, text));
+      if (target && collection) add(OperationKind.ASSIGNMENT, valueNode, {
+        inputs: [symbol(`${collection}[*]`)],
         output: symbol(target),
-        metadata: { assignmentMode: normalizeAccessPath(nodeText(right, text)) ? "alias" : "aggregate" },
+        metadata: {
+          assignmentMode: "aggregate",
+          propagationReason: `Enhanced-for binds one element of ${collection} to ${target}.`,
+          propagationStatus: "verified",
+        },
       });
     }
     if (CALL_TYPES.has(node.type)) {
       const call = genericCall(node, text);
       call.argumentInputs = call.arguments.map(argument => expressionInputs(argument, input.language).map(symbol));
+      call.receiverInputs = genericReceiverInputs(call, input.language);
       call.argumentTypes = call.arguments.map(argument => inferExpressionType(argument, record, references));
-      call.symbol = genericCallIdentity(call, record, references, input.language);
+      attachGenericCallIdentity(call, record, references, input.language, inferredTypes);
       const output = enclosingCallOutput(node, text, input.language);
+      const collectionAccess = interpretCollectionCall(call, output, input.language, collectionStates, {
+        controlScope: input.language === "java" ? javaControlScope(node, record.node) : "",
+      });
+      if (collectionAccess.receiverInputs) call.receiverInputs = collectionAccess.receiverInputs.map(symbol);
       const modeled = genericModeledCall(call, input.language, output, input.options?.semanticModels);
+      if (output?.name && modeled?.returnType) inferredTypes.set(canonicalSymbolName(output.name), modeled.returnType);
       const operationCall = serializableGenericCall(call);
-      if (call.function) add(OperationKind.CALL, node, {
+      const representedSource = modeled?.kind === OperationKind.SOURCE || Boolean(output?.name) && operations.some(item =>
+        item.kind === OperationKind.SOURCE && item.location.startOffset === node.startIndex && item.output?.name === output.name);
+      if (call.function && !representedSource) add(OperationKind.CALL, node, {
         inputs: modeled?.kind === OperationKind.CALL ? modeled.inputs : call.argumentInputs.flat(),
         output,
         call: operationCall,
@@ -398,6 +483,27 @@ function buildOperations(record, input, lines, text, references = []) {
         certainty: modeled.certainty,
         metadata: modeled.metadata,
       });
+      const beanRead = javaBeanGetterRead(call, output, input.language);
+      if (beanRead) add(OperationKind.ASSIGNMENT, node, {
+        inputs: [symbol(beanRead.input)],
+        output: symbol(beanRead.output),
+        metadata: {
+          assignmentMode: "alias",
+          propagationReason: `${call.function}() reads JavaBean property ${beanRead.input}.`,
+          propagationStatus: "verified",
+        },
+      });
+      for (const effect of collectionAccess.writes || []) {
+        add(OperationKind.ASSIGNMENT, node, {
+          inputs: effect.inputs,
+          output: symbol(effect.output),
+          metadata: {
+            assignmentMode: "aggregate",
+            propagationReason: effect.reason,
+            propagationStatus: "verified",
+          },
+        });
+      }
     }
     if (node.type === "return_statement") add(OperationKind.RETURN, node, {
       inputs: normalizedIdentifiers(nodeText(node, text).replace(/^\s*return\b/, "")).map(symbol),
@@ -408,7 +514,7 @@ function buildOperations(record, input, lines, text, references = []) {
     if (node.type === "break_statement") add(OperationKind.BREAK, node);
     if (node.type === "continue_statement") add(OperationKind.CONTINUE, node);
     if (BRANCH_TYPES.has(node.type)) {
-      const branch = genericBranchMetadata(node, text, LOOP_TYPES.has(node.type) ? "loop" : "branch");
+      const branch = genericBranchMetadata(node, text, LOOP_TYPES.has(node.type) ? "loop" : "branch", constantValues);
       add(OperationKind.BRANCH, node, {
         inputs: normalizedIdentifiers(branch.condition).map(symbol),
         metadata: { branch },
@@ -439,7 +545,17 @@ function signalOperations(record, input, lines, text, references = []) {
     const semantic = genericSemanticValues(signal, record.node, text, input.language);
     if (!semantic.resolved && hasNestedFunctionOnLine(record.node, input.language, signal.line)) return [];
     const assignment = semantic.output ? undefined : assignmentFromLine(code, input.language);
-    const names = semantic.resolved
+    const boundParameters = signal.kind === "source" && (
+      /Framework-bound request data/i.test(signal.label || "") ||
+      /\.framework\.bound-request$/.test(signal.catalogModelId || "")
+    )
+      ? record.parameterDescriptors
+        .filter(parameter => /@(?:RequestParam|PathVariable|RequestBody|CookieValue|RequestHeader|ModelAttribute)\b/.test(parameter.raw || ""))
+        .map(parameter => parameter.name)
+      : [];
+    const names = boundParameters.length
+      ? boundParameters
+      : semantic.resolved
       ? semantic.inputs
       : signal.kind === "source" && assignment?.target ? [assignment.target] : normalizedIdentifiers(code);
     const fingerprint = `${kind}:${signal.category}:${signal.label}:${stableHash(code, 12)}`;
@@ -449,11 +565,28 @@ function signalOperations(record, input, lines, text, references = []) {
     const call = semantic.node && CALL_TYPES.has(semantic.node.type) ? genericCall(semantic.node, text) : undefined;
     if (call) {
       call.argumentInputs = call.arguments.map(argument => expressionInputs(argument, input.language).map(symbol));
+      call.receiverInputs = genericReceiverInputs(call, input.language);
       call.symbol = genericCallIdentity(call, record, references, input.language);
     }
     const expectedRole = signal.kind === "sink" ? SemanticRole.SINK :
-      ["sanitizer", "auth"].includes(signal.kind) ? SemanticRole.GUARD : undefined;
-    const modelResolution = expectedRole && call ? resolveSemanticCall(input.language, call, input.options?.semanticModels) : { status: "none" };
+      signal.kind === "source" ? SemanticRole.SOURCE :
+        ["sanitizer", "auth"].includes(signal.kind) ? SemanticRole.GUARD : undefined;
+    // A broad textual candidate can match `function exec(...)` itself.  A
+    // declaration is not a call site and must never become a sink/guard.
+    if (expectedRole && semantic.node && FUNCTION_TYPES[input.language]?.has(semantic.node.type)) return [];
+    if (expectedRole && !semantic.resolved && input.language === "php" &&
+      FUNCTION_TYPES.php?.has(record.node?.type) && record.node.startPosition?.row + 1 === signal.line &&
+      new RegExp(`\\bfunction\\s+${escapeRegExp(record.name)}\\s*\\(`, "i").test(code)) return [];
+    let modeledCall = call;
+    let modelResolution = expectedRole && modeledCall
+      ? resolveSemanticCall(input.language, modeledCall, input.options?.semanticModels, expectedRole)
+      : { status: "none" };
+    if (expectedRole && modelResolution.status === "none" && call?.receiverCall) {
+      modeledCall = call.receiverCall;
+      modeledCall.receiverInputs = genericReceiverInputs(modeledCall, input.language);
+      modeledCall.symbol = genericCallIdentity(modeledCall, record, references, input.language);
+      modelResolution = resolveSemanticCall(input.language, modeledCall, input.options?.semanticModels, expectedRole);
+    }
     const matchingModel = Boolean(expectedRole && modelResolution.model?.role === expectedRole);
     if (modelResolution.status === "rejected" && expectedRole) return [];
     if (matchingModel && ["verified", "syntax"].includes(modelResolution.status)) {
@@ -463,16 +596,38 @@ function signalOperations(record, input, lines, text, references = []) {
       signalSemantic.sinkKind = model.sinkKind;
       signalSemantic.category = model.category;
       signalSemantic.guardCapabilities = model.guardCapabilities || signalSemantic.guardCapabilities;
+      signalSemantic.applicableSinkKinds = model.applicableSinkKinds || signalSemantic.applicableSinkKinds;
     }
-    const taintArguments = matchingModel ? genericTaintArguments(modelResolution.model, call) : undefined;
-    const operationInputs = matchingModel
-      ? taintArguments.flatMap(index => call.argumentInputs[index] || []).map(value => value.name)
-      : names;
+    const contractModels = matchingModel
+      ? [modelResolution.model]
+      : modelResolution.status === "candidate" ? modelResolution.candidateModels || [] : [];
+    const taintArguments = matchingModel && modeledCall
+      ? genericTaintArguments(modelResolution.model, modeledCall)
+      : modeledCall && kind !== OperationKind.SOURCE
+        ? modeledCall.argumentInputs.map((_, index) => index)
+        : undefined;
+    const operationInputs = matchingModel && kind !== OperationKind.SOURCE
+      ? [
+        ...(modelResolution.model.taintReceiver ? modeledCall.receiverInputs || [] : []),
+        ...taintArguments.flatMap(index => modeledCall.argumentInputs[index] || []),
+      ].map(value => value.name)
+      : modeledCall && kind === OperationKind.SINK
+        ? [
+          ...(contractModels.some(model => model.taintReceiver) ? modeledCall.receiverInputs || [] : []),
+          ...modeledCall.argumentInputs.flat(),
+        ].map(value => value.name)
+        : names;
     const guardVerification = matchingModel ? modelResolution.status :
       modelResolution.status === "rejected" ? "rejected" :
         structurallyParameterizedGuard(signalSemantic.guardCapabilities, call) ? "structural" : undefined;
     const guardBinding = kind === OperationKind.GUARD
-      ? buildGenericGuardBinding(signalSemantic.guardCapabilities, semantic, call, guardVerification)
+      ? buildGenericGuardBinding(
+        signalSemantic.guardCapabilities,
+        semantic,
+        modeledCall,
+        guardVerification,
+        matchingModel ? modelResolution.model : signalSemantic,
+      )
       : undefined;
     return [operation({
       id: stableHash(`${record.symbolKey}:${fingerprint}:${occurrence}`),
@@ -485,7 +640,7 @@ function signalOperations(record, input, lines, text, references = []) {
       }),
       inputs: operationInputs.map(symbol),
       output: semantic.output ? symbol(semantic.output) : signal.kind === "source" && assignment?.target ? symbol(assignment.target) : undefined,
-      call: serializableGenericCall(call),
+      call: serializableGenericCall(modeledCall),
       semantic: signalSemantic,
       certainty: ["verified", "syntax"].includes(modelResolution.status) ? Certainty.MEDIUM :
         signal.kind === "sink" ? Certainty.LOW : semantic.resolved ? Certainty.MEDIUM : Certainty.LOW,
@@ -498,6 +653,7 @@ function signalOperations(record, input, lines, text, references = []) {
         semanticVerification: modelResolution.status === "none" ? undefined : modelResolution.status,
         modelCandidates: modelResolution.candidates || [],
         taintArguments,
+        taintReceiver: contractModels.some(model => model.taintReceiver),
         guardBinding,
       },
     })];
@@ -516,8 +672,8 @@ function hasNestedFunctionOnLine(rootNode, language, line) {
 
 function buildGlobal(signals, input, lines, references, rootNode) {
   const symbolKey = buildSymbolKey({ language: input.language, absolutePath: input.absolutePath, relativePath: input.relativePath, kind: "global", enclosingScope: "<file>", name: "global scope", parameterDescriptors: [] });
-  const record = { id: symbolId(symbolKey), symbolKey, signals, node: rootNode, parameterDescriptors: [] };
-  const operations = signalOperations(record, input, lines, lines.join("\n"), references);
+  const record = { id: symbolId(symbolKey), symbolKey, signals, node: rootNode, parameterDescriptors: [], name: "global scope" };
+  const operations = buildOperations(record, input, lines, lines.join("\n"), references);
   return functionIR({
     id: record.id,
     symbolKey,
@@ -560,49 +716,101 @@ function genericCall(node, text) {
 
 function serializableGenericCall(call) {
   if (!call) return undefined;
-  const { receiverCallNode: _frontendNode, ...serializable } = call;
-  return serializable;
+  const { receiverCallNode: _frontendNode, receiverCall, ...serializable } = call;
+  return {
+    ...serializable,
+    receiverCall: receiverCall ? serializableGenericCall(receiverCall) : undefined,
+  };
 }
 
-function genericCallIdentity(call, record, references = [], language) {
+function attachGenericCallIdentity(call, record, references, language, inferredTypes) {
+  if (call.receiverCall) attachGenericCallIdentity(call.receiverCall, record, references, language, inferredTypes);
+  call.symbol = genericCallIdentity(call, record, references, language, inferredTypes);
+}
+
+function genericCallIdentity(call, record, references = [], language, inferredTypes = new Map()) {
   const receiverRoot = String(call.receiver || "").match(/^[A-Za-z_$][\w$]*/)?.[0];
   const receiverMember = String(call.receiver || "").match(/^(?:this|self|\$this)(?:\.|->)(\$?[A-Za-z_]\w*)/)?.[1];
   const receiverNames = [call.receiver, receiverMember, receiverMember && language === "php" ? `$${receiverMember.replace(/^\$/, "")}` : receiverMember, receiverRoot].filter(Boolean);
-  const parameterType = receiverRoot && !["this", "self", "$this"].includes(receiverRoot)
+  const inferredReceiverType = receiverRoot ? inferredTypes.get(canonicalSymbolName(receiverRoot)) : undefined;
+  const javaPackage = language === "java" ? references.find(reference => reference.kind === "package")?.target : undefined;
+  const javaSpecialReceiverType = language === "java" && call.receiver === "this"
+    ? resolveDeclaredJavaType(record.enclosingScope, javaPackage, references)
+    : language === "java" && call.receiver === "super" && record.superClassType
+      ? resolveDeclaredJavaType(record.superClassType, javaPackage, references)
+      : undefined;
+  const parameterType = inferredReceiverType || (receiverRoot && !["this", "self", "$this"].includes(receiverRoot)
     ? record.parameterDescriptors?.find(parameter => canonicalSymbolName(parameter.name) === canonicalSymbolName(receiverRoot))?.type
-    : undefined;
+    : undefined) || javaSpecialReceiverType || call.receiverCall?.symbol?.receiverType;
   const sameLocal = (reference, value) => canonicalSymbolName(reference.local) === canonicalSymbolName(value);
-  const matchingReferences = references.filter(reference => receiverNames.some(name => sameLocal(reference, name)) || (!call.receiver && sameLocal(reference, call.function)));
-  const localType = matchingReferences.find(reference => reference.kind === "type");
+  const receiverReferences = references.filter(reference => receiverNames.some(name => sameLocal(reference, name)));
+  // A Java method declaration is represented in the lightweight reference table
+  // as `<method name> -> <return type>`.  That return type describes the value
+  // produced by the call, not its receiver.  Treating it as the receiver made an
+  // unqualified same-class call such as `injectableQuery(query)` look like
+  // `AttackResult.injectableQuery(query)` and caused the call resolver to reject
+  // the real local method.  Callable imports/declarations still participate in
+  // identity resolution, but type evidence must come from an actual receiver.
+  const callableReferences = !call.receiver
+    ? references.filter(reference => sameLocal(reference, call.function) && ["import", "require", "declaration"].includes(reference.kind))
+    : [];
+  const matchingReferences = [...receiverReferences, ...callableReferences];
+  const localType = receiverReferences.find(reference => reference.kind === "type");
   const declaredType = parameterType && parameterType !== "?" ? parameterType : localType?.target;
   const declaredTypeName = simpleTypeName(declaredType);
   const declaredImport = declaredTypeName ? references.find(reference => reference.kind === "import" && sameLocal(reference, declaredTypeName)) : undefined;
+  const wildcardImports = declaredTypeName
+    ? references.filter(reference => reference.kind === "import" && reference.local === "*" && String(reference.target || "").endsWith(".*"))
+    : [];
+  // A single Java wildcard import gives one deterministic package candidate for
+  // the receiver type. Multiple wildcard packages remain syntax-only because
+  // choosing one would recreate the same-name collision problem this identity
+  // layer is meant to prevent.
+  const wildcardImport = language === "java" && wildcardImports.length === 1
+    ? { ...wildcardImports[0], target: `${wildcardImports[0].target.slice(0, -2)}.${declaredTypeName}` }
+    : undefined;
+  const resolvedTypeImport = declaredImport || wildcardImport;
   const declaredTypeDeclaration = declaredTypeName ? references.find(reference => reference.kind === "declaration" && sameLocal(reference, declaredTypeName)) : undefined;
   const declaredTypeRoot = String(declaredType || "").split(".")[0];
   const qualifiedTypeImport = declaredTypeRoot && declaredTypeRoot !== declaredType
     ? references.find(reference => ["import", "require"].includes(reference.kind) && sameLocal(reference, declaredTypeRoot))
     : undefined;
   const directImport = localType ? undefined : matchingReferences.find(reference => ["import", "require"].includes(reference.kind));
-  const moduleReference = declaredImport || qualifiedTypeImport || directImport;
+  const localDeclaration = !call.receiver
+    ? matchingReferences.find(reference => reference.kind === "declaration")
+    : undefined;
+  const moduleReference = resolvedTypeImport || qualifiedTypeImport || directImport;
   const qualifiedDeclaredModule = language === "python" && String(declaredType || "").includes(".")
     ? String(declaredType).split(".").slice(0, -1).join(".")
     : undefined;
+  const implicitJavaType = language === "java"
+    ? javaLangType(declaredType || call.receiver || (call.form === "constructor" ? call.function : undefined))
+    : undefined;
+  const explicitQualifiedJavaReceiver = language === "java" && /^(?:[a-z_$][\w$]*\.)+[A-Z_$][\w$]*$/.test(String(call.receiver || ""))
+    ? String(call.receiver)
+    : undefined;
+  const implicitPhpGlobal = language === "php" && !call.receiver && !moduleReference && !localDeclaration;
   const unresolvedDeclaredType = ["java", "python"].includes(language) && declaredType && declaredType !== "?" &&
-    !moduleReference && !qualifiedDeclaredModule && !declaredTypeDeclaration && !String(declaredType).includes(".");
-  const resolvedReceiverType = declaredImport
-    ? language === "python" ? `${declaredImport.target}.${declaredTypeName}` : declaredImport.target
-    : declaredType || (call.form === "constructor" ? call.function : undefined) || call.receiver;
-  const qualifiedBase = declaredImport ? resolvedReceiverType : moduleReference?.target || resolvedReceiverType;
+    !moduleReference && !qualifiedDeclaredModule && !implicitJavaType && !declaredTypeDeclaration && !String(declaredType).includes(".");
+  const resolvedReceiverType = resolvedTypeImport
+    ? language === "python" ? `${resolvedTypeImport.target}.${declaredTypeName}` : resolvedTypeImport.target
+    : implicitJavaType || declaredType || (call.form === "constructor" ? call.function : undefined) || call.receiver;
+  const qualifiedBase = resolvedTypeImport ? resolvedReceiverType : moduleReference?.target || resolvedReceiverType;
   return {
-    kind: moduleReference ? moduleReference.kind : declaredTypeDeclaration ? "local" : unresolvedDeclaredType ? "syntax" : localType || declaredType ? "local" : "syntax",
-    moduleName: moduleReference?.target || qualifiedDeclaredModule,
+    kind: moduleReference ? moduleReference.kind : explicitQualifiedJavaReceiver ? "fully-qualified" : implicitJavaType ? "implicit-import" : implicitPhpGlobal ? "global" : declaredTypeDeclaration || localDeclaration ? "local" : unresolvedDeclaredType ? "syntax" : localType || declaredType ? "local" : "syntax",
+    moduleName: moduleReference?.target || qualifiedDeclaredModule || explicitQualifiedJavaReceiver || (implicitJavaType ? "java.lang" : undefined),
     exportName: call.function,
     qualifiedName: qualifiedBase ? `${qualifiedBase}.${call.function}` : call.function,
     receiverType: resolvedReceiverType,
     unresolvedType: Boolean(unresolvedDeclaredType),
-    shadowed: Boolean(declaredTypeDeclaration),
-    verified: Boolean(moduleReference || qualifiedDeclaredModule || declaredTypeDeclaration || (declaredType && !unresolvedDeclaredType)),
+    shadowed: Boolean(declaredTypeDeclaration || localDeclaration),
+    verified: Boolean(moduleReference || qualifiedDeclaredModule || explicitQualifiedJavaReceiver || implicitJavaType || implicitPhpGlobal || declaredTypeDeclaration || localDeclaration || (declaredType && !unresolvedDeclaredType)),
   };
+}
+
+function javaLangType(value) {
+  const name = simpleTypeName(value);
+  return JAVA_LANG_TYPES.has(name) ? `java.lang.${name}` : undefined;
 }
 
 function simpleTypeName(value) {
@@ -619,7 +827,8 @@ function callFormFromReceiver(receiverNode) {
 
 function genericModeledCall(call, language, output, semanticModels) {
   const resolution = resolveSemanticCall(language, call, semanticModels);
-  if (!["verified", "syntax"].includes(resolution.status)) return undefined;
+  const reviewSink = resolution.status === "candidate" && resolution.model?.role === SemanticRole.SINK;
+  if (!["verified", "syntax"].includes(resolution.status) && !reviewSink) return undefined;
   const model = resolution.model;
   const kind = {
     [SemanticRole.SOURCE]: OperationKind.SOURCE,
@@ -629,7 +838,10 @@ function genericModeledCall(call, language, output, semanticModels) {
   }[model.role];
   if (!kind) return undefined;
   const taintArguments = genericTaintArguments(model, call);
-  const inputs = taintArguments.flatMap(index => call.argumentInputs[index] || []);
+  const inputs = [
+    ...(model.taintReceiver ? call.receiverInputs || [] : []),
+    ...taintArguments.flatMap(index => call.argumentInputs[index] || []),
+  ];
   const guardBinding = model.role === SemanticRole.GUARD ? {
     capabilities: model.guardCapabilities || [],
     inputs: inputs.map(value => value.name),
@@ -637,26 +849,31 @@ function genericModeledCall(call, language, output, semanticModels) {
     receiver: call.receiver,
     trustedOperands: (call.argumentConstants || []).filter(Boolean),
     semanticVerification: resolution.status,
-    ...guardAssociation(model.guardCapabilities || []),
+    ...guardAssociation(model.guardCapabilities || [], model),
   } : undefined;
   return {
     kind,
+    returnType: model.returnType,
     inputs,
     output: model.returnsTaint || model.role === SemanticRole.GUARD ? output : undefined,
     semantic: {
       modelId: model.id,
       modelRole: model.role,
       sourceKind: model.sourceKind,
+      exposure: model.exposure,
       sinkKind: model.sinkKind,
       category: model.category,
       guardCapabilities: model.guardCapabilities || [],
+      applicableSinkKinds: model.applicableSinkKinds || [],
       label: model.id,
     },
-    certainty: Certainty.MEDIUM,
+    certainty: reviewSink ? Certainty.LOW : Certainty.MEDIUM,
     metadata: {
       frontend: "tree-sitter-semantic-registry",
       semanticVerification: resolution.status,
+      candidateStatus: reviewSink ? "symbol-unverified" : undefined,
       taintArguments,
+      taintReceiver: Boolean(model.taintReceiver),
       guardBinding,
     },
   };
@@ -672,6 +889,11 @@ function genericTaintArguments(model, call) {
 
 function enclosingCallOutput(node, text, language) {
   for (let parent = node.parent; parent; parent = parent.parent) {
+    // Only the outermost call expression produces the assignment target. Giving
+    // every nested receiver/argument call the same output made inner return
+    // types overwrite the real outer type (for example Path.resolve(...)
+    // becoming String because getOriginalFilename() was nested inside it).
+    if (CALL_TYPES.has(parent.type)) return undefined;
     if (ASSIGNMENT_TYPES.has(parent.type)) {
       const left = parent.childForFieldName("left") || parent.childForFieldName("name") || parent.namedChildren?.[0];
       const target = assignmentTarget(nodeText(left, text));
@@ -731,7 +953,7 @@ function semanticCandidateText(node, text, language) {
   return `${call.receiver ? `${call.receiver}${separator}` : ""}${call.function}(${directArguments.join(", ")})`;
 }
 
-function buildGenericGuardBinding(capabilities = [], semantic = {}, call, semanticVerification) {
+function buildGenericGuardBinding(capabilities = [], semantic = {}, call, semanticVerification, associationOptions = {}) {
   return {
     capabilities,
     inputs: semantic.inputs || [],
@@ -740,7 +962,7 @@ function buildGenericGuardBinding(capabilities = [], semantic = {}, call, semant
     trustedOperands: (call?.argumentConstants || []).filter(Boolean),
     semanticVerification,
     allowsBoundParameters: semanticVerification === "structural",
-    ...guardAssociation(capabilities),
+    ...guardAssociation(capabilities, associationOptions),
   };
 }
 
@@ -849,17 +1071,74 @@ function stabilizeDuplicateSymbols(records) {
   }
 }
 
-function genericBranchMetadata(node, text, controlKind = "branch") {
-  const conditionNode = node.childForFieldName("condition") || node.childForFieldName("condition_clause") || node.namedChildren?.[0];
+function genericBranchMetadata(node, text, controlKind = "branch", constantValues = new Map()) {
+  const conditionNode = node.type === "enhanced_for_statement"
+    ? node.childForFieldName("value")
+    : node.childForFieldName("condition") || node.childForFieldName("condition_clause") || node.namedChildren?.[0];
   const thenNode = node.childForFieldName("consequence") || node.childForFieldName("body");
   const elseNode = node.childForFieldName("alternative");
+  const constant = controlKind === "branch" ? constantExpressionValue(conditionNode, text, constantValues) : NO_CONSTANT;
   return {
     controlKind,
     condition: nodeText(conditionNode, text),
+    constantOutcome: typeof constant === "boolean" ? constant : undefined,
     conditionRange: treeNodeRange(conditionNode),
     thenRange: treeNodeRange(thenNode),
     elseRange: treeNodeRange(elseNode),
   };
+}
+
+const NO_CONSTANT = Symbol("no-constant");
+
+function constantExpressionValue(node, text, constants = new Map()) {
+  if (!node) return NO_CONSTANT;
+  const children = node.namedChildren || [];
+  if (["parenthesized_expression", "condition_clause"].includes(node.type) && children.length === 1) {
+    return constantExpressionValue(children[0], text, constants);
+  }
+  const source = nodeText(node, text).trim();
+  if (/^(?:true|false)$/.test(source)) return source === "true";
+  if (/^null$/.test(source)) return null;
+  if (/^[+-]?\d+$/.test(source)) return Number(source);
+  if (/^[A-Za-z_$][\w$]*$/.test(source)) return constants.has(source) ? constants.get(source) : NO_CONSTANT;
+  if (/^(?:string_literal|character_literal)$/.test(node.type)) return source.slice(1, -1);
+  if (/^(?:unary_expression)$/.test(node.type) && children.length === 1) {
+    const value = constantExpressionValue(children[0], text, constants);
+    if (value === NO_CONSTANT) return NO_CONSTANT;
+    const operator = source.slice(0, source.indexOf(nodeText(children[0], text))).trim();
+    if (operator === "!" && typeof value === "boolean") return !value;
+    if (operator === "+" && typeof value === "number") return value;
+    if (operator === "-" && typeof value === "number") return -value;
+    return NO_CONSTANT;
+  }
+  if (children.length !== 2 || !/(?:binary_expression|infix_expression)$/.test(node.type)) return NO_CONSTANT;
+  const left = constantExpressionValue(children[0], text, constants);
+  const right = constantExpressionValue(children[1], text, constants);
+  if (left === NO_CONSTANT || right === NO_CONSTANT) return NO_CONSTANT;
+  const operator = String(text).slice(children[0].endIndex, children[1].startIndex).trim();
+  switch (operator) {
+    case "+": return typeof left === "number" && typeof right === "number" ? left + right : NO_CONSTANT;
+    case "-": return typeof left === "number" && typeof right === "number" ? left - right : NO_CONSTANT;
+    case "*": return typeof left === "number" && typeof right === "number" ? left * right : NO_CONSTANT;
+    case "/": return typeof left === "number" && typeof right === "number" && right !== 0 ? Math.trunc(left / right) : NO_CONSTANT;
+    case "%": return typeof left === "number" && typeof right === "number" && right !== 0 ? left % right : NO_CONSTANT;
+    case ">": return left > right;
+    case ">=": return left >= right;
+    case "<": return left < right;
+    case "<=": return left <= right;
+    case "==": case "===": return left === right;
+    case "!=": case "!==": return left !== right;
+    case "&&": return typeof left === "boolean" && typeof right === "boolean" ? left && right : NO_CONSTANT;
+    case "||": return typeof left === "boolean" && typeof right === "boolean" ? left || right : NO_CONSTANT;
+    default: return NO_CONSTANT;
+  }
+}
+
+function hasBranchAncestor(node, boundary) {
+  for (let parent = node.parent; parent && parent !== boundary; parent = parent.parent) {
+    if (BRANCH_TYPES.has(parent.type) || LOOP_TYPES.has(parent.type)) return true;
+  }
+  return false;
 }
 
 function genericTryMetadata(node, text) {
@@ -886,14 +1165,19 @@ function javaEnclosingTypeInfo(node, text) {
   const relationNodes = (typeNode.namedChildren || []).filter(child =>
     /(?:superclass|super_interfaces|extends_interfaces|type_list)/.test(child.type));
   const implementedTypes = relationNodes.flatMap(child => javaRelationTypes(nodeText(child, text)));
+  const superClassType = javaRelationTypes(nodeText(relationNodes.find(child => child.type === "superclass"), text))[0];
   return {
     declarationKind: typeNode.type.replace(/_declaration$/, ""),
     implementedTypes: [...new Set(implementedTypes)],
+    superClassType,
   };
 }
 
-function javaTypeRelations(root, text, references) {
+function javaTypeRelations(root, text, references, input = {}) {
   const packageName = references.find(reference => reference.kind === "package")?.target;
+  const hasBeanPatternCandidate = references.some(reference => reference.kind === "import" &&
+    /^(?:jakarta|javax)\.validation\.constraints\.(?:Pattern|\*)$/.test(reference.target || "")) ||
+    /@(?:jakarta|javax)\.validation\.constraints\.Pattern\b/.test(text);
   const relations = [];
   const visit = node => {
     if (["class_declaration", "interface_declaration", "record_declaration", "enum_declaration"].includes(node.type)) {
@@ -907,6 +1191,7 @@ function javaTypeRelations(root, text, references) {
           language: "java",
           type: packageName ? `${packageName}.${name}` : name,
           extends: [...new Set(directTypes.map(type => resolveDeclaredJavaType(type, packageName, references)).filter(Boolean))],
+          validationConstraints: hasBeanPatternCandidate ? javaBeanValidationConstraints(node, text, input, references) : [],
         });
       }
     }
@@ -914,6 +1199,81 @@ function javaTypeRelations(root, text, references) {
   };
   visit(root);
   return relations;
+}
+
+function javaParameterAnnotationNames(raw) {
+  return [...String(raw || "").matchAll(/@(?:[A-Za-z_$][\w$]*\.)*([A-Za-z_$][\w$]*)\b/g)]
+    .map(match => match[1]);
+}
+
+function javaBeanValidationConstraints(typeNode, text, input = {}, references = []) {
+  const constraints = [];
+  const body = typeNode.childForFieldName("body") || (typeNode.namedChildren || []).find(child => child.type === "class_body");
+  const fields = (body?.namedChildren || []).filter(child => child.type === "field_declaration");
+  const typeGeneratesGetters = javaAnnotations(typeNode, text).some(annotation => isLombokGetterAnnotation(annotation, references));
+  const declaredMethods = new Set((body?.namedChildren || [])
+    .filter(child => child.type === "method_declaration")
+    .map(method => nodeText(method.childForFieldName("name"), text))
+    .filter(Boolean));
+  const generatedPureAccessors = fields.flatMap(field => {
+    const fieldGeneratesGetter = typeGeneratesGetters || javaAnnotations(field, text).some(annotation =>
+      annotation.name === "Getter" && annotationTarget(annotation, references) === "lombok.Getter");
+    if (!fieldGeneratesGetter) return [];
+    return (field.namedChildren || []).filter(child => child.type === "variable_declarator")
+      .map(declarator => nodeText(declarator.childForFieldName("name"), text))
+      .filter(Boolean)
+      .map(property => `get${property[0]?.toUpperCase() || ""}${property.slice(1)}`)
+      .filter(accessor => !declaredMethods.has(accessor));
+  });
+  for (const field of fields) {
+    const patterns = javaAnnotations(field, text).filter(annotation => annotation.name === "Pattern" &&
+      /^(?:jakarta|javax)\.validation\.constraints\.Pattern$/.test(annotationTarget(annotation, references) || ""));
+    if (!patterns.length) continue;
+    const names = (field.namedChildren || [])
+      .filter(child => child.type === "variable_declarator")
+      .map(declarator => nodeText(declarator.childForFieldName("name"), text))
+      .filter(Boolean);
+    for (const property of names) for (const annotation of patterns) {
+      constraints.push({
+        kind: "PATTERN",
+        property,
+        accessor: `get${property[0]?.toUpperCase() || ""}${property.slice(1)}`,
+        regexp: javaAnnotationStringAttribute(annotation.raw, "regexp"),
+        annotation: annotation.raw,
+        defaultValidationGroup: !/\bgroups\s*=/.test(annotation.raw),
+        generatedPureAccessors,
+        verification: "syntax-only",
+        location: {
+          absolutePath: input.absolutePath,
+          relativePath: input.relativePath,
+          ...treeSourceLocation(annotation.node),
+        },
+      });
+    }
+  }
+  return constraints;
+}
+
+function isLombokGetterAnnotation(annotation, references) {
+  if (!["Getter", "Data", "Value"].includes(annotation.name)) return false;
+  return annotationTarget(annotation, references) === `lombok.${annotation.name}`;
+}
+
+function annotationTarget(annotation, references) {
+  const qualified = String(annotation.raw || "").match(/^@([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+)/)?.[1];
+  if (qualified?.includes(".")) return qualified;
+  const explicit = references.find(reference => reference.kind === "import" && reference.local === annotation.name);
+  if (explicit) return explicit.target;
+  const wildcard = references.filter(reference => reference.kind === "import" && reference.local === "*" && reference.target.endsWith(".*"))
+    .map(reference => `${reference.target.slice(0, -2)}.${annotation.name}`)
+    .filter(target => /^(?:(?:jakarta|javax)\.validation\.constraints|lombok)\./.test(target));
+  return wildcard.length === 1 ? wildcard[0] : undefined;
+}
+
+function javaAnnotationStringAttribute(raw, attribute) {
+  const match = new RegExp(`\\b${attribute}\\s*=\\s*(\"(?:\\\\.|[^\"\\\\])*\")`).exec(String(raw || ""));
+  if (!match) return undefined;
+  try { return JSON.parse(match[1]); } catch { return match[1].slice(1, -1); }
 }
 
 function javaRelationTypes(value) {
@@ -1001,6 +1361,36 @@ function phpFrameworkEntries(records, text) {
         framework: "php-route",
         language: "php",
       }, record, treeSourceLocation(attribute)));
+    }
+  }
+  return dedupeFrameworkEntries(entries);
+}
+
+function pythonFrameworkEntries(records, text) {
+  const entries = [];
+  for (const record of records) {
+    if (record.node.type !== "function_definition") continue;
+    const decorated = record.node.parent?.type === "decorated_definition" ? record.node.parent : undefined;
+    if (!decorated) continue;
+    const decorators = (decorated.namedChildren || []).filter(child => child.type === "decorator");
+    for (const decorator of decorators) {
+      const raw = nodeText(decorator, text);
+      const match = raw.match(/^\s*@\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\.(get|post|put|delete|patch|options|head|websocket|route|api_route)\s*\(([\s\S]*)\)\s*$/i);
+      if (!match) continue;
+      const receiver = match[1].split(".").at(-1).toLowerCase();
+      if (!/(?:app|router|blueprint|bp)$/.test(receiver)) continue;
+      const methodName = match[2].replace("_", "").toLowerCase();
+      const methodsText = match[3].match(/methods\s*=\s*\[([\s\S]*?)\]/i)?.[1] || "";
+      const methods = stringLiterals(methodsText).map(method => method.toUpperCase());
+      const method = methodName === "route" || methodName === "apiroute"
+        ? methods.length ? [...new Set(methods)].join("|") : "ANY"
+        : methodName === "websocket" ? "WEBSOCKET" : methodName.toUpperCase();
+      entries.push(frameworkEntry({
+        method,
+        route: stringLiterals(match[3])[0] || "<dynamic>",
+        framework: methodName === "route" ? "flask" : "fastapi",
+        language: "python",
+      }, record, treeSourceLocation(decorator)));
     }
   }
   return dedupeFrameworkEntries(entries);
@@ -1140,37 +1530,46 @@ function assignSignals(records, signals, lines) {
 
 function nodeText(node, text) { return node ? String(node.text ?? String(text).slice(node.startIndex, node.endIndex)) : ""; }
 function normalizedIdentifiers(value) { return extractIdentifiers(value).map(name => normalizeAccessPath(name) || name); }
-function expressionInputs(value, language) {
-  if (language === "php") {
-    return [...new Set([...normalizedIdentifiers(value), ...[...String(value || "").matchAll(/\$[A-Za-z_]\w*/g)].map(match => match[0])])];
-  }
-  if (language === "python") {
-    const source = String(value || "");
-    const paths = [...source.matchAll(/\b[A-Za-z_]\w*(?:(?:\.[A-Za-z_]\w*)|\[\s*(?:\d+|["'][^"']+["'])\s*\])+/g)]
-      .filter(match => !/^\s*\(/.test(source.slice(match.index + match[0].length)))
-      .map(match => normalizeAccessPath(match[0]))
-      .filter(Boolean);
-    const identifiers = normalizedIdentifiers(source).filter(identifier =>
-      !paths.some(path => path === identifier || path.startsWith(`${identifier}.`) || path.startsWith(`${identifier}[`)));
-    return [...new Set([...paths, ...identifiers])];
-  }
-  if (language !== "java") return normalizedIdentifiers(value);
-  const accessPaths = [];
-  const source = String(value || "");
-  for (const match of source.matchAll(/\b([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\.(?:get|is)([A-Z][A-Za-z0-9_$]*)\s*\(\s*\)/g)) {
-    const property = javaBeanProperty(match[2]);
-    const path = normalizeAccessPath(`${match[1]}.${property}`);
-    if (path) accessPaths.push(path);
-  }
-  const identifiers = normalizedIdentifiers(source).filter(identifier =>
-    !accessPaths.some(path => path === identifier || path.startsWith(`${identifier}.`)) &&
-    !/^get[A-Z]|^is[A-Z]/.test(identifier));
-  return [...new Set([...accessPaths, ...identifiers])];
+function genericReceiverInputs(call, language) {
+  if (call?.receiverCall) return (call.receiverCall.argumentInputs || []).flat();
+  return expressionInputs(call?.receiver || "", language).map(symbol);
 }
 
-function javaBeanProperty(value) {
-  return /^[A-Z]{2}/.test(value) ? value : value.charAt(0).toLowerCase() + value.slice(1);
+function assignmentExpressionInputs(right, text, language) {
+  const source = nodeText(right, text);
+  const callRanges = [];
+  const visit = node => {
+    if (CALL_TYPES.has(node.type)) {
+      callRanges.push([node.startIndex - right.startIndex, node.endIndex - right.startIndex]);
+      return;
+    }
+    for (const child of node.namedChildren || []) visit(child);
+  };
+  visit(right);
+  if (!callRanges.length) return expressionInputs(source, language);
+  const outsideCalls = [...source];
+  for (const [start, end] of callRanges) {
+    for (let index = Math.max(0, start); index < Math.min(outsideCalls.length, end); index += 1) outsideCalls[index] = " ";
+  }
+  return expressionInputs(outsideCalls.join(""), language);
 }
+
+function javaControlScope(node, boundary) {
+  const parts = [];
+  for (let parent = node?.parent; parent && parent !== boundary; parent = parent.parent) {
+    if (!BRANCH_TYPES.has(parent.type) && !LOOP_TYPES.has(parent.type)) continue;
+    const thenNode = parent.childForFieldName("consequence") || parent.childForFieldName("body");
+    const elseNode = parent.childForFieldName("alternative");
+    const arm = containsTreeNode(elseNode, node) ? "else" : containsTreeNode(thenNode, node) ? "then" : "condition";
+    parts.push(`${parent.startIndex}:${arm}`);
+  }
+  return parts.reverse().join("/");
+}
+
+function containsTreeNode(container, node) {
+  return Boolean(container && node && container.startIndex <= node.startIndex && container.endIndex >= node.endIndex);
+}
+function escapeRegExp(value) { return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 function stripParens(value) { return String(value || "").trim().replace(/^\(/, "").replace(/\)$/, ""); }
 function signalKey(signal) { return [signal.kind, signal.category, signal.line, signal.label].join(":"); }
 module.exports = { TreeSitterLanguageFrontend, collectFunctions };

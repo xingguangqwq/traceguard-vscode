@@ -36,6 +36,8 @@ function extractFileReferences(lines, language) {
     if (language === "python") {
       const declaration = code.match(/^(?:async\s+)?class\s+([A-Za-z_]\w*)/);
       if (declaration) add(declaration[1], declaration[1], "declaration");
+      const functionDeclaration = String(rawLine).match(/^(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(/);
+      if (functionDeclaration) add(functionDeclaration[1], functionDeclaration[1], "declaration");
       const fromImport = code.match(/^from\s+([\w.]+)\s+import\s+(.+)$/);
       if (fromImport) {
         for (const part of splitArguments(fromImport[2])) {
@@ -82,6 +84,8 @@ function extractFileReferences(lines, language) {
     if (language === "php") {
       const declaration = code.match(/^(?:(?:abstract|final|readonly)\s+)*(?:class|interface|trait|enum)\s+([A-Za-z_]\w*)/i);
       if (declaration) add(declaration[1], declaration[1], "declaration");
+      const functionDeclaration = String(rawLine).match(/^(?:(?:public|protected|private|static|final|abstract)\s+)*function\s+&?\s*([A-Za-z_]\w*)\s*\(/i);
+      if (functionDeclaration) add(functionDeclaration[1], functionDeclaration[1], "declaration");
       const imported = code.match(/^use\s+([^;]+);/i);
       if (imported) for (const binding of parsePhpUseBindings(imported[1])) add(binding.local, binding.target);
       const namespaceDeclaration = code.match(/^(?:<\?php\s*)?namespace\s+([^;]+);/i);

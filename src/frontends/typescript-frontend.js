@@ -4,14 +4,14 @@ const ts = require("typescript");
 const { buildSymbolKey, parameterDescriptors, stableHash, symbolId } = require("../identity");
 const { appendAccessPath: appendIRAccessPath, normalizeAccessPath } = require("../ir/access-path");
 const { Certainty, OperationKind, ParameterRole, fileIR, functionIR, location, operation, symbol } = require("../ir/schema");
-const { GuardCapability, guardAssociation, semanticForSignal } = require("../security/semantics");
+const { GuardCapability, SinkKind, guardAssociation, semanticForSignal } = require("../security/semantics");
 const { buildOperationCFG, compareOperations } = require("../dataflow/cfg");
 const { collectSignals, findEntries } = require("./pattern-parser");
 const { extractAssignment, extractIdentifiers } = require("./syntax-tools");
 const { runtime } = require("./tree-sitter-runtime");
 const { createCompilerModel, scriptKindFor } = require("./typescript-compiler");
 const { classifyFrameworkCall, frameworkEntry, frameworkParameterRoles, inferParameterRoles, mergeFrameworkEntries } = require("./framework-entries");
-const { resolveSemanticCall, SemanticRole } = require("../security/semantic-models");
+const { resolveSemanticCall, SemanticRole } = require("../security/catalog");
 
 const TREE_FUNCTION_TYPES = new Set([
   "function_declaration", "function_expression", "arrow_function", "method_definition",
@@ -69,10 +69,12 @@ class TypeScriptAstFrontend {
     const treeFunctionCount = countTreeFunctions(treeResult.tree.rootNode);
     const compilerDiagnostics = compiler.sourceFile.parseDiagnostics?.length || 0;
     const treeHasErrors = Boolean(treeResult.tree.rootNode.hasError);
-    const degraded = treeHasErrors || compilerDiagnostics > 0;
+    const syntaxOnly = Boolean(compiler.syntaxOnly);
+    const degraded = treeHasErrors || compilerDiagnostics > 0 || syntaxOnly;
     const degradedReasons = [
       ...(treeHasErrors ? ["Tree-sitter recovered from syntax errors."] : []),
       ...(compilerDiagnostics ? [`TypeScript Compiler API reported ${compilerDiagnostics} parse diagnostic(s).`] : []),
+      ...(syntaxOnly ? ["This standalone JavaScript file has syntax-level semantics; unresolved receiver and type evidence remains heuristic."] : []),
     ];
     const frontend = {
       id: this.id,
@@ -88,6 +90,7 @@ class TypeScriptAstFrontend {
       compilerProjectFiles: compiler.projectFileCount || 1,
       compilerProjectGeneration: compiler.projectGeneration || 0,
       compilerStandardLibrary: Boolean(compiler.standardLibrary),
+      compilerSemanticMode: syntaxOnly ? "syntax-only" : "type-aware",
       degraded,
       degradedReason: degradedReasons.join(" ") || undefined,
     };
@@ -111,6 +114,7 @@ class TypeScriptAstFrontend {
           parameterRoles: entry.parameterRoles || fn?.parameters.map(parameter => parameter.role || "unknown") || [],
           framework: entry.framework,
           handlerIndex: entry.handlerIndex,
+          handler: entry.handler,
           location: location({ ...input, ...entry, code: lines[entry.line - 1] }),
         };
       }),
@@ -131,7 +135,9 @@ function typescriptFrameworkEntries(compiler, records, input) {
           for (const handler of handlerNodes(argument)) {
             const record = handlerRecord(records, handler, handler?.getText(sourceFile), compiler);
             if (!record && !handler) continue;
-            entries.push(frameworkEntry({ ...classification, handlerIndex, language: input.language }, record, tsSourceLocation(node, sourceFile)));
+            const entry = frameworkEntry({ ...classification, handlerIndex, language: input.language }, record, tsSourceLocation(node, sourceFile));
+            if (!record) entry.handler = commonJsInstanceHandler(handler, sourceFile, input.language);
+            entries.push(entry);
           }
         }
       }
@@ -168,6 +174,11 @@ function handlerRecord(records, handlerNode, handlerText, compiler) {
 
 function resolvedFunctionNode(node, checker) {
   if (!node || !checker) return undefined;
+  if (ts.isCallExpression(node)) {
+    const factory = resolvedFunctionNode(node.expression, checker);
+    const returned = returnedHandlerNode(factory, checker);
+    if (returned) return returned;
+  }
   const target = ts.isPropertyAccessExpression(node) ? node.name : node;
   let targetSymbol;
   try { targetSymbol = checker.getSymbolAtLocation(target); } catch { return undefined; }
@@ -181,6 +192,56 @@ function resolvedFunctionNode(node, checker) {
     if (ts.isPropertyAssignment(declaration) && isFunctionNode(declaration.initializer)) return declaration.initializer;
   }
   return undefined;
+}
+
+function returnedHandlerNode(factory, checker) {
+  if (!factory || !isFunctionNode(factory) || !factory.body) return undefined;
+  const candidates = [];
+  const visit = node => {
+    if (node !== factory && isFunctionNode(node)) return;
+    if (ts.isReturnStatement(node) && node.expression) {
+      const expression = unwrapParenthesizedExpression(node.expression);
+      if (isFunctionNode(expression)) candidates.push(expression);
+      else if (ts.isIdentifier(expression) || ts.isPropertyAccessExpression(expression)) {
+        const resolved = resolvedFunctionNode(expression, checker);
+        if (resolved) candidates.push(resolved);
+      }
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(factory.body);
+  const unique = [...new Set(candidates)];
+  return unique.length === 1 ? unique[0] : undefined;
+}
+
+function unwrapParenthesizedExpression(node) {
+  let current = node;
+  while (current && ts.isParenthesizedExpression(current)) current = current.expression;
+  return current;
+}
+
+function commonJsInstanceHandler(node, sourceFile, language) {
+  if (!ts.isPropertyAccessExpression(node) || !ts.isIdentifier(node.expression)) return undefined;
+  const instanceName = node.expression.text;
+  let constructorName;
+  const visit = current => {
+    if (constructorName) return;
+    if (ts.isVariableDeclaration(current) && ts.isIdentifier(current.name) && current.name.text === instanceName &&
+        current.initializer && ts.isNewExpression(current.initializer) && ts.isIdentifier(current.initializer.expression)) {
+      constructorName = current.initializer.expression.text;
+      return;
+    }
+    ts.forEachChild(current, visit);
+  };
+  visit(sourceFile);
+  if (!constructorName) return undefined;
+  return {
+    language,
+    className: constructorName,
+    targetType: constructorName,
+    functionName: node.name.text,
+  };
 }
 
 function tsSourceLocation(node, sourceFile) {
@@ -242,6 +303,28 @@ function assignClosureMetadata(records, compiler) {
 function closureRecordsForCall(call, parent, records) {
   return records.filter(candidate => candidate.closureParentId === parent.id &&
     call.arguments.some(argument => containsNode(argument, candidate.node)));
+}
+
+function invokedClosureRecord(call, parent, records) {
+  if (!ts.isIdentifier(call.expression)) return undefined;
+  const lexical = records.filter(candidate => candidate.closureParentId === parent.id && candidate.name === call.expression.text);
+  return lexical.length === 1 ? lexical[0] : undefined;
+}
+
+function attachClosureCaptureArguments(call, closure) {
+  if (!closure) return;
+  call.argumentTypes ||= [];
+  const explicitCount = closure.parameterDescriptors.length;
+  while (call.arguments.length < explicitCount) call.arguments.push("");
+  while (call.argumentInputs.length < explicitCount) call.argumentInputs.push([]);
+  while (call.argumentTypes.length < explicitCount) call.argumentTypes.push("?");
+  for (const capture of closure.captures || []) {
+    call.arguments.push(capture.name);
+    call.argumentInputs.push([symbol(capture.name, capture.type, ParameterRole.CAPTURE, { captured: true })]);
+    call.argumentTypes.push(capture.type || "?");
+  }
+  call.targetFunctionId = closure.id;
+  call.closure = true;
 }
 
 function describeFunction(node, compiler, input) {
@@ -440,11 +523,13 @@ function operationsFor(record, compiler, input, lines, records = []) {
     }
     if (ts.isCallExpression(node)) {
       const call = callDetails(node, compiler.sourceFile, compiler.checker);
+      const invokedClosure = invokedClosureRecord(node, record, records);
+      attachClosureCaptureArguments(call, invokedClosure);
       call.output = callOutput(node, compiler.sourceFile);
       const modeled = modeledCallOperation(call, input.language, input.options?.semanticModels);
       const collectionWrites = collectionWriteEffects(node, compiler.sourceFile, compiler.checker);
       add(OperationKind.CALL, node, {
-        inputs: modeled?.kind === OperationKind.CALL ? modeled.inputs : node.arguments.flatMap(argument => symbolsFromNode(argument, compiler.sourceFile, compiler.checker)),
+        inputs: modeled?.kind === OperationKind.CALL ? modeled.inputs : call.argumentInputs.flat(),
         output: call.output,
         call,
         semantic: modeled?.kind === OperationKind.CALL ? modeled.semantic : undefined,
@@ -452,6 +537,11 @@ function operationsFor(record, compiler, input, lines, records = []) {
         metadata: {
           ...(modeled?.kind === OperationKind.CALL ? modeled.metadata : {}),
           receiverPropagation: collectionWrites.length ? "precise" : undefined,
+          ...(invokedClosure ? {
+            closure: true,
+            propagationReason: `The invocation passes captured values ${(invokedClosure.captures || []).map(capture => capture.name).join(", ") || "<none>"} to the named closure.`,
+            propagationStatus: "verified",
+          } : {}),
         },
       });
       for (const closure of closureRecordsForCall(node, record, records)) {
@@ -495,7 +585,7 @@ function operationsFor(record, compiler, input, lines, records = []) {
         metadata: modeled.metadata,
       });
     }
-    if (ts.isReturnStatement(node)) add(OperationKind.RETURN, node, { inputs: symbolsFromNode(node.expression, compiler.sourceFile, compiler.checker) });
+    if (ts.isReturnStatement(node)) add(OperationKind.RETURN, node, { inputs: expressionValueInputs(node.expression, compiler.sourceFile, compiler.checker) });
     if (ts.isThrowStatement(node)) add(OperationKind.THROW, node, { inputs: symbolsFromNode(node.expression, compiler.sourceFile, compiler.checker) });
     if (ts.isBreakStatement(node)) add(OperationKind.BREAK, node);
     if (ts.isContinueStatement(node)) add(OperationKind.CONTINUE, node);
@@ -513,6 +603,15 @@ function operationsFor(record, compiler, input, lines, records = []) {
     });
     ts.forEachChild(node, visit);
   };
+  if (ts.isArrowFunction(record.node) && !ts.isBlock(record.node.body)) {
+    add(OperationKind.RETURN, record.node.body, {
+      inputs: expressionValueInputs(record.node.body, compiler.sourceFile, compiler.checker),
+      metadata: {
+        propagationReason: "A concise arrow body returns its expression value.",
+        propagationStatus: "verified",
+      },
+    });
+  }
   visit(record.node.body);
   return result.sort(compareOperations);
 }
@@ -525,32 +624,50 @@ function signalOperations(signals, symbolKey, functionId, input, lines, compiler
     const call = semantic.node && ts.isCallExpression(semantic.node)
       ? callDetails(semantic.node, compiler.sourceFile, compiler.checker)
       : undefined;
-    const modelResolution = call && ["sink", "sanitizer", "auth"].includes(signal.kind)
-      ? resolveSemanticCall(input.language, call, input.options?.semanticModels)
-      : { status: "none" };
-    if (modelResolution.status === "rejected") return [];
     const expectedRole = signal.kind === "sink" ? SemanticRole.SINK :
       ["sanitizer", "auth"].includes(signal.kind) ? SemanticRole.GUARD : undefined;
+    const modelResolution = call && ["sink", "sanitizer", "auth"].includes(signal.kind)
+      ? resolveSemanticCall(input.language, call, input.options?.semanticModels, expectedRole)
+      : { status: "none" };
+    if (modelResolution.status === "rejected") return [];
     const matchingModel = modelResolution.model?.role === expectedRole;
-    if (matchingModel && ["verified", "syntax"].includes(modelResolution.status)) return [];
+    // One call may be both a propagator and a guard (for example path.normalize).
+    // Signal operations are added before AST call operations and the shared
+    // operation key de-duplicates a real guard-only call. Only sinks can safely
+    // defer to the direct modeled call here.
+    if (signal.kind === "sink" && matchingModel && ["verified", "syntax"].includes(modelResolution.status)) return [];
     const signalResolution = matchingModel || modelResolution.status === "candidate"
       ? modelResolution
       : { status: "none", candidates: [] };
     if (!semantic.resolved && looksLikeFunctionDeclaration(code, input.language)) return [];
     const assignment = semantic.output ? undefined : extractAssignment(code);
     const kind = signal.kind === "source" ? OperationKind.SOURCE : signal.kind === "sink" ? OperationKind.SINK : OperationKind.GUARD;
-    const signalInput = semantic.resolved
+    const candidateModels = signalResolution.status === "candidate" ? signalResolution.candidateModels || [] : [];
+    const candidateInputs = call && kind === OperationKind.SINK
+      ? [
+        ...(candidateModels.some(model => model.taintReceiver) ? call.receiverInputs || [] : []),
+        ...(call.argumentInputs || []).flat(),
+      ].map(value => value.name)
+      : undefined;
+    const signalInput = candidateInputs || (semantic.resolved
       ? semantic.inputs
-      : signal.kind === "source" && assignment?.target ? [assignment.target] : extractIdentifiers(code);
+      : signal.kind === "source" && assignment?.target ? [assignment.target] : extractIdentifiers(code));
     const fingerprint = `${kind}:${signal.category}:${signal.label}:${stableHash(code, 12)}`;
     const occurrence = occurrences.get(fingerprint) || 0;
     occurrences.set(fingerprint, occurrence + 1);
     const signalSemantic = semanticForSignal(signal);
+    if (kind === OperationKind.SINK && structurallyParameterizedSqlCall(signalSemantic, call)) return [];
     const guardVerification = structurallyParameterizedGuard(signalSemantic.guardCapabilities, call)
       ? "structural"
       : signalResolution.status;
     const guardBinding = kind === OperationKind.GUARD
-      ? buildGuardBinding(signalSemantic.guardCapabilities, semantic, call, guardVerification)
+      ? buildGuardBinding(
+        signalSemantic.guardCapabilities,
+        semantic,
+        call,
+        guardVerification,
+        matchingModel ? modelResolution.model : signalSemantic,
+      )
       : undefined;
     return [operation({
       id: stableHash(`${symbolKey}:${fingerprint}:${occurrence}`),
@@ -572,15 +689,26 @@ function signalOperations(signals, symbolKey, functionId, input, lines, compiler
         frontend: "ast-pattern-candidate",
         candidateStatus: signalResolution.status === "candidate" ? "symbol-unverified" : semantic.resolved ? "ast-validated" : "unverified",
         modelCandidates: signalResolution.candidates || [],
+        taintArguments: call && kind !== OperationKind.SOURCE ? call.argumentInputs.map((_, index) => index) : undefined,
+        taintReceiver: candidateModels.some(model => model.taintReceiver),
         guardBinding,
       },
     })];
   });
 }
 
+function structurallyParameterizedSqlCall(semantic, call) {
+  if (semantic?.sinkKind !== SinkKind.SQL_QUERY || !call || !["query", "execute"].includes(String(call.function || ""))) return false;
+  const sql = String(call.arguments?.[0] || "").trim();
+  const options = String(call.arguments?.[1] || "");
+  if (!sql || /\$\{[^}]+\}/.test(sql) || !/\b(?:replacements|bind)\s*:/.test(options)) return false;
+  return /\?|:\w+\b|\$\d+\b/.test(sql);
+}
+
 function modeledCallOperation(call, language, semanticModels) {
   const resolution = resolveSemanticCall(language, call, semanticModels);
-  if (!["verified", "syntax"].includes(resolution.status)) return undefined;
+  const reviewSink = resolution.status === "candidate" && resolution.model?.role === SemanticRole.SINK;
+  if (!["verified", "syntax"].includes(resolution.status) && !reviewSink) return undefined;
   const model = resolution.model;
   const kind = {
     [SemanticRole.SOURCE]: OperationKind.SOURCE,
@@ -596,8 +724,10 @@ function modeledCallOperation(call, language, semanticModels) {
     modelRole: model.role,
     sinkKind: model.sinkKind,
     sourceKind: model.sourceKind,
+    exposure: model.exposure,
     category: model.category,
     guardCapabilities: model.guardCapabilities || [],
+    applicableSinkKinds: model.applicableSinkKinds || [],
     label: model.id,
   };
   const guardBinding = model.role === SemanticRole.GUARD ? {
@@ -607,17 +737,18 @@ function modeledCallOperation(call, language, semanticModels) {
     receiver: call.receiver,
     trustedOperands: (call.argumentConstants || []).filter(Boolean),
     semanticVerification: resolution.status,
-    ...guardAssociation(model.guardCapabilities || []),
+    ...guardAssociation(model.guardCapabilities || [], model),
   } : undefined;
   return {
     kind,
     inputs,
     output: model.returnsTaint || model.role === SemanticRole.GUARD ? call.output : undefined,
     semantic,
-    certainty: resolution.status === "verified" ? Certainty.HIGH : Certainty.MEDIUM,
+    certainty: resolution.status === "verified" ? Certainty.HIGH : reviewSink ? Certainty.LOW : Certainty.MEDIUM,
     metadata: {
       frontend: "typescript-semantic-registry",
       semanticVerification: resolution.status,
+      candidateStatus: reviewSink ? "symbol-unverified" : undefined,
       taintArguments,
       callForms: model.callForms,
       applicableSinkKinds: model.applicableSinkKinds || [],
@@ -655,8 +786,9 @@ function semanticValues(signal, rootNode, sourceFile, language) {
     ts.forEachChild(node, visit);
   };
   visit(rootNode);
-  const node = candidates.sort((left, right) =>
-    Number(ts.isCallExpression(right)) - Number(ts.isCallExpression(left)) || left.getWidth(sourceFile) - right.getWidth(sourceFile),
+  const node = candidates.sort((left, right) => signal.kind === "source"
+    ? Number(ts.isCallExpression(left)) - Number(ts.isCallExpression(right)) || right.getWidth(sourceFile) - left.getWidth(sourceFile)
+    : Number(ts.isCallExpression(right)) - Number(ts.isCallExpression(left)) || left.getWidth(sourceFile) - right.getWidth(sourceFile),
   )[0];
   if (!node) return { inputs: [], resolved: false };
   if (signal.kind === "sink" || signal.kind === "sanitizer" || signal.kind === "auth") {
@@ -669,13 +801,23 @@ function semanticValues(signal, rootNode, sourceFile, language) {
     const output = signal.kind === "sanitizer" ? enclosingAssignmentOutputs(node, sourceFile)[0] : undefined;
     return { inputs: values.map(value => value.name), output, resolved: true, node };
   }
-  const output = enclosingAssignmentOutputs(node, sourceFile)[0];
+  const output = enclosingDirectSourceAssignmentOutputs(node, sourceFile)[0] || accessPathText(node, sourceFile);
   return {
     inputs: output ? [output] : symbolsFromNode(node, sourceFile).map(value => value.name),
     output,
     resolved: true,
     node,
   };
+}
+
+function enclosingDirectSourceAssignmentOutputs(node, sourceFile) {
+  for (let parent = node.parent; parent; parent = parent.parent) {
+    if (ts.isCallExpression(parent)) return [];
+    if (ts.isVariableDeclaration(parent) && parent.initializer && containsNode(parent.initializer, node)) return bindingNames(parent.name, sourceFile);
+    if (ts.isBinaryExpression(parent) && assignmentOperator(parent.operatorToken.kind) && containsNode(parent.right, node)) return [parent.left.getText(sourceFile)];
+    if (ts.isStatement(parent) || isFunctionNode(parent)) break;
+  }
+  return [];
 }
 
 function enclosingAssignmentOutputs(node, sourceFile) {
@@ -816,6 +958,9 @@ function functionName(node, sourceFile) {
   if (node.name) return node.name.getText(sourceFile);
   if (ts.isVariableDeclaration(node.parent)) return node.parent.name.getText(sourceFile);
   if (ts.isPropertyAssignment(node.parent)) return node.parent.name.getText(sourceFile);
+  if (ts.isBinaryExpression(node.parent) && node.parent.right === node && assignmentOperator(node.parent.operatorToken.kind)) {
+    return node.parent.left.getText(sourceFile).split(/[?.]/).at(-1);
+  }
   if (ts.isCallExpression(node.parent)) {
     const index = node.parent.arguments.indexOf(node);
     const expression = node.parent.expression;
@@ -1015,7 +1160,7 @@ function callDetails(node, sourceFile, checker) {
     function: callee,
     receiver,
     arguments: node.arguments.map(argument => argument.getText(sourceFile)),
-    argumentInputs: node.arguments.map(argument => symbolsFromNode(argument, sourceFile, checker)),
+    argumentInputs: node.arguments.map(argument => expressionValueInputs(argument, sourceFile, checker)),
     argumentConstants: node.arguments.map((argument, index) => {
       const value = constantStringValue(argument, checker);
       return value === undefined ? undefined : { index, expression: argument.getText(sourceFile), value };
@@ -1028,8 +1173,8 @@ function callDetails(node, sourceFile, checker) {
   };
 }
 
-function buildGuardBinding(capabilities = [], semantic = {}, call, semanticVerification = "none") {
-  const association = guardAssociation(capabilities);
+function buildGuardBinding(capabilities = [], semantic = {}, call, semanticVerification = "none", associationOptions = {}) {
+  const association = guardAssociation(capabilities, associationOptions);
   return {
     capabilities,
     inputs: semantic.inputs || [],
@@ -1065,7 +1210,11 @@ function callSymbolIdentity(node, sourceFile, checker) {
   const moduleBinding = importBinding || requireBinding || (aliasBinding?.kind === "global" ? undefined : aliasBinding);
   const receiverType = receiver && checker ? checkerTypeName(checker, receiver) : undefined;
   const fullyQualified = checkerQualifiedName(checker, targetSymbol);
-  const local = localDeclaration(declaration) || localDeclaration(receiverDeclaration);
+  // A local variable/parameter used as a receiver does not shadow the member
+  // declaration. `res: Response` is local, but `res.redirect` still resolves to
+  // the Response API. Local receiver members are caught through the target
+  // declaration itself; direct calls still use the receiver declaration.
+  const local = localDeclaration(declaration) || (!receiver && localDeclaration(receiverDeclaration));
   const globalAlias = aliasBinding?.kind === "global";
   const globalBuiltin = !receiver && ["fetch", "eval", "Function", "String", "decodeURIComponent", "encodeURIComponent"].includes(property);
   const global = globalAlias || (!local && globalBuiltin);
@@ -1226,7 +1375,23 @@ function constantStringValue(node, checker, seen = new Set()) {
 function callOutput(node, sourceFile) {
   if (ts.isVariableDeclaration(node.parent) && node.parent.initializer === node) return symbol(node.parent.name.getText(sourceFile));
   if (ts.isBinaryExpression(node.parent) && node.parent.right === node && assignmentOperator(node.parent.operatorToken.kind)) return symbol(node.parent.left.getText(sourceFile));
+  if (ts.isCallExpression(node.parent) && node.parent.arguments.includes(node)) {
+    return symbol(`__traceguard_expr_${stableHash(`${sourceFile.fileName}:${node.pos}:${node.end}`, 12)}`);
+  }
+  if (ts.isArrowFunction(node.parent) && node.parent.body === node) {
+    return symbol(`__traceguard_expr_${stableHash(`${sourceFile.fileName}:${node.pos}:${node.end}`, 12)}`);
+  }
   return undefined;
+}
+
+function expressionValueInputs(node, sourceFile, checker) {
+  if (!node) return [];
+  if (ts.isParenthesizedExpression(node)) return expressionValueInputs(node.expression, sourceFile, checker);
+  if (ts.isCallExpression(node)) {
+    const output = callOutput(node, sourceFile);
+    if (output) return [output];
+  }
+  return symbolsFromNode(node, sourceFile, checker);
 }
 
 function symbolsFromNode(node, sourceFile, checker) {

@@ -60,7 +60,9 @@
         "function": { "type": "string", "minLength": 1, "maxLength": 300 },
         "module": { "type": "string", "minLength": 1, "maxLength": 500 },
         "qualifiedName": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "symbol": { "type": "string", "minLength": 1, "maxLength": 500 },
         "receiverType": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "certainty": { "enum": ["verified", "review"] },
         "arguments": { "$ref": "#/$defs/arguments" },
         "restFrom": { "type": "integer", "minimum": 0, "maximum": 63 },
         "returnsTaint": { "type": "boolean" },
@@ -121,7 +123,7 @@
       "enum": ["SQL_QUERY", "COMMAND_EXEC", "DYNAMIC_EXEC", "FILE_ACCESS", "HTTP_REQUEST", "REDIRECT", "RESPONSE_OUTPUT", "DESERIALIZATION", "DIRECTORY_LOOKUP", "SENSITIVE_OPERATION"]
     },
     "guardCapability": {
-      "enum": ["INPUT_VALIDATION", "VALIDATE_SCHEME", "VALIDATE_IP", "BLOCK_PRIVATE_IP", "URL_POLICY", "PATH_CANONICALIZATION", "PATH_CONFINEMENT", "OUTPUT_ENCODING", "SQL_PARAMETERIZATION", "SHELL_ESCAPE", "AUTHENTICATION", "AUTHORIZATION", "DESERIALIZATION_ALLOWLIST"]
+      "enum": ["INPUT_VALIDATION", "VALIDATE_SCHEME", "VALIDATE_IP", "BLOCK_PRIVATE_IP", "URL_POLICY", "PATH_CANONICALIZATION", "PATH_CONFINEMENT", "OUTPUT_ENCODING", "SQL_PARAMETERIZATION", "SHELL_ESCAPE", "AUTHENTICATION", "AUTHORIZATION", "DESERIALIZATION_ALLOWLIST", "NUMERIC_ONLY", "FIXED_COLLECTION", "ALL_ELEMENTS", "SAFE_JOIN"]
     },
     "severity": { "enum": ["critical", "high", "medium", "low", "info"] }
   }
