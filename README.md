@@ -1,5 +1,9 @@
 # TraceGuard White-box Audit
 
+Version 1.1 adds **Changed since review** filtering and **Needs re-review** decisions when code, resolved dependencies or analysis settings change. Previous decisions remain visible until reconfirmed. Fingerprints cover files and their dependencies, so other edits in the same file may also trigger review; legacy decisions without fingerprints require reconfirmation.
+
+Trace interruptions now offer callee inspection and project Source, Sink or argument-to-return Propagator modeling, followed by query recomputation. Unknown identities retain their unverified proof status.
+
 [简体中文](README.zh-CN.md)
 
 TraceGuard is a VS Code extension for white-box code review. It maps application entry points, helps decide what to read first, follows values across functions, and keeps review decisions next to the code instead of burying them in another document.
@@ -94,10 +98,10 @@ Java, PHP, and Python parser assets are built in for offline backend review. Oth
 
 ## Install
 
-Download `traceguard-vscode-1.0.0.vsix` from [Releases](https://github.com/xingguangqwq/traceguard-vscode/releases/latest), then run **Extensions: Install from VSIX** in VS Code.
+Download `traceguard-vscode-1.1.0.vsix` from [Releases](https://github.com/xingguangqwq/traceguard-vscode/releases/latest), then run **Extensions: Install from VSIX** in VS Code.
 
 ```powershell
-code --install-extension .\traceguard-vscode-1.0.0.vsix
+code --install-extension .\traceguard-vscode-1.1.0.vsix
 ```
 
 Open a source folder you trust. Do not use the extension as a reason to execute unknown code.

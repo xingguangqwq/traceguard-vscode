@@ -5,13 +5,14 @@ const path = require("node:path");
 const { WorkspaceAnalysisEngine } = require("../src/analysis/workspace-engine");
 const { languageForPath } = require("../src/language-support");
 const { parseComposerConfigurationText } = require("../src/config/project-identity");
+const { pathVerificationStatus } = require("../src/review/finding-pool");
 
 const corpusRoot = path.resolve(process.argv.find(argument => argument.startsWith("--corpus="))?.split("=")[1] || "eval-corpus");
 const baselinePath = process.argv.find(argument => argument.startsWith("--baseline="))?.split("=")[1];
 
 async function main() {
   const manifest = JSON.parse(await fs.readFile(path.join(corpusRoot, "manifest.json"), "utf8"));
-  if (manifest.schema !== "traceguard-eval-corpus" || manifest.version !== 1) throw new Error("Unsupported TraceGuard evaluation manifest.");
+  validateManifest(manifest);
   const cases = [];
   for (const specification of manifest.cases || []) cases.push(await evaluateCase(specification));
   const report = {
@@ -19,6 +20,8 @@ async function main() {
     version: 1,
     generatedAt: new Date().toISOString(),
     summary: summarize(cases),
+    byLanguage: groupSummary(cases, "language"),
+    byRule: groupSummary(cases, "ruleFamily"),
     cases,
   };
   if (baselinePath) report.comparison = compareBaseline(JSON.parse(await fs.readFile(path.resolve(baselinePath), "utf8")), report);
@@ -27,8 +30,8 @@ async function main() {
   if (report.comparison?.regressions?.length || failed) process.exitCode = 1;
 }
 
-async function evaluateCase(specification) {
-  const projectRoot = path.resolve(corpusRoot, specification.projectDir);
+async function evaluateCase(specification, root = corpusRoot) {
+  const projectRoot = path.resolve(root, specification.projectDir);
   const sourcePaths = (await walk(projectRoot)).filter(fileName => languageForPath(fileName));
   const files = await Promise.all(sourcePaths.map(async absolutePath => ({
     absolutePath,
@@ -52,22 +55,31 @@ async function evaluateCase(specification) {
     maxPaths: 400,
   });
   const findings = result.findingDelta.upsert;
+  return scoreFindings(specification, findings);
+}
+
+function scoreFindings(specification, findings) {
+  const checkedRules = specification.checkedRules ? new Set(specification.checkedRules) : undefined;
+  const relevant = findings.filter(finding => !checkedRules || checkedRules.has(finding.ruleId));
   const matchedIds = new Set();
   let detected = 0;
   let unexpectedHeuristicPaths = 0;
   for (const expected of specification.expected || []) {
-    const finding = findings.find(candidate => !matchedIds.has(candidate.id) && matchesExpected(candidate, expected));
+    const finding = relevant.find(candidate => !matchedIds.has(candidate.id) && matchesExpected(candidate, expected));
     if (!finding) continue;
     matchedIds.add(finding.id);
     detected += 1;
-    if (!expected.allowHeuristic && finding.confidence === "low") unexpectedHeuristicPaths += 1;
+    const acceptedProof = expected.allowedProofStatuses || (expected.allowHeuristic ? ["verified", "heuristic", "unresolved"] : ["verified"]);
+    if (!findingPaths(finding).some(flow => matchesFunctions(flow, expected) && acceptedProof.includes(evaluationPathStatus(flow)))) unexpectedHeuristicPaths += 1;
   }
-  const relevant = findings.filter(finding => (specification.expected || []).some(expected => expected.ruleId === finding.ruleId));
-  const paths = relevant.flatMap(finding => finding.paths || [finding.path]).filter(Boolean);
+  const paths = relevant.flatMap(findingPaths);
   const pathStatuses = paths.map(evaluationPathStatus);
   return {
     id: specification.id,
     language: specification.language,
+    ruleFamily: specification.ruleFamily || specification.expected?.[0]?.ruleId || "unspecified-negative",
+    scenario: specification.scenario,
+    proofLimitation: specification.proofLimitation,
     repository: specification.repository,
     commit: specification.commit,
     vulnerability: specification.vulnerability,
@@ -84,16 +96,22 @@ async function evaluateCase(specification) {
 }
 
 function evaluationPathStatus(flow) {
-  if (flow.sink?.semanticVerification === "candidate" || /unverified/.test(flow.sink?.candidateStatus || "")) return "unresolved";
-  if (flow.sink?.semanticVerification === "syntax" || flow.confidence === "review" ||
-    (flow.steps || []).some(step => step.kind === "call" && step.candidateMatch && step.candidateMatch !== "high")) return "heuristic";
-  return "verified";
+  const status = pathVerificationStatus(flow);
+  return status === "syntax-only" ? "heuristic" : status;
 }
 
 function matchesExpected(finding, expected) {
   if (finding.ruleId !== expected.ruleId || finding.relativePath !== expected.relativePath) return false;
   if (expected.sinkLine && finding.line !== expected.sinkLine) return false;
-  const functions = new Set((finding.path?.steps || []).map(step => step.functionName));
+  return !expected.requiredFunctions?.length || findingPaths(finding).some(flow => matchesFunctions(flow, expected));
+}
+
+function findingPaths(finding) {
+  return (finding.paths?.length ? finding.paths : [finding.path]).filter(Boolean);
+}
+
+function matchesFunctions(flow, expected) {
+  const functions = new Set((flow.steps || []).map(step => step.functionName));
   return (expected.requiredFunctions || []).every(name => functions.has(name));
 }
 
@@ -108,15 +126,34 @@ function summarize(cases) {
   }), { expected: 0, detected: 0, falsePositives: 0, verifiedPaths: 0, heuristicPaths: 0, unresolvedPaths: 0 });
 }
 
+function groupSummary(cases, property) {
+  const groups = new Map();
+  for (const item of cases) {
+    const key = item[property] || "unspecified";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(item);
+  }
+  return Object.fromEntries([...groups].sort(([a], [b]) => a.localeCompare(b)).map(([key, values]) => {
+    const summary = summarize(values);
+    return [key, { cases: values.length, ...summary,
+      precision: summary.detected + summary.falsePositives ? summary.detected / (summary.detected + summary.falsePositives) : null,
+      recall: summary.expected ? summary.detected / summary.expected : null,
+      proofFailures: values.reduce((total, item) => total + item.unexpectedHeuristicPaths, 0) }];
+  }));
+}
+
 function compareBaseline(baseline, current) {
   const previous = new Map((baseline.cases || []).map(item => [item.id, item]));
   const regressions = [];
+  const currentIds = new Set(current.cases.map(item => item.id));
+  for (const id of previous.keys()) if (!currentIds.has(id)) regressions.push(`${id}: missing baseline case`);
   for (const item of current.cases) {
     const before = previous.get(item.id);
     if (!before) continue;
     if (item.detected < before.detected) regressions.push(`${item.id}: detected ${before.detected} -> ${item.detected}`);
     if (item.falsePositives > before.falsePositives) regressions.push(`${item.id}: false positives ${before.falsePositives} -> ${item.falsePositives}`);
-    if (item.verifiedPaths < before.verifiedPaths && item.heuristicPaths > before.heuristicPaths) regressions.push(`${item.id}: verified paths degraded to heuristic`);
+    if (item.verifiedPaths < before.verifiedPaths) regressions.push(`${item.id}: verified paths ${before.verifiedPaths} -> ${item.verifiedPaths}`);
+    if (Number.isFinite(before.expected) && item.expected < before.expected) regressions.push(`${item.id}: expected findings removed`);
   }
   return { regressions };
 }
@@ -131,7 +168,28 @@ async function walk(directory) {
   return output;
 }
 
-main().catch(error => {
+function validateManifest(manifest) {
+  if (manifest.schema !== "traceguard-eval-corpus" || manifest.version !== 1) throw new Error("Unsupported TraceGuard evaluation manifest.");
+  if (!Array.isArray(manifest.cases) || !manifest.cases.length) throw new Error("Evaluation corpus must not be empty.");
+  const ids = new Set();
+  for (const item of manifest.cases) {
+    if (!item || typeof item.id !== "string" || !item.id || typeof item.projectDir !== "string" || !Array.isArray(item.expected)) throw new Error("Invalid evaluation case.");
+    if (ids.has(item.id)) throw new Error(`Duplicate evaluation case: ${item.id}`);
+    ids.add(item.id);
+    if (item.checkedRules !== undefined && (!Array.isArray(item.checkedRules) || !item.checkedRules.length || item.checkedRules.some(rule => typeof rule !== "string" || !rule))) throw new Error(`${item.id}: checkedRules must be a non-empty rule list.`);
+    for (const expected of item.expected) {
+      if (expected?.allowedProofStatuses !== undefined && (!Array.isArray(expected.allowedProofStatuses) || !expected.allowedProofStatuses.length ||
+        expected.allowedProofStatuses.some(status => !["verified", "heuristic", "unresolved"].includes(status)))) throw new Error(`${item.id}: invalid allowedProofStatuses.`);
+      if (expected?.allowedProofStatuses?.some(status => status !== "verified") && !item.proofLimitation) throw new Error(`${item.id}: weaker proof expectations require a documented proofLimitation.`);
+      if (!expected || typeof expected.ruleId !== "string" || typeof expected.relativePath !== "string") throw new Error(`${item.id}: invalid expected finding.`);
+      if (item.checkedRules && !item.checkedRules.includes(expected.ruleId)) throw new Error(`${item.id}: expected rule is outside checkedRules.`);
+    }
+  }
+}
+
+if (require.main === module) main().catch(error => {
   process.stderr.write(`${error.stack || error}\n`);
   process.exitCode = 1;
 });
+
+module.exports = { evaluateCase, scoreFindings, compareBaseline, validateManifest };

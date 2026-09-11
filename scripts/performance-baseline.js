@@ -15,6 +15,7 @@ const requestedIncrementalLimit = Number(process.argv.find(argument => argument.
 const disableIncrementalGate = process.argv.includes("--no-incremental-gate");
 const requestedRuns = Number(process.argv.find(argument => argument.startsWith("--runs="))?.split("=")[1] || 5);
 const incrementalRuns = Math.min(20, Math.max(1, Number.isFinite(requestedRuns) ? Math.floor(requestedRuns) : 5));
+const compactResult = process.argv.includes("--compact");
 const maxIncrementalMs = disableIncrementalGate
   ? null
   : Number.isFinite(requestedIncrementalLimit) && requestedIncrementalLimit > 0
@@ -27,10 +28,10 @@ async function main() {
   const files = benchmark.files;
   const heapBefore = process.memoryUsage().heapUsed;
   const startedAt = performance.now();
-  const initial = await client.initializeWorkspace(files, { maxDepth: 6, maxPaths: Math.max(400, fileCount * 2) });
+  const initial = await client.initializeWorkspace(files, { maxDepth: 6, maxPaths: Math.max(400, fileCount * 2), compactResult });
   const initializedAt = performance.now();
   const unrelatedStartedAt = performance.now();
-  const unrelated = await client.updateFile(benchmark.unrelated || benchmark.changed);
+  const unrelated = await client.updateFile(benchmark.unrelated || benchmark.changed, { compactResult });
   const unrelatedSaveMs = performance.now() - unrelatedStartedAt;
   const incrementalTimes = [];
   let mainThreadDispatchMs = 0;
@@ -38,7 +39,7 @@ async function main() {
   for (let run = 0; run < incrementalRuns; run += 1) {
     const changed = benchmark.changeForRun ? benchmark.changeForRun(run) : { ...benchmark.changed, version: `semantic-${run}`, text: `${benchmark.changed.text}\nexport const benchmarkMarker${run} = ${run};\n` };
     const dispatchStartedAt = performance.now();
-    const pending = client.updateFile(changed);
+    const pending = client.updateFile(changed, { compactResult });
     mainThreadDispatchMs = Math.max(mainThreadDispatchMs, performance.now() - dispatchStartedAt);
     incremental = await pending;
     incrementalTimes.push(performance.now() - dispatchStartedAt);
@@ -48,8 +49,9 @@ async function main() {
 
   const result = {
     fixture: benchmark.name,
+    compactResult,
     files: files.length,
-    functions: initial.analyses.reduce((total, analysis) => total + analysis.ir.functions.length, 0),
+    functions: initial.auditModel?.functions ?? initial.analyses.reduce((total, analysis) => total + analysis.ir.functions.length, 0),
     findings: initial.findingDelta.upsert.length,
     initializeMs: round(initializedAt - startedAt),
     unrelatedSaveMs: round(unrelatedSaveMs),

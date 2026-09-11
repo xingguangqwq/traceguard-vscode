@@ -1,11 +1,11 @@
 {
   "schema": "traceguard-language-assets",
   "version": 1,
-  "release": "1.0.0",
-  "baseUrl": "https://github.com/xingguangqwq/traceguard-vscode/releases/download/v1.0.0",
+  "release": "1.1.0",
+  "baseUrl": "https://github.com/xingguangqwq/traceguard-vscode/releases/download/v1.1.0",
   "assets": {
     "javascript-typescript": {
-      "fileName": "traceguard-assets-javascript-typescript-v1.0.0.json.gz",
+      "fileName": "traceguard-assets-javascript-typescript-v1.1.0.json.gz",
       "sha256": "e697461afff553af4a5b313a2cc8a483d25d9866f309267cc9f2596379e0698d",
       "bytes": 459236,
       "files": {
@@ -22,7 +22,7 @@
       "typeLibrary": "typescript/traceguard-minimal-lib.d.ts"
     },
     "csharp": {
-      "fileName": "traceguard-assets-csharp-v1.0.0.json.gz",
+      "fileName": "traceguard-assets-csharp-v1.1.0.json.gz",
       "sha256": "620b7ca0c49caa34d3050339c6adeb34cb9db6b00d44d4c31b1fef0472738689",
       "bytes": 539649,
       "files": {
@@ -33,7 +33,7 @@
       }
     },
     "go": {
-      "fileName": "traceguard-assets-go-v1.0.0.json.gz",
+      "fileName": "traceguard-assets-go-v1.1.0.json.gz",
       "sha256": "cff02e276e59bcafdd930ba39e87d6cb6b364bc24ee224b08acc2ec590b50df4",
       "bytes": 53827,
       "files": {

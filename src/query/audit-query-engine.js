@@ -217,14 +217,14 @@ function backwardVariable(context, fn, variable, beforeLine, visiting, depth, li
   })];
 }
 
-function forwardVariable(context, fn, variable, afterLine, visiting, depth, limits) {
+function forwardVariable(context, fn, variable, afterLine, visiting, depth, limits, originEvent) {
   if (!reserve(limits)) return [truncatedNode(fn)];
-  const key = `forward:${fn.id}:${variable}:${afterLine}`;
+  const key = `forward:${fn.id}:${variable}:${afterLine}:${originEvent?.id || "selection"}`;
   if (visiting.has(key) || depth > limits.maxDepth) return [cycleNode(fn, variable, depth > limits.maxDepth)];
   const nextVisiting = new Set(visiting);
   nextVisiting.add(key);
   const consumers = fn.events.filter(event => event.line >= afterLine && isReachableEvent(event) &&
-    eventConsumes(event, variable) && taintReachesEventOnSomePath(fn, variable, afterLine, event));
+    event.id !== originEvent?.id && eventConsumes(event, variable) && taintReachesEventOnSomePath(fn, variable, afterLine, event, originEvent));
   const roots = [];
   for (const event of consumers) {
     if (!reserve(limits)) { roots.push(truncatedNode(fn)); break; }
@@ -238,7 +238,7 @@ function forwardVariable(context, fn, variable, afterLine, visiting, depth, limi
         fn,
         event,
         details: { assignmentMode: event.assignmentMode || "expression", input: variable, output },
-        children: forwardVariable(context, fn, output, event.line + 1, nextVisiting, depth + 1, limits),
+        children: forwardVariable(context, fn, output, event.line, nextVisiting, depth + 1, limits, event),
       }));
       continue;
     }
@@ -249,6 +249,14 @@ function forwardVariable(context, fn, variable, afterLine, visiting, depth, limi
     }
     if (event.type === "call") {
       const edges = context.outgoing.get(fn.id)?.filter(edge => edge.event.id === event.id) || [];
+      if (event.semanticRole === "propagator" && event.target &&
+        (event.argumentVariables || []).some((values, index) => (event.taintArgumentIndexes || []).includes(index) &&
+          values.some(value => pathsOverlap(value, variable)))) {
+        roots.push(queryNode({ kind: "call", label: `Modeled ${event.callee}() → ${event.target}`,
+          status: eventStatus(event), reason: `Semantic model ${event.semanticModelId} propagates the selected argument to its return value.`,
+          fn, event, children: forwardVariable(context, fn, event.target, event.line, nextVisiting, depth + 1, limits, event) }));
+        continue;
+      }
       if (!edges.length) { roots.push(unresolvedCallNode(fn, event)); continue; }
       for (const edge of edges) {
         const mappings = calleeValuesForCallerVariable(edge, variable);
@@ -269,7 +277,7 @@ function forwardVariable(context, fn, variable, afterLine, visiting, depth, limi
           roots.push(callNode(edge, [queryNode({ kind: "return", label: "Return value is ignored", status: QueryStatus.VERIFIED,
             reason: "The caller invokes the function without assigning its return value.", fn: edge.caller, event: edge.event })]));
         } else {
-          roots.push(callNode(edge, forwardVariable(context, edge.caller, edge.event.target, edge.event.line + 1, nextVisiting, depth + 1, limits),
+          roots.push(callNode(edge, forwardVariable(context, edge.caller, edge.event.target, edge.event.line, nextVisiting, depth + 1, limits, edge.event),
             `The return value is assigned to ${edge.event.target} in ${edge.caller.name}().`));
         }
       }
@@ -281,7 +289,7 @@ function forwardVariable(context, fn, variable, afterLine, visiting, depth, limi
   return dedupeNodes(roots);
 }
 
-function taintReachesEventOnSomePath(fn, variable, afterLine, targetEvent) {
+function taintReachesEventOnSomePath(fn, variable, afterLine, targetEvent, originEvent) {
   const sequences = eventSequences(fn, {
     startLine: afterLine,
     targetBlocks: targetEvent.blockId ? [targetEvent.blockId] : [],
@@ -290,11 +298,16 @@ function taintReachesEventOnSomePath(fn, variable, afterLine, targetEvent) {
     maxVisits: 3,
   });
   return sequences.some(events => {
+    if (originEvent) {
+      const originIndex = events.findIndex(event => event.id === originEvent.id);
+      if (originIndex < 0) return false;
+      events = events.slice(originIndex + 1);
+    }
     let tainted = new Set([variable]);
     for (const event of events) {
       if (event.id === targetEvent.id) return eventConsumes(event, variable) && [...tainted].some(value => pathsOverlap(value, variable));
       if (event.type === "assignment" && event.target) {
-        if (event.line === afterLine && pathFeeds(event.target, variable)) continue;
+        if (!originEvent && event.line === afterLine && pathFeeds(event.target, variable)) continue;
         tainted = applyAssignment(tainted, event).tainted;
         continue;
       }

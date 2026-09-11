@@ -12,6 +12,7 @@ function findingPaths(finding) {
 }
 
 function pathVerificationStatus(flow) {
+  if (!flow?.steps?.length) return "unresolved";
   if (flow?.sink?.semanticVerification === "candidate" || /unverified/.test(flow?.sink?.candidateStatus || "")) return "unresolved";
   if ((flow?.steps || []).some(step => step.analysisStatus === "unresolved" || /unresolved/.test(step.candidateStatus || ""))) return "unresolved";
   if (flow?.sink?.semanticVerification === "syntax" || ["low", "review"].includes(flow?.confidence) ||
@@ -25,7 +26,6 @@ function findingPool(finding) {
   if (finding?.status && finding.status !== "open") return "resolved";
   const paths = findingPaths(finding);
   if (paths.some(flow => pathVerificationStatus(flow) === "verified")) return "verified";
-  if (!paths.length && !["low", "review"].includes(finding?.confidence)) return "verified";
   return "review";
 }
 

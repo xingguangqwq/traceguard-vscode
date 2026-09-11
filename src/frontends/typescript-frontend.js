@@ -707,8 +707,9 @@ function structurallyParameterizedSqlCall(semantic, call) {
 
 function modeledCallOperation(call, language, semanticModels) {
   const resolution = resolveSemanticCall(language, call, semanticModels);
-  const reviewSink = resolution.status === "candidate" && resolution.model?.role === SemanticRole.SINK;
-  if (!["verified", "syntax"].includes(resolution.status) && !reviewSink) return undefined;
+  const reviewModel = resolution.status === "candidate" && (resolution.model?.role === SemanticRole.SINK ||
+    resolution.model?.custom && [SemanticRole.SOURCE, SemanticRole.PROPAGATOR].includes(resolution.model.role));
+  if (!["verified", "syntax"].includes(resolution.status) && !reviewModel) return undefined;
   const model = resolution.model;
   const kind = {
     [SemanticRole.SOURCE]: OperationKind.SOURCE,
@@ -744,11 +745,11 @@ function modeledCallOperation(call, language, semanticModels) {
     inputs,
     output: model.returnsTaint || model.role === SemanticRole.GUARD ? call.output : undefined,
     semantic,
-    certainty: resolution.status === "verified" ? Certainty.HIGH : reviewSink ? Certainty.LOW : Certainty.MEDIUM,
+    certainty: resolution.status === "verified" ? Certainty.HIGH : reviewModel ? Certainty.LOW : Certainty.MEDIUM,
     metadata: {
       frontend: "typescript-semantic-registry",
       semanticVerification: resolution.status,
-      candidateStatus: reviewSink ? "symbol-unverified" : undefined,
+      candidateStatus: reviewModel ? "symbol-unverified" : undefined,
       taintArguments,
       callForms: model.callForms,
       applicableSinkKinds: model.applicableSinkKinds || [],

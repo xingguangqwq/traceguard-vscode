@@ -1,6 +1,7 @@
 const path = require("path");
+const { randomUUID } = require("node:crypto");
 const vscode = require("vscode");
-const { buildAuditModel, shortHash } = require("./audit-analyzer");
+const { buildAuditModel } = require("./audit-analyzer");
 const {
   MAX_PROJECT_CONFIG_BYTES,
   PROJECT_CONFIG_FILENAME,
@@ -18,13 +19,14 @@ const {
 } = require("./config/project-identity");
 const { DataflowWorkerClient } = require("./dataflow/worker-client");
 const { inspectSourceFile } = require("./analysis/source-admission");
+const { EXCLUDE_GLOB, isDefaultExcluded } = require("./analysis/workspace-file-sync");
 const { normalizePath, stableHash } = require("./identity");
 const { languageForPath } = require("./language-support");
 const { calibrateReviewTargets } = require("./review/targets");
 const { reconcileFindingStatuses, reconcileReviewStatuses } = require("./review/status-store");
+const { sanitizeEvidenceAnchor } = require("./review/evidence-anchor");
 
 const SOURCE_GLOB = "**/*.{java,jsp,jspx,php,phtml,php3,php4,php5,inc,js,jsx,mjs,cjs,ts,tsx,py,cs,go}";
-const EXCLUDE_GLOB = "**/{.git,.svn,node_modules,vendor,target,build,dist,coverage,.gradle,.mvn,.venv,venv,__pycache__,bin,obj,storage,cache,tmp,temp}/**";
 const HARD_MAX_SOURCE_BYTES = 2 * 1024 * 1024;
 const DEFAULT_MAX_SOURCE_FILES = 1000;
 const HARD_MAX_SOURCE_FILES = 8000;
@@ -33,6 +35,8 @@ class AuditSession {
   constructor(context, output) {
     this.context = context;
     this.output = output;
+    this.evidenceWrite = Promise.resolve();
+    this.reviewWrite = Promise.resolve();
     this.analyses = [];
     this.model = emptyModel();
     this.indexing = false;
@@ -66,7 +70,9 @@ class AuditSession {
     const evidence = this.context.workspaceState.get("traceguard.audit.evidence", []);
     const items = this.model.items.map(item => {
       const record = statuses[item.id] || item.legacyIds?.map(id => statuses[id]).find(Boolean);
-      return { ...item, status: record?.status || "unreviewed", statusUpdatedAt: record?.updatedAt || "" };
+      return { ...item, status: record?.needsReview ? "needs_review" : record?.status || "unreviewed",
+        needsReview: Boolean(record?.needsReview), previousStatus: record?.needsReview ? record.status : undefined,
+        changeReason: record?.changeReason, statusUpdatedAt: record?.updatedAt || "" };
     });
     const reviewed = items.filter(item => item.status === "reviewed").length;
     const inReview = items.filter(item => item.status === "in_review").length;
@@ -75,7 +81,10 @@ class AuditSession {
     const discoveredFiles = Math.max(Number(this.model.indexDiscoveredFiles) || 0, indexedFiles + skippedFiles);
     const findings = this.model.findings.map(finding => ({
       ...finding,
-      status: findingStatuses[finding.id]?.status || "open",
+      status: findingStatuses[finding.id]?.needsReview ? "open" : findingStatuses[finding.id]?.status || "open",
+      needsReview: Boolean(findingStatuses[finding.id]?.needsReview),
+      previousStatus: findingStatuses[finding.id]?.needsReview ? findingStatuses[finding.id].status : undefined,
+      changeReason: findingStatuses[finding.id]?.changeReason,
       statusUpdatedAt: findingStatuses[finding.id]?.updatedAt || "",
     }));
     return {
@@ -83,6 +92,7 @@ class AuditSession {
       indexing: this.indexing,
       indexStage: { ...this.indexStage },
       indexError: this.indexError,
+      indexStale: Boolean(this.filesystemSyncPending),
       items,
       findings,
       evidence,
@@ -96,7 +106,8 @@ class AuditSession {
       },
       manualReviewCoverage: { reviewed, total: items.length },
       statusCounts: {
-        unreviewed: items.length - reviewed - inReview - items.filter(item => item.status === "blocked").length,
+        unreviewed: items.filter(item => item.status === "unreviewed").length,
+        needs_review: items.filter(item => item.status === "needs_review").length,
         in_review: inReview,
         reviewed,
         blocked: items.filter(item => item.status === "blocked").length,
@@ -456,7 +467,14 @@ class AuditSession {
   }
 
   _setIndexStage(phase, message, processed = 0, total = 0) {
+    if (phase === "ready") this.filesystemSyncPending = false;
     this.indexStage = { phase, message, processed, total };
+    this._changed.fire(this.snapshot);
+  }
+
+  setFilesystemSyncPending(pending) {
+    if (this.disposed || this.filesystemSyncPending === pending) return;
+    this.filesystemSyncPending = pending;
     this._changed.fire(this.snapshot);
   }
 
@@ -488,6 +506,7 @@ class AuditSession {
     } catch (error) {
       this._markWorkspaceCoverageIncomplete(1, { absolutePath: uri.fsPath, relativePath: workspaceRelativePath(uri), reason: String(error.message || error) });
       this.output.warn(`Audit re-index failed for ${uri.fsPath}: ${error.message}`);
+      if (options.throwOnError) throw error;
     }
   }
 
@@ -517,6 +536,7 @@ class AuditSession {
       await this._replaceAnalysis(document.uri, text, { unsaved });
     } catch (error) {
       this.output.warn(`Live audit index failed for ${document.uri.fsPath}: ${error.message}`);
+      if (options.throwOnError) throw error;
     }
   }
 
@@ -588,6 +608,7 @@ class AuditSession {
     if (generation !== this.modelGeneration) return false;
     if (dataflow.analyses) this.analyses = dataflow.analyses;
     this._applyWorkerResult(dataflow);
+    await this._reconcileReviewStatuses(this.workspaceCoverageComplete);
     return true;
   }
 
@@ -755,10 +776,9 @@ class AuditSession {
 
   _isExcludedUri(uri) {
     const patterns = this._projectConfigurationForUri(uri).excludePaths || [];
-    if (!patterns.length) return false;
     const folder = vscode.workspace.getWorkspaceFolder(uri);
     const localPath = folder ? path.relative(folder.uri.fsPath, uri.fsPath).replaceAll("\\", "/") : workspaceRelativePath(uri);
-    return matchesExcludedPath(localPath, patterns) || matchesExcludedPath(workspaceRelativePath(uri), patterns);
+    return isDefaultExcluded(localPath) || matchesExcludedPath(localPath, patterns) || matchesExcludedPath(workspaceRelativePath(uri), patterns);
   }
 
   _projectConfigurationForUri(uri) {
@@ -776,50 +796,71 @@ class AuditSession {
   }
 
   async setStatus(itemId, status) {
+    return this._withReviewWrite(() => this._setStatus(itemId, status));
+  }
+
+  async _setStatus(itemId, status) {
     if (!["unreviewed", "in_review", "reviewed", "blocked"].includes(status)) return;
     const statuses = { ...this.context.workspaceState.get("traceguard.audit.statuses", {}) };
     const item = this.model.items.find(candidate => candidate.id === itemId);
     for (const legacyId of item?.legacyIds || []) delete statuses[legacyId];
     if (status === "unreviewed") delete statuses[itemId];
-    else statuses[itemId] = { status, updatedAt: new Date().toISOString() };
+    else statuses[itemId] = { status, updatedAt: new Date().toISOString(), reviewFingerprint: item?.reviewFingerprint };
     await this.context.workspaceState.update("traceguard.audit.statuses", statuses);
     this._changed.fire(this.snapshot);
   }
 
   async setFindingStatus(findingId, status) {
+    return this._withReviewWrite(() => this._setFindingStatus(findingId, status));
+  }
+
+  async _setFindingStatus(findingId, status) {
     if (!["open", "reviewed", "false_positive", "accepted_risk", "suppressed"].includes(status)) return false;
     if (!this.model.findings.some(finding => finding.id === findingId)) return false;
     const statuses = { ...this.context.workspaceState.get("traceguard.audit.findingStatuses", {}) };
     if (status === "open") delete statuses[findingId];
-    else statuses[findingId] = { status, updatedAt: new Date().toISOString() };
+    else statuses[findingId] = { status, updatedAt: new Date().toISOString(),
+      reviewFingerprint: this.model.findings.find(item => item.id === findingId)?.reviewFingerprint };
     await this.context.workspaceState.update("traceguard.audit.findingStatuses", statuses);
     this._changed.fire(this.snapshot);
     return true;
   }
 
   async addEvidence(input) {
+    return this._withEvidenceWrite(() => this._addEvidence(input));
+  }
+
+  async _addEvidence(input) {
     const evidence = [...this.context.workspaceState.get("traceguard.audit.evidence", [])];
     const item = {
-      id: shortHash(`${Date.now()}:${input.absolutePath}:${input.line}:${input.type}:${input.code}`),
       createdAt: new Date().toISOString(),
       ...input,
+      id: randomUUID(),
       note: String(input.note || "").slice(0, 10000),
       code: String(input.code || "").slice(0, 50000),
       relativePath: String(input.relativePath || "").slice(0, 2000),
     };
     evidence.unshift(item);
-    await this.context.workspaceState.update("traceguard.audit.evidence", evidence.slice(0, 500));
+    await this.context.workspaceState.update("traceguard.audit.evidence", evidence);
     this._changed.fire(this.snapshot);
     return item;
   }
 
   async removeEvidence(evidenceId) {
+    return this._withEvidenceWrite(() => this._removeEvidence(evidenceId));
+  }
+
+  async _removeEvidence(evidenceId) {
     const evidence = this.context.workspaceState.get("traceguard.audit.evidence", []).filter(item => item.id !== evidenceId);
     await this.context.workspaceState.update("traceguard.audit.evidence", evidence);
     this._changed.fire(this.snapshot);
   }
 
   async migrateEvidencePaths(renames) {
+    return this._withEvidenceWrite(() => this._migrateEvidencePaths(renames));
+  }
+
+  async _migrateEvidencePaths(renames) {
     const mappings = (renames || []).map(item => ({ oldPath: item.oldUri.fsPath, newPath: item.newUri.fsPath }));
     if (!mappings.length) return 0;
     const evidence = this.context.workspaceState.get("traceguard.audit.evidence", []);
@@ -859,6 +900,28 @@ class AuditSession {
   }
 
   async importPortableState(payload) {
+    return this._withEvidenceWrite(() => this._importPortableState(payload));
+  }
+
+  _withEvidenceWrite(operation) {
+    const pending = this.evidenceWrite.then(operation);
+    this.evidenceWrite = pending.catch(() => {});
+    return pending;
+  }
+
+  updateEvidenceLocation(id, location) {
+    return this._withEvidenceWrite(async () => {
+      const evidence = this.context.workspaceState.get("traceguard.audit.evidence", []).map(item => {
+        if (item.id !== id) return item;
+        return { ...item, locationStatus: location.status,
+          ...(location.status === "stale" ? {} : { line: location.line, endLine: location.endLine }) };
+      });
+      await this.context.workspaceState.update("traceguard.audit.evidence", evidence);
+      this._changed.fire(this.snapshot);
+    });
+  }
+
+  async _importPortableState(payload) {
     if (!payload || payload.schema !== "traceguard-review-session" || payload.version !== 1 || typeof payload.statuses !== "object" || !Array.isArray(payload.evidence)) {
       throw new Error("This file is not a supported TraceGuard review session.");
     }
@@ -870,19 +933,17 @@ class AuditSession {
     const importedFindingStatuses = Object.fromEntries(Object.entries(payload.findingStatuses || {})
       .slice(0, 10000)
       .filter(([key, value]) => key.length <= 128 && allowedFindingStatuses.has(value?.status)));
-    const currentStatuses = this.context.workspaceState.get("traceguard.audit.statuses", {});
-    const currentFindingStatuses = this.context.workspaceState.get("traceguard.audit.findingStatuses", {});
     const currentEvidence = this.context.workspaceState.get("traceguard.audit.evidence", []);
     const importedEvidence = payload.evidence
-      .slice(0, 1000)
       .filter(item => item && typeof item.id === "string" && typeof item.relativePath === "string")
       .map(item => {
         const relativePath = item.relativePath.slice(0, 2000).replaceAll("\\", "/");
         return {
           id: item.id.slice(0, 128),
-          type: ["Source", "Sink", "Authorization", "Validation", "Observation"].includes(item.type) ? item.type : "Observation",
+          type: ["Source", "Sink", "Authorization", "Validation", "Observation", "Controllability", "Missing Context", "Dynamic Validation", "Exploit Condition", "False Positive Reason", "Remediation"].includes(item.type) ? item.type : "Observation",
           note: typeof item.note === "string" ? item.note.slice(0, 10000) : "",
           code: typeof item.code === "string" ? item.code.slice(0, 50000) : "",
+          anchor: sanitizeEvidenceAnchor(item.anchor),
           relativePath,
           absolutePath: resolveWorkspacePath(relativePath),
           line: Number.isInteger(item.line) && item.line > 0 ? item.line : 1,
@@ -894,9 +955,14 @@ class AuditSession {
       .filter(item => item.absolutePath);
     const evidenceById = new Map(currentEvidence.map(item => [item.id, item]));
     for (const item of importedEvidence) evidenceById.set(item.id, item);
-    await this.context.workspaceState.update("traceguard.audit.statuses", { ...currentStatuses, ...importedStatuses });
-    await this.context.workspaceState.update("traceguard.audit.findingStatuses", { ...currentFindingStatuses, ...importedFindingStatuses });
-    await this.context.workspaceState.update("traceguard.audit.evidence", [...evidenceById.values()].slice(0, 500));
+    await this._withReviewWrite(async () => {
+      await this.context.workspaceState.update("traceguard.audit.statuses", {
+        ...this.context.workspaceState.get("traceguard.audit.statuses", {}), ...importedStatuses });
+      await this.context.workspaceState.update("traceguard.audit.findingStatuses", {
+        ...this.context.workspaceState.get("traceguard.audit.findingStatuses", {}), ...importedFindingStatuses });
+    });
+    await this.context.workspaceState.update("traceguard.audit.evidence", [...evidenceById.values()]);
+    await this._reconcileReviewStatuses(this.workspaceCoverageComplete);
     this._changed.fire(this.snapshot);
     return { statuses: Object.keys(importedStatuses).length, findingStatuses: Object.keys(importedFindingStatuses).length, evidence: importedEvidence.length };
   }
@@ -1001,6 +1067,16 @@ class AuditSession {
   }
 
   async _reconcileReviewStatuses(complete) {
+    return this._withReviewWrite(() => this._reconcileReviewStatusesNow(complete));
+  }
+
+  _withReviewWrite(operation) {
+    const pending = this.reviewWrite.then(operation);
+    this.reviewWrite = pending.catch(() => {});
+    return pending;
+  }
+
+  async _reconcileReviewStatusesNow(complete) {
     const current = this.context.workspaceState.get("traceguard.audit.statuses", {});
     const result = reconcileReviewStatuses(current, this.model.items, { complete });
     const currentFindingStatuses = this.context.workspaceState.get("traceguard.audit.findingStatuses", {});
@@ -1029,6 +1105,7 @@ class AuditSession {
   }
 
   dispose() {
+    this.disposed = true;
     void this.dataflowWorker.dispose();
     this._changed.dispose();
   }

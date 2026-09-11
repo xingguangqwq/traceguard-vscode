@@ -2,7 +2,7 @@
   "name": "traceguard-vscode",
   "displayName": "TraceGuard White-box Audit",
   "description": "Local white-box audit navigation: entry discovery, explainable data-flow traces, prioritized review queues and evidence notes.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "publisher": "traceguard",
   "license": "MIT",
   "repository": {
@@ -61,6 +61,12 @@
   },
   "contributes": {
     "commands": [
+      {
+        "command": "traceguard.modelInterruptedCall",
+        "title": "TraceGuard: Inspect or Model Interrupted Call",
+        "category": "TraceGuard",
+        "icon": "$(tools)"
+      },
       {
         "command": "traceguard.startAudit",
         "title": "TraceGuard: Start Code Review",
@@ -445,19 +451,19 @@
     "viewsWelcome": [
       {
         "view": "traceguard.summary",
-        "contents": "$(globe) Build the analysis scope to inventory endpoints, indexed files and explicit coverage gaps.\n[Build Scope](command:traceguard.startAudit)"
+        "contents": "Build the analysis scope to inventory endpoints, indexed files and explicit coverage gaps.\n[Build Scope](command:traceguard.startAudit)"
       },
       {
         "view": "traceguard.code",
-        "contents": "$(list-tree) Build the review queue to order entry-reachable and security-sensitive code for human review.\n[Build Review Queue](command:traceguard.startAudit)"
+        "contents": "Build the review queue to order entry-reachable and security-sensitive code for human review.\n[Build Review Queue](command:traceguard.startAudit)"
       },
       {
         "view": "traceguard.auditQueries",
-        "contents": "$(debug-stackframe) Inspect a finding or trace a selected value to step through Source → Sink code.\n[Explain Analysis Here](command:traceguard.explainAnalysisHere)"
+        "contents": "Inspect a finding or trace a selected value to step through Source → Sink code.\n[Explain Analysis Here](command:traceguard.explainAnalysisHere)"
       },
       {
         "view": "traceguard.evidence",
-        "contents": "$(bookmark) Select relevant code and record why it matters.\n[Add Selection to Notes](command:traceguard.addEvidence)"
+        "contents": "Select relevant code and record why it matters.\n[Add Selection to Notes](command:traceguard.addEvidence)"
       }
     ],
     "menus": {
@@ -534,6 +540,11 @@
         }
       ],
       "view/item/context": [
+        {
+          "command": "traceguard.modelInterruptedCall",
+          "when": "view == traceguard.auditQueries && viewItem == traceguard.modelableInterruption",
+          "group": "inline"
+        },
         {
           "command": "traceguard.traceFromEntry",
           "when": "view == traceguard.summary && viewItem == traceguard.attackEntry",
@@ -878,12 +889,13 @@
     "benchmark:python": "node scripts/performance-baseline.js --fixture=python-backend --files=1000 --max-incremental-ms=500 --max-rss-mib=500",
     "benchmark:stress": "node scripts/performance-baseline.js --fixture=java-backend --files=8000 --runs=1 --no-incremental-gate --max-rss-mib=768",
     "eval": "node scripts/evaluate-corpus.js",
-    "eval:compare": "node scripts/evaluate-corpus.js --baseline=eval-corpus/baseline-0.9.0.json",
+    "eval:compare": "node scripts/evaluate-corpus.js --baseline=eval-corpus/baseline-1.1.0.json",
     "check": "node scripts/check.js",
     "verify:package": "node scripts/verify-packaged-runtime.js",
     "verify:release-version": "node scripts/verify-release-version.js",
     "build:assets": "node scripts/build-language-assets.js",
-    "package": "npm run build:assets && vsce package"
+    "package": "npm run build:assets && vsce package",
+    "benchmark:review": "node scripts/performance-baseline.js --fixture=java-backend --files=1000 --max-incremental-ms=500 --max-rss-mib=500 --compact"
   },
   "devDependencies": {
     "@vscode/test-electron": "^3.1.0",

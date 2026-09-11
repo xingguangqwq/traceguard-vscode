@@ -100,6 +100,8 @@ class AttackSurfaceProvider extends SessionTreeProvider {
     const data = this.session.snapshot;
     if (!data.indexed_at) return scopePlaceholderItems(data);
     const rows = [new ScopeOverviewItem(data), ...buildCoverageRows(data)];
+    if (data.indexStale) rows.unshift(new MetricItem("Results pending refresh", "Files changed on disk", "sync", undefined,
+      "The previous audit map may be stale. Wait for synchronization or run Refresh Code Review Index."));
     rows.push(...buildAttackSurface(data));
     rows.push(new DiagnosticsItem(buildDiagnostics(data)));
     return rows;
@@ -449,6 +451,7 @@ class CodeTreeProvider extends SessionTreeProvider {
 }
 
 function reviewTargetMatchesFilter(item, filter, activeFile, currentEndpointIds = []) {
+  if (filter === "needs_review") return Boolean(item.needsReview);
   if (filter === "unreviewed") return item.status === "unreviewed";
   if (filter === "in_review") return item.status === "in_review";
   if (filter === "blocked") return item.status === "blocked";
@@ -554,10 +557,12 @@ class FindingItem extends vscode.TreeItem {
     const resolved = finding.status !== "open";
     const reviewOnly = findingPool(finding) === "review";
     this.description = `L${finding.line}`
+      + `${finding.needsReview ? " · needs re-review" : ""}`
       + `${reviewOnly ? " · review" : ""}`
       + `${finding.pathCount > 1 ? ` · ${finding.pathCount} paths` : ""}`
       + `${resolved ? ` · ${findingStatusLabel(finding.status)}` : ""}`;
     this.tooltip = buildFindingTooltip(finding);
+    if (finding.needsReview) this.tooltip.appendMarkdown(`\n\n**Needs re-review**: ${md(finding.changeReason || "Analysis changed")}\n\nPrevious decision: ${md(finding.previousStatus || "unknown")}`);
     this.iconPath = resolved
       ? new vscode.ThemeIcon(FINDING_STATUS_GLYPH[finding.status] || "circle-filled", new vscode.ThemeColor("descriptionForeground"))
       : reviewOnly
@@ -648,12 +653,14 @@ class AuditItem extends vscode.TreeItem {
       reviewed: { icon: "pass-filled", color: "testing.iconPassed" },
       in_review: { icon: "debug-pause", color: "editorWarning.foreground" },
       blocked: { icon: "circle-slash", color: "errorForeground" },
+      needs_review: { icon: "refresh", color: "editorWarning.foreground" },
       unreviewed: { icon: priorityMeta.icon || "circle-outline", color: priorityMeta.color },
     }[item.status] || { icon: priorityMeta.icon || "circle-outline", color: priorityMeta.color };
     this.tooltip = new vscode.MarkdownString();
     this.tooltip.appendMarkdown(`$(${statusMeta.icon}) **${item.priority}** · `);
     this.tooltip.appendText(item.title);
     this.tooltip.appendMarkdown(`\n\n${item.reasons.map(reason => `- ${md(reason)}`).join("\n")}\n\nReview status: **${statusLabel(item.status)}**`);
+    if (item.needsReview) this.tooltip.appendMarkdown(`\n\n${md(item.changeReason || "Analysis changed")}\n\nPrevious decision: **${statusLabel(item.previousStatus)}**`);
     this.iconPath = statusMeta.color
       ? new vscode.ThemeIcon(statusMeta.icon, new vscode.ThemeColor(statusMeta.color))
       : new vscode.ThemeIcon(statusMeta.icon);
@@ -704,6 +711,11 @@ class EvidenceItem extends vscode.TreeItem {
     if (item.note) { this.tooltip.appendMarkdown("\n\n"); this.tooltip.appendText(item.note); }
     this.iconPath = new vscode.ThemeIcon(evidenceIcon(item.type), new vscode.ThemeColor(tone));
     this.evidenceItem = item;
+    if (item.locationStatus === "stale") {
+      this.description += " · stale";
+      this.iconPath = new vscode.ThemeIcon("warning");
+      this.tooltip.appendText("\nThe source was changed, removed, or is ambiguous. This saved snippet has not been discarded.");
+    }
     this.contextValue = "traceguard.evidence";
     this.command = { command: "traceguard.openEvidence", title: "Open evidence", arguments: [item] };
   }
@@ -847,6 +859,9 @@ class TraceInterruptionItem extends vscode.TreeItem {
   constructor(interruption, identity) {
     super("Path interrupted — inspect next", vscode.TreeItemCollapsibleState.None);
     this.kind = "trace-interruption";
+    this.interruption = interruption;
+    this.contextValue = interruption.location?.absolutePath && interruption.status !== "partial"
+      ? "traceguard.modelableInterruption" : "traceguard.traceInterruption";
     this.id = `traceguard:interruption:${identity}`;
     this.description = interruption.status;
     this.iconPath = new vscode.ThemeIcon("debug-disconnect", new vscode.ThemeColor("editorWarning.foreground"));
@@ -854,7 +869,9 @@ class TraceInterruptionItem extends vscode.TreeItem {
     this.tooltip.appendMarkdown(`$(debug-disconnect) **Why the path stopped**\n\n${md(interruption.reason)}\n\n`);
     this.tooltip.appendMarkdown(`**Suggested manual check**\n\n${md(interruption.next)}`);
     if (interruption.location?.absolutePath) {
-      this.command = { command: "traceguard.openAuditLocation", title: "Inspect unresolved call", arguments: [interruption.location] };
+      this.command = interruption.status === "partial"
+        ? { command: "traceguard.openAuditLocation", title: "Inspect partial path", arguments: [interruption.location] }
+        : { command: "traceguard.modelInterruptedCall", title: "Inspect or model interrupted call", arguments: [{ interruption }] };
     }
   }
 }
@@ -1038,7 +1055,7 @@ function md(value) {
   return String(value ?? "").replace(/[\\`*_{}[\]()#+\-.!]/g, "\\$&");
 }
 
-function statusLabel(status) { return { unreviewed: "Not reviewed", in_review: "In review", reviewed: "Reviewed", blocked: "Needs context" }[status] || "Not reviewed"; }
+function statusLabel(status) { return { unreviewed: "Not reviewed", in_review: "In review", reviewed: "Reviewed", blocked: "Needs context", needs_review: "Needs re-review" }[status] || "Not reviewed"; }
 function findingStatusLabel(status) { return { open: "Open", reviewed: "Reviewed", false_positive: "False positive", accepted_risk: "Accepted risk", suppressed: "Suppressed" }[status] || "Open"; }
 function evidenceIcon(type) { return { Source: "arrow-right", Sink: "target", Authorization: "lock", Validation: "verified", Controllability: "radio-tower", "Missing Context": "question", "Dynamic Validation": "pulse", "Exploit Condition": "warning", "False Positive Reason": "circle-slash", Remediation: "tools", Observation: "note" }[type] || "bookmark"; }
 

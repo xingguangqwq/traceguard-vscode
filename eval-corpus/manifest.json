@@ -3,19 +3,53 @@
   "version": 1,
   "cases": [
     {
+      "id": "java-parameterized-query-negative",
+      "language": "java",
+      "projectDir": "java/parameterized-query",
+      "repository": "local-regression-fixture",
+      "commit": "working-tree",
+      "vulnerability": "Negative: JDBC binds input into a constant parameterized query",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "php-parameterized-query-negative",
+      "language": "php",
+      "projectDir": "php/parameterized-query",
+      "repository": "local-regression-fixture",
+      "commit": "working-tree",
+      "vulnerability": "Negative: PDO binds input into a constant parameterized query",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "python-parameterized-query-negative",
+      "language": "python",
+      "projectDir": "python/parameterized-query",
+      "repository": "local-regression-fixture",
+      "commit": "working-tree",
+      "vulnerability": "Negative: sqlite3 binds input into a constant parameterized query",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
       "id": "java-prepared-statement",
       "language": "java",
       "projectDir": "java/prepared-statement",
       "repository": "local-regression-fixture",
       "commit": "traceguard-0.9.0-baseline",
       "vulnerability": "CWE-89 dynamic SQL passed to Connection.prepareStatement",
-      "expected": [{
-        "ruleId": "potential-sql-injection",
-        "relativePath": "SearchController.java",
-        "sinkLine": 6,
-        "requiredFunctions": ["handle"],
-        "allowHeuristic": false
-      }],
+      "expected": [
+        {
+          "ruleId": "potential-sql-injection",
+          "relativePath": "SearchController.java",
+          "sinkLine": 6,
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowHeuristic": false
+        }
+      ],
       "falsePositiveMax": 0
     },
     {
@@ -25,13 +59,17 @@
       "repository": "local-regression-fixture",
       "commit": "traceguard-0.9.0-baseline",
       "vulnerability": "CWE-89 request data reaches an unresolved query receiver",
-      "expected": [{
-        "ruleId": "potential-sql-injection",
-        "relativePath": "search.php",
-        "sinkLine": 5,
-        "requiredFunctions": ["run"],
-        "allowHeuristic": true
-      }],
+      "expected": [
+        {
+          "ruleId": "potential-sql-injection",
+          "relativePath": "search.php",
+          "sinkLine": 5,
+          "requiredFunctions": [
+            "run"
+          ],
+          "allowHeuristic": true
+        }
+      ],
       "falsePositiveMax": 0
     },
     {
@@ -41,13 +79,1088 @@
       "repository": "local-regression-fixture",
       "commit": "traceguard-0.9.0-baseline",
       "vulnerability": "CWE-89 request data reaches sqlite3 Cursor.execute",
-      "expected": [{
-        "ruleId": "potential-sql-injection",
-        "relativePath": "search.py",
-        "sinkLine": 6,
-        "requiredFunctions": ["search"],
-        "allowHeuristic": false
-      }],
+      "expected": [
+        {
+          "ruleId": "potential-sql-injection",
+          "relativePath": "search.py",
+          "sinkLine": 6,
+          "requiredFunctions": [
+            "search"
+          ],
+          "allowHeuristic": false
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-java-command-vulnerable",
+      "language": "java",
+      "projectDir": "java/backend-v1/command/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "command",
+      "ruleFamily": "potential-command-injection",
+      "proofLimitation": "JDK chained/static receiver models currently provide syntax evidence, without compiler-backed symbol proof.",
+      "vulnerability": "Positive: command command-injection",
+      "expected": [
+        {
+          "ruleId": "potential-command-injection",
+          "relativePath": "Controller.java",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified",
+            "heuristic"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-java-command-safe",
+      "language": "java",
+      "projectDir": "java/backend-v1/command/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "command",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Negative: command command-injection",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-java-concatenation-vulnerable",
+      "language": "java",
+      "projectDir": "java/backend-v1/concatenation/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "concatenation",
+      "ruleFamily": "potential-command-injection",
+      "proofLimitation": "JDK chained/static receiver models currently provide syntax evidence, without compiler-backed symbol proof.",
+      "vulnerability": "Positive: concatenation command-injection",
+      "expected": [
+        {
+          "ruleId": "potential-command-injection",
+          "relativePath": "Controller.java",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified",
+            "heuristic"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-java-concatenation-safe",
+      "language": "java",
+      "projectDir": "java/backend-v1/concatenation/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "concatenation",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Negative: concatenation command-injection",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-java-overwrite-vulnerable",
+      "language": "java",
+      "projectDir": "java/backend-v1/overwrite/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "overwrite",
+      "ruleFamily": "potential-command-injection",
+      "proofLimitation": "JDK chained/static receiver models currently provide syntax evidence, without compiler-backed symbol proof.",
+      "vulnerability": "Positive: overwrite command-injection",
+      "expected": [
+        {
+          "ruleId": "potential-command-injection",
+          "relativePath": "Controller.java",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified",
+            "heuristic"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-java-overwrite-safe",
+      "language": "java",
+      "projectDir": "java/backend-v1/overwrite/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "overwrite",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Negative: overwrite command-injection",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-java-branch-vulnerable",
+      "language": "java",
+      "projectDir": "java/backend-v1/branch/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "branch",
+      "ruleFamily": "potential-command-injection",
+      "proofLimitation": "JDK chained/static receiver models currently provide syntax evidence, without compiler-backed symbol proof.",
+      "vulnerability": "Positive: branch command-injection",
+      "expected": [
+        {
+          "ruleId": "potential-command-injection",
+          "relativePath": "Controller.java",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified",
+            "heuristic"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-java-branch-safe",
+      "language": "java",
+      "projectDir": "java/backend-v1/branch/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "branch",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Negative: branch command-injection",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-java-alias-vulnerable",
+      "language": "java",
+      "projectDir": "java/backend-v1/alias/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "alias",
+      "ruleFamily": "potential-command-injection",
+      "proofLimitation": "JDK chained/static receiver models currently provide syntax evidence, without compiler-backed symbol proof.",
+      "vulnerability": "Positive: alias command-injection",
+      "expected": [
+        {
+          "ruleId": "potential-command-injection",
+          "relativePath": "Controller.java",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified",
+            "heuristic"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-java-alias-safe",
+      "language": "java",
+      "projectDir": "java/backend-v1/alias/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "alias",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Negative: alias command-injection",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-java-cross-file-vulnerable",
+      "language": "java",
+      "projectDir": "java/backend-v1/cross-file/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "cross-file",
+      "ruleFamily": "potential-command-injection",
+      "proofLimitation": "JDK chained/static receiver models currently provide syntax evidence, without compiler-backed symbol proof.",
+      "vulnerability": "Positive: cross-file command-injection",
+      "expected": [
+        {
+          "ruleId": "potential-command-injection",
+          "relativePath": "Helper.java",
+          "requiredFunctions": [
+            "handle",
+            "run"
+          ],
+          "allowedProofStatuses": [
+            "verified",
+            "heuristic"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-java-cross-file-safe",
+      "language": "java",
+      "projectDir": "java/backend-v1/cross-file/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "cross-file",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Negative: cross-file command-injection",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-java-sql-vulnerable",
+      "language": "java",
+      "projectDir": "java/backend-v1/sql/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "sql",
+      "ruleFamily": "potential-sql-injection",
+      "vulnerability": "Positive: sql sql-injection",
+      "expected": [
+        {
+          "ruleId": "potential-sql-injection",
+          "relativePath": "Controller.java",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-java-sql-safe",
+      "language": "java",
+      "projectDir": "java/backend-v1/sql/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "sql",
+      "ruleFamily": "potential-sql-injection",
+      "vulnerability": "Negative: sql sql-injection",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-java-path-vulnerable",
+      "language": "java",
+      "projectDir": "java/backend-v1/path/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "path",
+      "ruleFamily": "potential-path-traversal",
+      "proofLimitation": "JDK chained/static receiver models currently provide syntax evidence, without compiler-backed symbol proof.",
+      "vulnerability": "Positive: path path-traversal",
+      "expected": [
+        {
+          "ruleId": "potential-path-traversal",
+          "relativePath": "Controller.java",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified",
+            "heuristic"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-java-path-safe",
+      "language": "java",
+      "projectDir": "java/backend-v1/path/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "path",
+      "ruleFamily": "potential-path-traversal",
+      "vulnerability": "Negative: path path-traversal",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-java-ssrf-vulnerable",
+      "language": "java",
+      "projectDir": "java/backend-v1/ssrf/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "ssrf",
+      "ruleFamily": "potential-ssrf",
+      "vulnerability": "Positive: ssrf ssrf",
+      "expected": [
+        {
+          "ruleId": "potential-ssrf",
+          "relativePath": "Controller.java",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-java-ssrf-safe",
+      "language": "java",
+      "projectDir": "java/backend-v1/ssrf/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "ssrf",
+      "ruleFamily": "potential-ssrf",
+      "vulnerability": "Negative: ssrf ssrf",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-java-deserialize-vulnerable",
+      "language": "java",
+      "projectDir": "java/backend-v1/deserialize/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "deserialize",
+      "ruleFamily": "potential-unsafe-deserialization",
+      "vulnerability": "Positive: deserialize unsafe-deserialization",
+      "expected": [
+        {
+          "ruleId": "potential-unsafe-deserialization",
+          "relativePath": "Controller.java",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-java-deserialize-safe",
+      "language": "java",
+      "projectDir": "java/backend-v1/deserialize/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "deserialize",
+      "ruleFamily": "potential-unsafe-deserialization",
+      "vulnerability": "Negative: deserialize unsafe-deserialization",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-php-command-vulnerable",
+      "language": "php",
+      "projectDir": "php/backend-v1/command/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "command",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Positive: command command-injection",
+      "expected": [
+        {
+          "ruleId": "potential-command-injection",
+          "relativePath": "handler.php",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-php-command-safe",
+      "language": "php",
+      "projectDir": "php/backend-v1/command/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "command",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Negative: command command-injection",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-php-concatenation-vulnerable",
+      "language": "php",
+      "projectDir": "php/backend-v1/concatenation/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "concatenation",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Positive: concatenation command-injection",
+      "expected": [
+        {
+          "ruleId": "potential-command-injection",
+          "relativePath": "handler.php",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-php-concatenation-safe",
+      "language": "php",
+      "projectDir": "php/backend-v1/concatenation/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "concatenation",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Negative: concatenation command-injection",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-php-overwrite-vulnerable",
+      "language": "php",
+      "projectDir": "php/backend-v1/overwrite/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "overwrite",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Positive: overwrite command-injection",
+      "expected": [
+        {
+          "ruleId": "potential-command-injection",
+          "relativePath": "handler.php",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-php-overwrite-safe",
+      "language": "php",
+      "projectDir": "php/backend-v1/overwrite/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "overwrite",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Negative: overwrite command-injection",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-php-branch-vulnerable",
+      "language": "php",
+      "projectDir": "php/backend-v1/branch/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "branch",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Positive: branch command-injection",
+      "expected": [
+        {
+          "ruleId": "potential-command-injection",
+          "relativePath": "handler.php",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-php-branch-safe",
+      "language": "php",
+      "projectDir": "php/backend-v1/branch/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "branch",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Negative: branch command-injection",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-php-alias-vulnerable",
+      "language": "php",
+      "projectDir": "php/backend-v1/alias/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "alias",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Positive: alias command-injection",
+      "expected": [
+        {
+          "ruleId": "potential-command-injection",
+          "relativePath": "handler.php",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-php-alias-safe",
+      "language": "php",
+      "projectDir": "php/backend-v1/alias/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "alias",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Negative: alias command-injection",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-php-cross-file-vulnerable",
+      "language": "php",
+      "projectDir": "php/backend-v1/cross-file/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "cross-file",
+      "ruleFamily": "potential-command-injection",
+      "proofLimitation": "The include-backed global function is currently resolved by a nearby-file heuristic, not proven include identity.",
+      "vulnerability": "Positive: cross-file command-injection",
+      "expected": [
+        {
+          "ruleId": "potential-command-injection",
+          "relativePath": "helper.php",
+          "requiredFunctions": [
+            "handle",
+            "runCommand"
+          ],
+          "allowedProofStatuses": [
+            "verified",
+            "heuristic"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-php-cross-file-safe",
+      "language": "php",
+      "projectDir": "php/backend-v1/cross-file/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "cross-file",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Negative: cross-file command-injection",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-php-sql-vulnerable",
+      "language": "php",
+      "projectDir": "php/backend-v1/sql/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "sql",
+      "ruleFamily": "potential-sql-injection",
+      "vulnerability": "Positive: sql sql-injection",
+      "expected": [
+        {
+          "ruleId": "potential-sql-injection",
+          "relativePath": "handler.php",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-php-sql-safe",
+      "language": "php",
+      "projectDir": "php/backend-v1/sql/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "sql",
+      "ruleFamily": "potential-sql-injection",
+      "vulnerability": "Negative: sql sql-injection",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-php-path-vulnerable",
+      "language": "php",
+      "projectDir": "php/backend-v1/path/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "path",
+      "ruleFamily": "potential-path-traversal",
+      "vulnerability": "Positive: path path-traversal",
+      "expected": [
+        {
+          "ruleId": "potential-path-traversal",
+          "relativePath": "handler.php",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-php-path-safe",
+      "language": "php",
+      "projectDir": "php/backend-v1/path/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "path",
+      "ruleFamily": "potential-path-traversal",
+      "vulnerability": "Negative: path path-traversal",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-php-ssrf-vulnerable",
+      "language": "php",
+      "projectDir": "php/backend-v1/ssrf/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "ssrf",
+      "ruleFamily": "potential-ssrf",
+      "vulnerability": "Positive: ssrf ssrf",
+      "expected": [
+        {
+          "ruleId": "potential-ssrf",
+          "relativePath": "handler.php",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-php-ssrf-safe",
+      "language": "php",
+      "projectDir": "php/backend-v1/ssrf/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "ssrf",
+      "ruleFamily": "potential-ssrf",
+      "vulnerability": "Negative: ssrf ssrf",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-php-deserialize-vulnerable",
+      "language": "php",
+      "projectDir": "php/backend-v1/deserialize/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "deserialize",
+      "ruleFamily": "potential-unsafe-deserialization",
+      "vulnerability": "Positive: deserialize unsafe-deserialization",
+      "expected": [
+        {
+          "ruleId": "potential-unsafe-deserialization",
+          "relativePath": "handler.php",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-php-deserialize-safe",
+      "language": "php",
+      "projectDir": "php/backend-v1/deserialize/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "deserialize",
+      "ruleFamily": "potential-unsafe-deserialization",
+      "vulnerability": "Negative: deserialize unsafe-deserialization",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-python-command-vulnerable",
+      "language": "python",
+      "projectDir": "python/backend-v1/command/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "command",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Positive: command command-injection",
+      "expected": [
+        {
+          "ruleId": "potential-command-injection",
+          "relativePath": "handler.py",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-python-command-safe",
+      "language": "python",
+      "projectDir": "python/backend-v1/command/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "command",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Negative: command command-injection",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-python-concatenation-vulnerable",
+      "language": "python",
+      "projectDir": "python/backend-v1/concatenation/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "concatenation",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Positive: concatenation command-injection",
+      "expected": [
+        {
+          "ruleId": "potential-command-injection",
+          "relativePath": "handler.py",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-python-concatenation-safe",
+      "language": "python",
+      "projectDir": "python/backend-v1/concatenation/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "concatenation",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Negative: concatenation command-injection",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-python-overwrite-vulnerable",
+      "language": "python",
+      "projectDir": "python/backend-v1/overwrite/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "overwrite",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Positive: overwrite command-injection",
+      "expected": [
+        {
+          "ruleId": "potential-command-injection",
+          "relativePath": "handler.py",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-python-overwrite-safe",
+      "language": "python",
+      "projectDir": "python/backend-v1/overwrite/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "overwrite",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Negative: overwrite command-injection",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-python-branch-vulnerable",
+      "language": "python",
+      "projectDir": "python/backend-v1/branch/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "branch",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Positive: branch command-injection",
+      "expected": [
+        {
+          "ruleId": "potential-command-injection",
+          "relativePath": "handler.py",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-python-branch-safe",
+      "language": "python",
+      "projectDir": "python/backend-v1/branch/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "branch",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Negative: branch command-injection",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-python-alias-vulnerable",
+      "language": "python",
+      "projectDir": "python/backend-v1/alias/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "alias",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Positive: alias command-injection",
+      "expected": [
+        {
+          "ruleId": "potential-command-injection",
+          "relativePath": "handler.py",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-python-alias-safe",
+      "language": "python",
+      "projectDir": "python/backend-v1/alias/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "alias",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Negative: alias command-injection",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-python-cross-file-vulnerable",
+      "language": "python",
+      "projectDir": "python/backend-v1/cross-file/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "cross-file",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Positive: cross-file command-injection",
+      "expected": [
+        {
+          "ruleId": "potential-command-injection",
+          "relativePath": "helper.py",
+          "requiredFunctions": [
+            "handle",
+            "run_command"
+          ],
+          "allowedProofStatuses": [
+            "verified"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-python-cross-file-safe",
+      "language": "python",
+      "projectDir": "python/backend-v1/cross-file/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "cross-file",
+      "ruleFamily": "potential-command-injection",
+      "vulnerability": "Negative: cross-file command-injection",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-python-sql-vulnerable",
+      "language": "python",
+      "projectDir": "python/backend-v1/sql/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "sql",
+      "ruleFamily": "potential-sql-injection",
+      "vulnerability": "Positive: sql sql-injection",
+      "expected": [
+        {
+          "ruleId": "potential-sql-injection",
+          "relativePath": "handler.py",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-python-sql-safe",
+      "language": "python",
+      "projectDir": "python/backend-v1/sql/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "sql",
+      "ruleFamily": "potential-sql-injection",
+      "vulnerability": "Negative: sql sql-injection",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-python-path-vulnerable",
+      "language": "python",
+      "projectDir": "python/backend-v1/path/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "path",
+      "ruleFamily": "potential-path-traversal",
+      "proofLimitation": "The builtin open call currently has syntax evidence without an independently resolved builtin symbol.",
+      "vulnerability": "Positive: path path-traversal",
+      "expected": [
+        {
+          "ruleId": "potential-path-traversal",
+          "relativePath": "handler.py",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified",
+            "heuristic"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-python-path-safe",
+      "language": "python",
+      "projectDir": "python/backend-v1/path/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "path",
+      "ruleFamily": "potential-path-traversal",
+      "vulnerability": "Negative: path path-traversal",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-python-ssrf-vulnerable",
+      "language": "python",
+      "projectDir": "python/backend-v1/ssrf/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "ssrf",
+      "ruleFamily": "potential-ssrf",
+      "vulnerability": "Positive: ssrf ssrf",
+      "expected": [
+        {
+          "ruleId": "potential-ssrf",
+          "relativePath": "handler.py",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-python-ssrf-safe",
+      "language": "python",
+      "projectDir": "python/backend-v1/ssrf/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "ssrf",
+      "ruleFamily": "potential-ssrf",
+      "vulnerability": "Negative: ssrf ssrf",
+      "expected": [],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-python-deserialize-vulnerable",
+      "language": "python",
+      "projectDir": "python/backend-v1/deserialize/vulnerable",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "deserialize",
+      "ruleFamily": "potential-unsafe-deserialization",
+      "vulnerability": "Positive: deserialize unsafe-deserialization",
+      "expected": [
+        {
+          "ruleId": "potential-unsafe-deserialization",
+          "relativePath": "handler.py",
+          "requiredFunctions": [
+            "handle"
+          ],
+          "allowedProofStatuses": [
+            "verified"
+          ]
+        }
+      ],
+      "falsePositiveMax": 0
+    },
+    {
+      "id": "backend-v1-python-deserialize-safe",
+      "language": "python",
+      "projectDir": "python/backend-v1/deserialize/safe",
+      "repository": "local-regression-fixture",
+      "commit": "backend-v1",
+      "scenario": "deserialize",
+      "ruleFamily": "potential-unsafe-deserialization",
+      "vulnerability": "Negative: deserialize unsafe-deserialization",
+      "expected": [],
       "falsePositiveMax": 0
     }
   ]

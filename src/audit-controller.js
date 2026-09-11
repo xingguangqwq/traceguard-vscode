@@ -1,6 +1,8 @@
 const path = require("path");
 const vscode = require("vscode");
 const { affectsAnalysisModel } = require("./analysis/configuration");
+const { WorkspaceFileMonitor } = require("./analysis/workspace-file-monitor");
+const { isRelevantDiskChange, synchronizeWorkspaceChanges } = require("./analysis/workspace-file-sync");
 const { AttackSurfaceProvider, AuditCodeLensProvider, AuditHoverProvider, AuditQueryProvider, CodeTreeProvider, EvidenceProvider } = require("./audit-providers");
 const { buildInteractiveModel, callDetailsAtPosition, callNameAtPosition, mergeInteractiveModel, selectedCallName } = require("./config/interactive-model");
 const { AuditSession, workspaceRelativePath } = require("./audit-session");
@@ -11,6 +13,7 @@ const { QueryKind, formatQueryMarkdown } = require("./query/audit-query-engine")
 const { buildSarif } = require("./sarif");
 const { normalizePath } = require("./identity");
 const { findingPool } = require("./review/finding-pool");
+const { createEvidenceAnchor, resolveEvidenceLocation } = require("./review/evidence-anchor");
 
 const INTERACTIVE_SINK_KINDS = [
   { label: "$(database) SQL query", description: "Dynamic database query text", kind: "SQL_QUERY" },
@@ -41,6 +44,14 @@ class AuditController {
     this.context = context;
     this.output = output;
     this.session = new AuditSession(context, output);
+    const isActive = () => vscode.workspace.isTrusted && (this.session.workspaceIndexBuilt || this.session.indexing || this.session.analyses.length > 0);
+    this.fileMonitor = new WorkspaceFileMonitor(vscode.workspace, {
+      isActive,
+      isRelevant: (uri, kind) => isActive() && isRelevantDiskChange(vscode.workspace, this.session, uri, kind),
+      onBatch: batch => synchronizeWorkspaceChanges(vscode.workspace, this.session, batch),
+      onPending: pending => this.session.setFilesystemSyncPending(pending),
+      onError: error => this.output.error(`Filesystem synchronization failed: ${firstLine(error?.message || error)}`),
+    });
     this.codeProvider = new CodeTreeProvider(this.session);
     this.queryProvider = new AuditQueryProvider();
     this.summaryProvider = new AttackSurfaceProvider(this.session);
@@ -69,6 +80,7 @@ class AuditController {
   _register() {
     this.context.subscriptions.push(
       this.session,
+      this.fileMonitor,
       this.codeProvider,
       this.queryProvider,
       this.summaryProvider,
@@ -110,6 +122,7 @@ class AuditController {
       vscode.commands.registerCommand("traceguard.traceCrossFileFlow", item => this.traceCrossFileFlow(item)),
       vscode.commands.registerCommand("traceguard.traceFromEntry", item => this.traceFromEntry(item)),
       vscode.commands.registerCommand("traceguard.traceFinding", item => this.traceFinding(item)),
+      vscode.commands.registerCommand("traceguard.modelInterruptedCall", item => this.modelInterruptedCall(item)),
       vscode.commands.registerCommand("traceguard.previousTraceStep", () => this.moveTraceStep(-1)),
       vscode.commands.registerCommand("traceguard.nextTraceStep", () => this.moveTraceStep(1)),
       vscode.commands.registerCommand("traceguard.selectTraceStep", index => this.selectTraceStep(index)),
@@ -308,6 +321,7 @@ class AuditController {
       return undefined;
     }
     await this.session.reindexDocument(editor.document);
+    this.lastAuditRequest = { uri: editor.document.uri, line: editor.selection.active.line, kind, identifier };
     const result = await vscode.window.withProgress({
       location: vscode.ProgressLocation.Window,
       title: "TraceGuard is querying the analysis graph",
@@ -333,6 +347,7 @@ class AuditController {
     const options = [
       { id: "priority", label: "$(list-ordered) P0 / P1 first", description: "All targets, ordered by audit value" },
       { id: "unreviewed", label: "$(circle-outline) Unreviewed" },
+      { id: "needs_review", label: "$(refresh) Changed since review", description: "Code, dependencies or analysis models changed" },
       { id: "in_review", label: "$(debug-pause) In review" },
       { id: "blocked", label: "$(circle-slash) Needs context" },
       { id: "reviewed", label: "$(pass-filled) Reviewed" },
@@ -638,8 +653,39 @@ class AuditController {
     await this.session.setFindingStatus(finding.id, status);
   }
 
-  async markSelectedCall(role) {
-    const editor = vscode.window.activeTextEditor;
+  async modelInterruptedCall(item) {
+    const location = item?.interruption?.location || item?.node?.location || item?.location;
+    if (!location?.absolutePath || !location.line) return;
+    const request = this.queryProvider.current ? this.lastAuditRequest : undefined;
+    const trace = this.queryProvider.currentTrace;
+    const root = trace?.steps?.[0];
+    const editor = await openLocation(location.absolutePath, location.line, location.line);
+    const selected = await vscode.window.showQuickPick([
+      { id: "callees", label: "Inspect candidate callees", description: "Inspect available implementations before modeling" },
+      { id: "propagator", label: "Model argument → return propagation", description: "Save selected argument propagation in .traceguard.json" },
+      { id: "source", label: "Model an external input Source", description: "Save an input-returning API in .traceguard.json" },
+      { id: "sink", label: "Model a sensitive Sink", description: "Save the API effect and affected arguments in .traceguard.json" },
+    ], { title: "Continue analysis at this interruption", matchOnDescription: true });
+    if (!selected) return;
+    if (selected.id === "callees") return this.executeAuditQuery(QueryKind.FIND_CALLEES);
+    const changed = await this.markSelectedCall(selected.id, { editor, suppressNotice: true });
+    if (!changed) return;
+    const rerun = request || { uri: vscode.Uri.file(root?.absolutePath || location.absolutePath),
+      line: Math.max(0, (root?.line || location.line) - 1), kind: QueryKind.REACHABLE_SINKS };
+    const result = await this.session.queryAudit(rerun.uri, rerun.line, rerun.kind, rerun.identifier);
+    this.lastAuditRequest = rerun;
+    this.lastAuditQuery = result;
+    this.queryProvider.setResult(result);
+    this.clearSymbolTrace();
+    await vscode.commands.executeCommand("setContext", "traceguard.hasAuditQuery", true);
+    await vscode.commands.executeCommand("setContext", "traceguard.hasTracePath", false);
+    await vscode.commands.executeCommand("traceguard.auditQueries.focus");
+    vscode.window.setStatusBarMessage("$(refresh) Model applied; trace recomputed with current proof status", 5000);
+    return result;
+  }
+
+  async markSelectedCall(role, options = {}) {
+    const editor = options.editor || vscode.window.activeTextEditor;
     const language = editor && languageForPath(editor.document.uri.fsPath);
     if (!editor || !language) {
       vscode.window.showInformationMessage(`Open a ${SUPPORTED_LABEL} file and place the cursor on a call first.`);
@@ -648,7 +694,7 @@ class AuditController {
     const callContext = await this._interactiveCallContext(editor);
     const inferred = callContext.functionName;
     const functionName = await vscode.window.showInputBox({
-      title: role === "source" ? "Mark selected call as Source" : "Mark selected call as Sink",
+      title: `Model selected call as ${role}`,
       prompt: "Confirm the function or qualified call name stored in this workspace's .traceguard.json.",
       placeHolder: "For example: requestValue, os.system, Runtime.exec",
       value: inferred,
@@ -666,6 +712,10 @@ class AuditController {
       if (!picked) return;
       kind = picked.kind;
       argumentIndexes = await this._pickInteractiveArguments(callContext, "Sink");
+      if (!argumentIndexes) return;
+    }
+    if (role === "propagator") {
+      argumentIndexes = await this._pickInteractiveArguments(callContext, "argument-to-return Propagator");
       if (!argumentIndexes) return;
     }
     const folder = vscode.workspace.getWorkspaceFolder(editor.document.uri);
@@ -710,11 +760,13 @@ class AuditController {
       title: `TraceGuard is applying the new ${role} model`,
       cancellable: false,
     }, () => this.session.reloadProjectConfiguration({ rebuild: true }));
+    if (options.suppressNotice) return true;
     const action = await vscode.window.showInformationMessage(
       `Marked ${selectedCallName(functionName)} as a project ${role}. Source → Sink paths were rebuilt.`,
       "Open Configuration",
     );
     if (action) await vscode.window.showTextDocument(uri, { preview: false });
+    return true;
   }
 
   async markTemporarySelection(role) {
@@ -856,7 +908,8 @@ class AuditController {
     if (!type) return;
     const note = await vscode.window.showInputBox({ prompt: "Audit note (optional)", placeHolder: "Why this evidence matters, assumptions, or follow-up question" });
     if (note === undefined) return;
-    await this.session.addEvidence({ type, note, code, absolutePath: editor.document.uri.fsPath, relativePath: workspaceRelativePath(editor.document.uri), line: selection.start.line + 1, endLine: selection.end.line + 1 });
+    await this.session.addEvidence({ type, note, code, absolutePath: editor.document.uri.fsPath, relativePath: workspaceRelativePath(editor.document.uri), line: selection.start.line + 1, endLine: selection.end.line + 1,
+      anchor: createEvidenceAnchor(editor.document.getText(), selection.start.line + 1, selection.end.line + 1) });
     vscode.window.showInformationMessage(`Added ${type.toLowerCase()} evidence to the audit notebook.`);
   }
 
@@ -874,7 +927,25 @@ class AuditController {
     await this.session.addEvidence({ type, note, code, absolutePath: item.absolutePath, relativePath: item.relativePath, line: item.line, endLine: item.endLine, auditItemId: item.id });
   }
 
-  async openEvidence(item) { if (item) await openLocation(item.absolutePath, item.line, item.endLine); }
+  async openEvidence(item) {
+    if (!item) return;
+    const current = this.session.snapshot.evidence.find(note => note.id === item.id);
+    if (!current) return;
+    let document;
+    try { document = await vscode.workspace.openTextDocument(vscode.Uri.file(current.absolutePath)); }
+    catch {
+      await this.session.updateEvidenceLocation(current.id, { status: "stale" });
+      vscode.window.showWarningMessage("This note's source file is unavailable. The saved evidence is still in Notes.");
+      return;
+    }
+    const location = resolveEvidenceLocation(current, document.getText());
+    await this.session.updateEvidenceLocation(current.id, location);
+    if (location.status === "stale") {
+      vscode.window.showWarningMessage("This evidence is stale or ambiguous: its saved code cannot be uniquely located. The original snippet is preserved in Notes.");
+      return;
+    }
+    await openLocation(current.absolutePath, location.line, location.endLine, document);
+  }
   async openEvidenceById(id) { const item = this.session.snapshot.evidence.find(candidate => candidate.id === id); if (item) await this.openEvidence(item); }
 
   async generateReport() {
@@ -955,6 +1026,10 @@ class AuditController {
   }
 
   _onSaved(document) {
+    if (this.session.workspaceIndexBuilt || this.session.indexing || this.session.analyses.length) {
+      this.fileMonitor.enqueue("change", document.uri);
+      return;
+    }
     if (isProjectConfigurationUri(document.uri) && vscode.workspace.isTrusted) {
       void this._runBackground("Project configuration reload", () => this._reloadProjectConfiguration());
       return;
@@ -997,6 +1072,10 @@ class AuditController {
 
   async _onFilesCreated(files) {
     if (!vscode.workspace.isTrusted) return;
+    if (this.session.workspaceIndexBuilt || this.session.indexing || this.session.analyses.length) {
+      for (const uri of files) this.fileMonitor.enqueue("create", uri);
+      return;
+    }
     if (files.some(isProjectConfigurationUri)) await this._reloadProjectConfiguration();
     if (files.some(isProjectIdentityUri)) await this._reloadProjectIdentity();
     for (const uri of files) await this.session.reindexFile(uri);
@@ -1004,6 +1083,10 @@ class AuditController {
 
   async _onFilesDeleted(files) {
     if (!vscode.workspace.isTrusted) return;
+    if (this.session.workspaceIndexBuilt || this.session.indexing || this.session.analyses.length) {
+      for (const uri of files) this.fileMonitor.enqueue("delete", uri);
+      return;
+    }
     await this.session.removeFiles(files);
     if (files.some(isProjectConfigurationUri)) await this._reloadProjectConfiguration();
     if (files.some(isProjectIdentityUri)) await this._reloadProjectIdentity();
@@ -1012,6 +1095,14 @@ class AuditController {
   async _onFilesRenamed(files) {
     if (!vscode.workspace.isTrusted) return;
     await this.session.migrateEvidencePaths(files);
+    if (this.session.workspaceIndexBuilt || this.session.indexing || this.session.analyses.length) {
+      for (const item of files) {
+        this.fileMonitor.enqueue("delete", item.oldUri);
+        this.fileMonitor.enqueue("create", item.newUri);
+        if (!languageForPath(item.oldUri.fsPath) && !languageForPath(item.newUri.fsPath)) this.fileMonitor.requestRescan();
+      }
+      return;
+    }
     await this.session.removeFiles(files.map(item => item.oldUri));
     for (const item of files) await this.session.reindexFile(item.newUri);
     if (files.some(item => isProjectConfigurationUri(item.oldUri) || isProjectConfigurationUri(item.newUri))) await this._reloadProjectConfiguration();
@@ -1048,6 +1139,11 @@ class AuditController {
 
   _updateStatus() {
     const data = this.session.snapshot;
+    if (data.indexStale) {
+      this.status.text = "$(sync) TraceGuard · Results pending refresh";
+      this.status.tooltip = "Files changed on disk. The audit map is pending synchronization; use Refresh Code Review Index if synchronization failed.";
+      return;
+    }
     if (!vscode.workspace.isTrusted) {
       this.status.text = "$(lock) TraceGuard";
       this.status.tooltip = new vscode.MarkdownString("Trust the workspace to build a local audit map.");
@@ -1125,6 +1221,10 @@ class AuditController {
   }
 
   _updateDiagnostics() {
+    if (this.session.snapshot.indexStale) {
+      this.problemDiagnostics.clear();
+      return;
+    }
     const byUri = new Map();
     for (const finding of this.session.snapshot.findings) {
       if (findingPool(finding) !== "verified" || !finding.absolutePath) continue;
@@ -1175,6 +1275,7 @@ class AuditController {
   }
 
   dispose() {
+    this.fileMonitor.dispose();
     this.subscription?.dispose();
     for (const timer of this.documentTimers.values()) clearTimeout(timer);
   }
@@ -1354,10 +1455,10 @@ function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-async function openLocation(absolutePath, line, endLine) {
-  const document = await vscode.workspace.openTextDocument(vscode.Uri.file(absolutePath));
+async function openLocation(absolutePath, line, endLine, existingDocument) {
+  const document = existingDocument || await vscode.workspace.openTextDocument(vscode.Uri.file(absolutePath));
   const editor = await vscode.window.showTextDocument(document, { preview: true, preserveFocus: false });
-  const start = new vscode.Position(Math.max(0, line - 1), 0);
+  const start = new vscode.Position(Math.min(document.lineCount - 1, Math.max(0, line - 1)), 0);
   const end = new vscode.Position(Math.min(document.lineCount - 1, Math.max(line - 1, (endLine || line) - 1)), 0);
   editor.selection = new vscode.Selection(start, start);
   editor.revealRange(new vscode.Range(start, end), vscode.TextEditorRevealType.InCenterIfOutsideViewport);

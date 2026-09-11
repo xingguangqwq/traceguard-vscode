@@ -5,6 +5,22 @@ const test = require("node:test");
 const { analyzeTextAsync } = require("../src/audit-analyzer");
 const { QueryKind, QueryStatus, formatQueryMarkdown, runAuditQuery } = require("../src/query/audit-query-engine");
 
+test("PHP/Python literal overwrites agree between findings and interactive forward queries", async () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const { runDataflowAnalysis } = require("../src/dataflow/pipeline");
+  for (const language of ["php", "python"]) for (const scenario of ["overwrite", "branch"]) {
+    const name = language === "php" ? "handler.php" : "handler.py";
+    const absolutePath = path.resolve("eval-corpus", language, "backend-v1", scenario, "safe", name);
+    const analysis = await analyzeTextAsync(fs.readFileSync(absolutePath, "utf8"), language, absolutePath, name);
+    const fn = analysis.ir.functions.find(item => item.name === "handle");
+    assert.equal(runDataflowAnalysis([analysis]).findings.length, 0, `${language}/${scenario}`);
+    const query = runAuditQuery([analysis], { kind: QueryKind.TRACE_FORWARD, functionId: fn.id,
+      identifier: language === "php" ? "$value" : "value", line: fn.location.line });
+    assert.equal(flatten(query.roots).some(node => node.kind === "sink"), false, `${language}/${scenario}`);
+  }
+});
+
 async function queryFixture() {
   const routes = await analyzeTextAsync(`
 import { run } from "./service";

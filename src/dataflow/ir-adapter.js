@@ -115,6 +115,7 @@ function operationFromIR(operation) {
     argumentTypes: operation.call?.argumentTypes || [],
     certainty: operation.certainty,
     semanticModelId: operation.semantic.modelId,
+    semanticRole: operation.semantic.modelRole,
     semanticVerification: operation.metadata.semanticVerification,
     candidateStatus: operation.metadata.candidateStatus,
     taintArgumentIndexes: operation.metadata.taintArguments,

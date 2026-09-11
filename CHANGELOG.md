@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.1.0 - 2026-09-11
+
+- Added dependency fingerprints for review decisions. Changed code, resolved dependencies or analysis configuration reopen affected decisions for review while preserving the original conclusion; older decisions without a fingerprint are explicitly marked for re-review.
+- Added a Changed since review queue filter, stale-decision explanations and serialized review-state writes. Reopened findings no longer retain active false-positive or accepted-risk suppression.
+- Added an actionable Trace interruption menu for inspecting callees or creating project Source, Sink and argument-to-return Propagator models, followed by query recomputation. Unknown model identities remain unverified.
+- Limited semantic-configuration reparsing to affected workspace roots and reran their dependent analysis while preserving other roots' frontends.
+- Expanded the evaluation corpus to 66 cases across Java, PHP and Python, with per-language/per-rule summaries, explicit proof limitations and a 1.1.0 regression baseline.
+- Fixed PHP/Python constant-string overwrites missing from IR and forward-query alias continuations skipping subsequent overwrites. Empty paths no longer qualify as verified evidence.
+
+- Fixed concurrent queries bypassing Worker replay, and made cancellation/disposal interrupt replay waiters without allowing late disk reads to mutate a replacement workspace.
+- Added bounded, debounced disk-change synchronization for external edits and workspace-root changes; unsaved editor text wins, exclusions and workspace file quotas are respected, and stale results are labeled while diagnostics await refresh.
+- Stopped silently evicting audit notes on add/import, serialized note mutations, retained all supported note types on import, and added snippet/context relocation with explicit stale-note handling.
+- Hardened evaluation gates for negative cases, missing baseline cases and loss of verified paths. Added Java/PHP/Python parameterized-query negative fixtures.
+- Removed unrendered icon tokens from welcome text and isolated Extension Host smoke fixtures from the development repository.
+
 ## 1.0.0 - 2026-09-01
 
 - Reworked TraceGuard around four parts of a manual audit: Scope, Review Queue, Trace and Notes.

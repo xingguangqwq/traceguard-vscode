@@ -63,6 +63,74 @@ function fileNotFound() {
   return error;
 }
 
+test("Worker fingerprints reopen reviewed callers and dismissed findings after a dependency changes", async () => {
+  const root = path.resolve("review-fingerprint-workspace");
+  const AuditSession = loadAuditSession(root);
+  const session = new AuditSession(contextWith({}), { warn() {}, info() {} });
+  const entry = { fsPath: path.join(root, "entry.py") };
+  const helper = { fsPath: path.join(root, "helper.py") };
+  const entryText = 'from flask import Flask, request\nfrom helper import run\napp = Flask(__name__)\n@app.get("/run")\ndef handler():\n    command = request.args.get("cmd")\n    run(command)\n';
+  try {
+    await session.reindexDocument({ uri: helper, getText: () => 'import os\ndef run(command):\n    os.system(command)\n' });
+    await session.reindexDocument({ uri: entry, getText: () => entryText });
+    const target = session.snapshot.items.find(item => item.absolutePath === entry.fsPath);
+    assert.ok(target?.reviewFingerprint);
+    const finding = session.snapshot.findings[0];
+    assert.ok(finding?.reviewFingerprint);
+    await session.setStatus(target.id, "reviewed");
+    await session.setFindingStatus(finding.id, "false_positive");
+    const exported = session.exportPortableState();
+    await session.reindexDocument({ uri: entry, getText: () => entryText });
+    assert.equal(session.snapshot.items.find(item => item.id === target.id).status, "reviewed");
+    await session.reindexDocument({ uri: helper, getText: () => 'import os\ndef run(command):\n    os.system(command)\n    return True\n' });
+    const changed = session.snapshot.items.find(item => item.id === target.id);
+    assert.equal(changed.status, "needs_review");
+    assert.equal(changed.previousStatus, "reviewed");
+    const reopened = session.snapshot.findings.find(item => item.id === finding.id);
+    assert.equal(reopened.status, "open");
+    assert.equal(reopened.previousStatus, "false_positive");
+    assert.equal(session.snapshot.manualReviewCoverage.reviewed, 0);
+    await session.setStatus(target.id, "reviewed");
+    assert.equal(session.snapshot.items.find(item => item.id === target.id).needsReview, false);
+    await session.importPortableState(exported);
+    assert.equal(session.snapshot.items.find(item => item.id === target.id).status, "needs_review");
+  } finally { session.dispose(); }
+});
+
+test("adding and importing notes never evicts existing evidence at the old 500-note limit", async () => {
+  const root = path.resolve("review-notes");
+  const AuditSession = loadAuditSession(root);
+  const notes = Array.from({ length: 500 }, (_, i) => ({ id: `old-${i}`, relativePath: "a.js", code: "old" }));
+  const context = contextWith({ "traceguard.audit.evidence": notes });
+  const session = new AuditSession(context, { warn() {}, info() {} });
+  try {
+    await session.addEvidence({ absolutePath: path.join(root, "a.js"), line: 1, type: "Observation", code: "new" });
+    assert.equal(session.snapshot.evidence.length, 501);
+    await session.importPortableState({ schema: "traceguard-review-session", version: 1, statuses: {}, evidence: [
+      { id: "imported", relativePath: "a.js", code: "imported", type: "Controllability" },
+    ] });
+    assert.equal(session.snapshot.evidence.length, 502);
+    assert.equal(session.snapshot.evidence.find(note => note.id === "imported").type, "Controllability");
+    assert.ok(notes.every(note => session.snapshot.evidence.some(saved => saved.id === note.id)));
+  } finally { session.dispose(); }
+});
+
+test("concurrent note writes are serialized even when storage updates are asynchronous", async () => {
+  const AuditSession = loadAuditSession(path.resolve("review-notes"));
+  const context = contextWith({});
+  context.workspaceState.update = async (key, value) => {
+    await new Promise(resolve => setImmediate(resolve));
+    context.state.set(key, value);
+  };
+  const session = new AuditSession(context, { warn() {}, info() {} });
+  try {
+    const input = { absolutePath: "a.js", line: 1, type: "Observation", code: "same" };
+    await Promise.all(Array.from({ length: 5 }, () => session.addEvidence(input)));
+    assert.equal(session.snapshot.evidence.length, 5);
+    assert.equal(new Set(session.snapshot.evidence.map(note => note.id)).size, 5);
+  } finally { session.dispose(); }
+});
+
 function contextWith(initial) {
   const state = new Map(Object.entries(initial));
   return {

@@ -39,6 +39,14 @@ function reconcilePersistedStatuses(statuses, records, options = {}) {
       next[item.id] = activeRecord;
       changed = true;
     }
+    const record = next[item.id];
+    if (record && item.reviewFingerprint && record.reviewFingerprint !== item.reviewFingerprint && !record.needsReview) {
+      next[item.id] = { ...record, needsReview: true, changedAt: nowIso,
+        changeReason: record.reviewFingerprint
+          ? "Code, a resolved dependency, or analysis configuration changed since this decision."
+          : "This older decision has no code fingerprint. Review it against the current code." };
+      changed = true;
+    }
   }
 
   if (complete) {

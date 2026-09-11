@@ -270,3 +270,62 @@ export function run(): void {
 });
 
 function flattenQuery(nodes) { return (nodes || []).flatMap(node => [node, ...flattenQuery(node.children)]); }
+
+test("concurrent queries and updates wait for workspace replay", async () => {
+  let enterReplay, releaseReplay;
+  const entered = new Promise(resolve => { enterReplay = resolve; });
+  const barrier = new Promise(resolve => { releaseReplay = resolve; });
+  const file = { absolutePath: path.resolve("replay.java"), relativePath: "replay.java", language: "java", version: "1", text: "class Demo { void before() {} }" };
+  const client = new DataflowWorkerClient({ fileLoader: async metadata => {
+    enterReplay();
+    await barrier;
+    return { ...metadata, text: file.text };
+  } });
+  try {
+    await client.initializeWorkspace([file]);
+    client.cancelActive();
+    const recovery = client.queryPaths();
+    await entered;
+    let queryFinished = false;
+    const query = client.getAnalysis(file.absolutePath).then(result => { queryFinished = true; return result; });
+    // Give the new worker time to process an incorrectly early request.
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.equal(queryFinished, false, "a spawned worker is not a ready workspace");
+    const update = client.updateFile({ ...file, version: "2", text: "class Demo { void after() {} }" });
+    releaseReplay();
+    const [, analysis] = await Promise.all([recovery, query, update]);
+    assert.ok(analysis);
+    assert.ok((await client.getAnalysis(file.absolutePath)).functions.some(fn => fn.name === "after"));
+  } finally { releaseReplay(); await client.dispose(); }
+});
+
+for (const action of ["cancelActive", "dispose"]) {
+  test(`${action} interrupts pending replay file loading without leaving waiters stuck`, async () => {
+    let enterReplay, releaseReplay;
+    const entered = new Promise(resolve => { enterReplay = resolve; });
+    const barrier = new Promise(resolve => { releaseReplay = resolve; });
+    const client = new DataflowWorkerClient({
+      workerPath: path.join(__dirname, "worker-replay-fixture.js"),
+      fileLoader: async metadata => { enterReplay(); await barrier; return { ...metadata, text: "old" }; },
+    });
+    try {
+      await client.initializeWorkspace([{ absolutePath: path.resolve("old.js"), text: "old" }]);
+      client.cancelActive();
+      const recovery = client.queryPaths();
+      const rejected = assert.rejects(recovery, error => error.code === (action === "dispose" ? "WORKER_DISPOSED" : "WORKER_CANCELLED"));
+      await entered;
+      await client[action]();
+      await Promise.race([rejected, new Promise((_, reject) => {
+        const timer = setTimeout(() => reject(new Error("replay cancellation hung")), 1000);
+        timer.unref();
+      })]);
+      if (action !== "dispose") {
+        await client.initializeWorkspace([]);
+        releaseReplay();
+        await new Promise(resolve => setTimeout(resolve, 30));
+        assert.equal(client.files.size, 0, "late replay must not resurrect old metadata");
+        assert.equal((await client.queryPaths()).initialized, true);
+      }
+    } finally { releaseReplay(); await client.dispose(); }
+  });
+}

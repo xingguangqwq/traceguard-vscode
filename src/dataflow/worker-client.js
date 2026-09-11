@@ -122,6 +122,7 @@ class DataflowWorkerClient {
     this.disposed = true;
     const error = new Error("TraceGuard dataflow worker was stopped.");
     error.code = "WORKER_DISPOSED";
+    this._interruptReady(error);
     this._rejectPending(error);
     const worker = this.worker;
     this.worker = undefined;
@@ -132,6 +133,7 @@ class DataflowWorkerClient {
   cancelActive(reason = "TraceGuard analysis was cancelled.") {
     const error = new Error(reason);
     error.code = "WORKER_CANCELLED";
+    this._interruptReady(error);
     const worker = this.worker;
     this.worker = undefined;
     this.readyPromise = undefined;
@@ -160,20 +162,22 @@ class DataflowWorkerClient {
   }
 
   async _ensureReady(skipReplay) {
-    if (this.worker) return this.worker;
     if (this.readyPromise) return this.readyPromise;
-    this.readyPromise = (async () => {
-      const worker = this._spawnWorker();
+    if (this.worker) return this.worker;
+    const worker = this._spawnWorker();
+    const interrupted = new Promise((_, reject) => { this.abortReady = reject; });
+    const initialization = (async () => {
       try {
         if (this.needsReplay && !skipReplay) {
           const replayStartedAt = performance.now();
           this.pendingReplayMetrics = undefined;
-          const files = await this._materializeReplayFiles();
+          const files = await this._materializeReplayFiles(worker);
           const replay = await this._post(worker, {
             type: "initializeWorkspace",
             files,
             options: this.workspaceOptions,
           }, { timeoutMs: this.indexTimeoutMs });
+          this._assertCurrentWorker(worker);
           this.pendingReplayMetrics = {
             workerReplayMs: roundMetric(performance.now() - replayStartedAt),
             workerReplayFiles: files.length,
@@ -189,18 +193,39 @@ class DataflowWorkerClient {
         throw error;
       }
     })();
+    const ready = Promise.race([initialization, interrupted]);
+    this.readyPromise = ready;
     try {
-      return await this.readyPromise;
+      return await ready;
     } finally {
-      this.readyPromise = undefined;
+      // A cancelled generation must not clear a replacement worker's barrier.
+      if (this.readyPromise === ready) {
+        this.readyPromise = undefined;
+        this.abortReady = undefined;
+      }
     }
   }
 
-  async _materializeReplayFiles() {
+  _interruptReady(error) {
+    const abort = this.abortReady;
+    this.readyPromise = undefined;
+    this.abortReady = undefined;
+    abort?.(error);
+  }
+
+  _assertCurrentWorker(worker) {
+    if (!this.disposed && this.worker === worker) return;
+    const error = new Error("TraceGuard worker readiness was interrupted.");
+    error.code = this.disposed ? "WORKER_DISPOSED" : "WORKER_CANCELLED";
+    throw error;
+  }
+
+  async _materializeReplayFiles(worker) {
     const materialized = [];
     for (const [key, metadata] of [...this.files]) {
       const unsaved = this.unsavedFiles.get(key);
       const file = unsaved || (this.fileLoader ? await this.fileLoader({ ...metadata }) : undefined);
+      this._assertCurrentWorker(worker);
       if (!file || typeof file.text !== "string") {
         this.files.delete(key);
         this.unsavedFiles.delete(key);
@@ -243,6 +268,7 @@ class DataflowWorkerClient {
   }
 
   _post(worker, message, control = {}) {
+    try { this._assertCurrentWorker(worker); } catch (error) { return Promise.reject(error); }
     const cancelKey = control.cancelKey;
     if (cancelKey) this._supersede(cancelKey, worker);
     const id = this.nextId++;
@@ -289,6 +315,7 @@ class DataflowWorkerClient {
 
   _fail(worker, error) {
     if (this.worker !== worker) return;
+    this._interruptReady(error);
     this.worker = undefined;
     this.pendingReplayMetrics = undefined;
     this.needsReplay = this.initialized;

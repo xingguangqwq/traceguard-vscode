@@ -119,13 +119,13 @@ function buildInteractiveModel({ role, language, functionName, kind, receiverTyp
   const normalizedFunction = normalizeCallName(functionName);
   if (!SUPPORTED_LANGUAGES.has(normalizedLanguage)) throw new Error(`Unsupported language: ${language}`);
   if (!normalizedFunction || normalizedFunction.length > 300) throw new Error("Select a function or method call before adding a semantic model.");
-  if (!["source", "sink", "sanitizer"].includes(normalizedRole)) throw new Error(`Unsupported interactive model role: ${role}`);
+  if (!["source", "sink", "sanitizer", "propagator"].includes(normalizedRole)) throw new Error(`Unsupported interactive model role: ${role}`);
   const modelKind = String(kind || (normalizedRole === "source" ? "EXTERNAL_INPUT" : normalizedRole === "sink" ? "SENSITIVE_OPERATION" : "INPUT_VALIDATION")).toUpperCase();
   if (normalizedRole === "source" && !SOURCE_KINDS.has(modelKind)) throw new Error(`Unsupported Source kind: ${kind}`);
   if (normalizedRole === "sink" && !SINK_KINDS.has(modelKind)) throw new Error(`Unsupported Sink kind: ${kind}`);
   if (normalizedRole === "sanitizer" && !GUARD_CAPABILITIES.has(modelKind)) throw new Error(`Unsupported Sanitizer capability: ${kind}`);
   const taintArguments = normalizeArgumentIndexes(argumentIndexes);
-  if (["sink", "sanitizer"].includes(normalizedRole) && !taintArguments.length) {
+  if (["sink", "sanitizer", "propagator"].includes(normalizedRole) && !taintArguments.length) {
     throw new Error("Choose at least one affected argument; TraceGuard does not assume argument 0.");
   }
   const proof = {
@@ -147,6 +147,7 @@ function buildInteractiveModel({ role, language, functionName, kind, receiverTyp
   };
   if (normalizedRole === "source") return { id, language: normalizedLanguage, function: normalizedFunction, kind: modelKind, returnsTaint: true, ...identity };
   if (normalizedRole === "sink") return { id, language: normalizedLanguage, function: normalizedFunction, kind: modelKind, arguments: taintArguments, ...identity };
+  if (normalizedRole === "propagator") return { id, language: normalizedLanguage, function: normalizedFunction, arguments: taintArguments, returnsTaint: true, ...identity };
   return { id, language: normalizedLanguage, function: normalizedFunction, capability: [modelKind], arguments: taintArguments, returnsTaint: true, ...identity };
 }
 
@@ -162,7 +163,7 @@ function boundedIdentity(value) {
 
 function mergeInteractiveModel(configuration, role, model) {
   if (!configuration || typeof configuration !== "object" || Array.isArray(configuration)) throw new Error(".traceguard.json must contain a JSON object.");
-  const collection = role === "source" ? "sources" : role === "sink" ? "sinks" : role === "sanitizer" ? "sanitizers" : undefined;
+  const collection = role === "source" ? "sources" : role === "sink" ? "sinks" : role === "sanitizer" ? "sanitizers" : role === "propagator" ? "propagators" : undefined;
   if (!collection) throw new Error(`Unsupported interactive model role: ${role}`);
   if (configuration[collection] !== undefined && !Array.isArray(configuration[collection])) {
     throw new Error(`.traceguard.json property “${collection}” must be an array before TraceGuard can update it.`);

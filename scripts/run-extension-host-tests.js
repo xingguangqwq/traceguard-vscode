@@ -19,7 +19,10 @@ async function main() {
   // but never leak it into the VS Code child process.
   const electronRunAsNode = process.env.ELECTRON_RUN_AS_NODE;
   const userDataPath = fs.mkdtempSync(path.join(os.tmpdir(), "traceguard-vscode-test-"));
+  const workspacePath = path.join(userDataPath, "workspace");
+  fs.mkdirSync(workspacePath);
   delete process.env.ELECTRON_RUN_AS_NODE;
+  let failed = false;
   try {
     await runTests({
       version: process.env.VSCODE_TEST_VERSION || "1.90.0",
@@ -30,13 +33,17 @@ async function main() {
         `--user-data-dir=${userDataPath}`,
         "--disable-extensions",
         "--disable-workspace-trust",
-        extensionDevelopmentPath,
+        workspacePath,
       ],
     });
+  } catch (error) {
+    failed = true;
+    throw error;
   } finally {
     if (electronRunAsNode === undefined) delete process.env.ELECTRON_RUN_AS_NODE;
     else process.env.ELECTRON_RUN_AS_NODE = electronRunAsNode;
-    fs.rmSync(userDataPath, { recursive: true, force: true, maxRetries: 3 });
+    if (failed) process.stderr.write(`Extension Host logs retained at ${userDataPath}\n`);
+    else fs.rmSync(userDataPath, { recursive: true, force: true, maxRetries: 3 });
   }
 }
 

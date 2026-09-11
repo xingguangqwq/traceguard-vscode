@@ -41,6 +41,7 @@ dist-assets/**
 .npm-cache/**
 .tmp-vsix*/**
 probe-*.js
+bench-owasp.js
 &;
 CONTRIBUTING.md
 SECURITY.md

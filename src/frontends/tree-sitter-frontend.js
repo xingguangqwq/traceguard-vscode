@@ -400,7 +400,12 @@ function buildOperations(record, input, lines, text, references = []) {
         const uninitializedSelfReference = !explicitRight && inputs.length === 1 && inputs[0] === target;
         if (!hasBranchAncestor(node, record.node) && constant !== NO_CONSTANT) constantValues.set(target, constant);
         else if (!hasBranchAncestor(node, record.node) && explicitRight) constantValues.delete(target);
-        if (!uninitializedSelfReference && (inputs.length || explicitRight && constant !== NO_CONSTANT)) add(OperationKind.ASSIGNMENT, node, {
+        // Python/PHP string literals use different AST names from Java. They
+        // must still produce a strong overwrite, without teaching the control
+        // flow constant evaluator either language's coercion/escape semantics.
+        const literalString = ["string", "encapsed_string"].includes(right.type) &&
+          (right.namedChildren || []).every(child => ["string_start", "string_end", "string_content", "escape_sequence"].includes(child.type));
+        if (!uninitializedSelfReference && (inputs.length || explicitRight && (constant !== NO_CONSTANT || literalString))) add(OperationKind.ASSIGNMENT, node, {
           inputs: inputs.map(symbol),
           output: symbol(target),
           metadata: { assignmentMode: inputs.length ? (normalizeAccessPath(nodeText(right, text)) ? "alias" : "aggregate") : "constant" },
@@ -469,7 +474,7 @@ function buildOperations(record, input, lines, text, references = []) {
         item.kind === OperationKind.SOURCE && item.location.startOffset === node.startIndex && item.output?.name === output.name);
       if (call.function && !representedSource) add(OperationKind.CALL, node, {
         inputs: modeled?.kind === OperationKind.CALL ? modeled.inputs : call.argumentInputs.flat(),
-        output,
+        output: modeled?.kind === OperationKind.CALL ? modeled.output : output,
         call: operationCall,
         semantic: modeled?.kind === OperationKind.CALL ? modeled.semantic : undefined,
         certainty: modeled?.kind === OperationKind.CALL ? modeled.certainty : undefined,
@@ -827,8 +832,9 @@ function callFormFromReceiver(receiverNode) {
 
 function genericModeledCall(call, language, output, semanticModels) {
   const resolution = resolveSemanticCall(language, call, semanticModels);
-  const reviewSink = resolution.status === "candidate" && resolution.model?.role === SemanticRole.SINK;
-  if (!["verified", "syntax"].includes(resolution.status) && !reviewSink) return undefined;
+  const reviewModel = resolution.status === "candidate" && (resolution.model?.role === SemanticRole.SINK ||
+    resolution.model?.custom && [SemanticRole.SOURCE, SemanticRole.PROPAGATOR].includes(resolution.model.role));
+  if (!["verified", "syntax"].includes(resolution.status) && !reviewModel) return undefined;
   const model = resolution.model;
   const kind = {
     [SemanticRole.SOURCE]: OperationKind.SOURCE,
@@ -867,11 +873,11 @@ function genericModeledCall(call, language, output, semanticModels) {
       applicableSinkKinds: model.applicableSinkKinds || [],
       label: model.id,
     },
-    certainty: reviewSink ? Certainty.LOW : Certainty.MEDIUM,
+    certainty: reviewModel ? Certainty.LOW : Certainty.MEDIUM,
     metadata: {
       frontend: "tree-sitter-semantic-registry",
       semanticVerification: resolution.status,
-      candidateStatus: reviewSink ? "symbol-unverified" : undefined,
+      candidateStatus: reviewModel ? "symbol-unverified" : undefined,
       taintArguments,
       taintReceiver: Boolean(model.taintReceiver),
       guardBinding,

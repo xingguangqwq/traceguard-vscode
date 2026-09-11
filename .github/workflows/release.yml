@@ -39,6 +39,9 @@ jobs:
       - name: Check JavaScript syntax
         run: npm run check
 
+      - name: Enforce editor review fingerprint baseline
+        run: npm run benchmark:review
+
       - name: Enforce Java backend baseline
         run: npm run benchmark:java
 

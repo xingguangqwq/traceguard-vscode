@@ -48,6 +48,10 @@ Trace 侧栏会同时显示每一步的证明状态和源码位置。切步骤�
 
 ## 功能
 
+1.1 增加了 **Changed since review** 筛选。代码、已解析的依赖或分析配置变化后，受影响目标会标成 **Needs re-review**；原来的人工结论会保留在提示里，重新确认后才恢复已审状态。当前采用文件及其依赖指纹，同文件的其他修改也可能触发复核。旧版本没有指纹的结论首次加载时需要重新确认。
+
+点击 Trace 中的断链提示，可以检查调用目标，或为项目补充 Source、Sink、参数到返回值的 Propagator 模型。保存后重新计算查询；补模型不会把无法证明的调用自动变成 verified。
+
 按请求方法和路由把 HTTP、Controller、框架入口理一遍,做攻击面梳理。
 
 审计队列分 P0、P1、P2、Backlog。这只是阅读顺序,跟漏洞严不严重没关系,别搞混。
@@ -94,10 +98,10 @@ Java、PHP、Python 的语法解析资源内置,离线就能审后端代码。�
 
 ## 安装
 
-去 [Releases](https://github.com/xingguangqwq/traceguard-vscode/releases/latest) 页下 `traceguard-vscode-1.0.0.vsix`,在 VS Code 里跑 **Extensions: Install from VSIX** 就行。
+去 [Releases](https://github.com/xingguangqwq/traceguard-vscode/releases/latest) 页下 `traceguard-vscode-1.1.0.vsix`,在 VS Code 里跑 **Extensions: Install from VSIX** 就行。
 
 ```powershell
-code --install-extension .\traceguard-vscode-1.0.0.vsix
+code --install-extension .\traceguard-vscode-1.1.0.vsix
 ```
 
 打开一个你信得过的源码目录,别拿来跑不明来源的代码。

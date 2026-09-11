@@ -1,0 +1,608 @@
+{
+  "schema": "traceguard-eval-report",
+  "version": 1,
+  "summary": {
+    "expected": 33,
+    "detected": 33,
+    "falsePositives": 0,
+    "verifiedPaths": 26,
+    "heuristicPaths": 16,
+    "unresolvedPaths": 1
+  },
+  "cases": [
+    {
+      "id": "java-parameterized-query-negative",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "php-parameterized-query-negative",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "python-parameterized-query-negative",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "java-prepared-statement",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 1,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "php-unknown-pdo-receiver",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 1
+    },
+    {
+      "id": "python-sqlite-cursor",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 1,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-java-command-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 2,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-java-command-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-java-concatenation-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 2,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-java-concatenation-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-java-overwrite-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 2,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-java-overwrite-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-java-branch-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 2,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-java-branch-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-java-alias-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 2,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-java-alias-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-java-cross-file-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 2,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-java-cross-file-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-java-sql-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 2,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-java-sql-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-java-path-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 2,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-java-path-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-java-ssrf-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 2,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-java-ssrf-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-java-deserialize-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 2,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-java-deserialize-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-php-command-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 1,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-php-command-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-php-concatenation-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 1,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-php-concatenation-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-php-overwrite-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 1,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-php-overwrite-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-php-branch-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 1,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-php-branch-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-php-alias-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 1,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-php-alias-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-php-cross-file-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 1,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-php-cross-file-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-php-sql-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 1,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-php-sql-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-php-path-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 1,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-php-path-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-php-ssrf-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 1,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-php-ssrf-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-php-deserialize-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 1,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-php-deserialize-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-python-command-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 1,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-python-command-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-python-concatenation-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 1,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-python-concatenation-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-python-overwrite-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 1,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-python-overwrite-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-python-branch-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 1,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-python-branch-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-python-alias-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 1,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-python-alias-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-python-cross-file-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 1,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-python-cross-file-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-python-sql-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 1,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-python-sql-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-python-path-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 1,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-python-path-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-python-ssrf-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 1,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-python-ssrf-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-python-deserialize-vulnerable",
+      "expected": 1,
+      "detected": 1,
+      "falsePositives": 0,
+      "verifiedPaths": 1,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    },
+    {
+      "id": "backend-v1-python-deserialize-safe",
+      "expected": 0,
+      "detected": 0,
+      "falsePositives": 0,
+      "verifiedPaths": 0,
+      "heuristicPaths": 0,
+      "unresolvedPaths": 0
+    }
+  ]
+}

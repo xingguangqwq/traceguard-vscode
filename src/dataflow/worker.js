@@ -5,10 +5,12 @@ const { runDataflowAnalysis } = require("./pipeline");
 const { WorkspaceAnalysisEngine } = require("../analysis/workspace-engine");
 const { buildAuditModel } = require("../audit-analyzer");
 const { normalizePath } = require("../identity");
+const { attachReviewFingerprints } = require("../review/fingerprint");
 
 if (!parentPort) throw new Error("TraceGuard dataflow worker must run in a worker thread.");
 
 const engine = new WorkspaceAnalysisEngine();
+let reviewFindingFingerprints = new Map();
 const cancelled = new Set();
 const queued = [];
 let draining = false;
@@ -73,6 +75,14 @@ async function dispatch(message) {
       "initializeWorkspace", "updateFile", "removeFile", "reanalyzeAffectedFunctions", "configure",
     ].includes(message.type)) {
       result.auditModel = buildAuditModel(engine.analyses(), engine.reviewReachability());
+      // Include retained findings too: a changed dependency can invalidate a
+      // human decision even when the visible Source → Sink path is unchanged.
+      const currentFindings = engine.dataflow.findings.map(finding => ({ ...finding }));
+      attachReviewFingerprints(result.auditModel, currentFindings, engine.reviewFingerprints());
+      const changedIds = new Set((result.findingDelta?.upsert || []).map(finding => finding.id));
+      result.findingDelta = { ...result.findingDelta, upsert: currentFindings.filter(finding =>
+        changedIds.has(finding.id) || reviewFindingFingerprints.get(finding.id) !== finding.reviewFingerprint) };
+      reviewFindingFingerprints = new Map(currentFindings.map(finding => [finding.id, finding.reviewFingerprint]));
       if (Array.isArray(result.analyses)) result.analyses = result.analyses.map(compactAnalysis);
       if (result.analysis) result.analysis = compactAnalysis(result.analysis);
     }

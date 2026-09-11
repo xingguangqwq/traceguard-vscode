@@ -19,6 +19,7 @@ const { workspaceRootForAbsolutePath } = require("../config/configuration-scope"
 const { composerPathsForType, projectIdentityFingerprint, projectIdentityForAbsolutePath } = require("../config/project-identity");
 const { frameworkParameterRoles } = require("../frontends/framework-entries");
 const { languageAssets } = require("../assets/language-assets");
+const { dependencyFingerprints } = require("../review/fingerprint");
 
 class WorkspaceAnalysisEngine {
   constructor() {
@@ -381,7 +382,23 @@ class WorkspaceAnalysisEngine {
       pathDelta: { upsert: [], removedIds: [] },
       metadata: this.dataflow.metadata,
     };
-    if (frontendChanged) return this._reparseWorkspace();
+    if (frontendChanged) {
+      const sameParser = previousOptions.astDifferential === nextOptions.astDifferential;
+      const sameIdentity = projectIdentityFingerprint(previousOptions.projectIdentitiesByRoot) === projectIdentityFingerprint(nextOptions.projectIdentitiesByRoot);
+      if (sameParser && sameIdentity) {
+        const reparsed = new Set();
+        const affected = new Set();
+        for (const [key, record] of this.files) {
+          const before = configurationForAbsolutePath(previousOptions, record.analysis.absolutePath);
+          const after = configurationForAbsolutePath(nextOptions, record.analysis.absolutePath);
+          if (before?.semanticFingerprint !== after?.semanticFingerprint) reparsed.add(key);
+          if (before?.fingerprint !== after?.fingerprint || structuralDigest(analysisSettingsForAbsolutePath(previousOptions, record.analysis.absolutePath)) !==
+            structuralDigest(analysisSettingsForAbsolutePath(nextOptions, record.analysis.absolutePath))) affected.add(key);
+        }
+        return this._reparseConfiguredFiles(reparsed, affected);
+      }
+      return this._reparseWorkspace();
+    }
     this.pendingAffectedFiles = new Set(this.files.keys());
     this.pendingAffectedFunctionIds = new Set(this.analyses().flatMap(analysis => analysis.ir.functions.map(fn => fn.id)));
     return this.reanalyzeAffectedFunctions({ forceAll: true });
@@ -406,6 +423,18 @@ class WorkspaceAnalysisEngine {
 
   reviewReachability() {
     return buildReviewReachability(this.flowFunctions, this.functionIndex);
+  }
+
+  reviewFingerprints() {
+    const functionFiles = new Map(this.flowFunctions.map(fn => [fn.id, fileKey(fn.absolutePath)]));
+    return dependencyFingerprints([...this.cache.files].map(([key, record]) => ({
+      key,
+      digest: structuralDigest([record.version,
+        analysisSettingsForAbsolutePath(this.options, record.absolutePath),
+        configurationForAbsolutePath(this.options, record.absolutePath)?.fingerprint,
+        projectIdentityForAbsolutePath(this.options, record.absolutePath)]),
+      dependencies: record.dependencyFunctionIds.map(id => functionFiles.get(id) || `missing:${id}`),
+    })));
   }
 
   analyses() {
@@ -535,6 +564,37 @@ class WorkspaceAnalysisEngine {
       if (record.summaries.some(summary => summary.callees.some(callee => names.has(String(callee.function || "").toLowerCase())))) matches.add(key);
     }
     return [...matches];
+  }
+
+  async _reparseConfiguredFiles(reparsed, affected) {
+    const replacements = new Map();
+    for (const key of reparsed) {
+      const previous = this.files.get(key);
+      if (previous.source?.text === undefined) continue;
+      const source = previous.source;
+      const isolated = ["javascript", "typescript"].includes(source.language) && this.typescriptProject.canAnalyzeIsolated(source.absolutePath, source.text);
+      replacements.set(key, await this._analyzeFile(source, {
+        isolatedCompiler: isolated && source.language === "typescript",
+        syntaxOnlyCompiler: isolated && source.language === "javascript",
+      }));
+    }
+    // Capture reverse dependencies before replacing the old summaries.
+    const pending = new Set(affected);
+    for (const key of affected) {
+      for (const dependent of this.cache.affectedFiles(key, this.files.get(key)?.summaries.map(summary => summary.id) || [])) pending.add(dependent);
+    }
+    for (const [key, record] of replacements) {
+      this.files.set(key, record);
+      this.cache.updateFile({ absolutePath: record.analysis.absolutePath, version: record.version,
+        analysis: record.analysis, functionSummaries: record.summaries, force: true });
+    }
+    this.typescriptProject.releasePrograms();
+    const changedEntries = this._applyProjectEntryBindings();
+    this.pendingAffectedFiles = pending;
+    this._rebuildDependencies(pending);
+    this._queueAffectedFunctions(changedEntries);
+    const result = this.reanalyzeAffectedFunctions();
+    return { analyses: this.analyses(), ...result, metadata: { ...result.metadata, configurationReparsedFiles: replacements.size } };
   }
 
   async _reparseWorkspace() {

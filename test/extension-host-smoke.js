@@ -32,6 +32,7 @@ async function run() {
     "traceguard.traceCrossFileFlow",
     "traceguard.traceFromEntry",
     "traceguard.traceFinding",
+    "traceguard.modelInterruptedCall",
     "traceguard.searchEntries",
     "traceguard.previousTraceStep",
     "traceguard.nextTraceStep",
@@ -96,12 +97,20 @@ async function run() {
     refreshSubscription.dispose();
     assert.equal(providerRefreshes, 1, "Review Queue coalesces bursty session updates into one rebuild notification");
 
+    const reviewedTarget = snapshot.items.find(item => item.absolutePath === smokePath && item.kind === "endpoint");
+    assert.ok(reviewedTarget?.reviewFingerprint, "live review targets carry dependency fingerprints");
+    await api.audit.session.setStatus(reviewedTarget.id, "reviewed");
     fs.writeFileSync(smokePath, "import { exec } from 'node:child_process';\nexport function proxy(req: any) { return exec(req.query.cmd); }\napp.get('/proxy', proxy);", "utf8");
     await api.audit.session.reindexFile(smokeUri);
     snapshot = api.audit.session.snapshot;
     assert.ok(snapshot.findings.some(finding => finding.ruleId === "potential-command-injection"), "incremental Worker update replaces the finding");
     assert.ok(!snapshot.findings.some(finding => finding.ruleId === "potential-ssrf"), "stale incremental findings are removed");
     assert.equal(snapshot.incrementallyInvalidatedFiles, 1);
+    assert.equal(snapshot.items.find(item => item.id === reviewedTarget.id)?.status, "needs_review", "changed code returns to the review queue");
+    api.audit.codeProvider.setFilter({ id: "needs_review", label: "Changed since review" });
+    const changedTree = flattenTreeProvider(api.audit.codeProvider, api.audit.codeProvider.getChildren());
+    assert.ok(changedTree.some(item => item.auditItem?.id === reviewedTarget.id && /Needs re-review/.test(item.description)), "the filter exposes changed targets with a clear label");
+    api.audit.codeProvider.setFilter({ id: "priority", label: "P0 / P1 first" });
 
     const query = await api.audit.session.queryAudit(smokeUri, 0, "reachable-sinks", "req.query.cmd");
     assert.equal(query.schema, "traceguard-audit-query", "persistent Worker serves the audit query protocol");
@@ -116,6 +125,13 @@ async function run() {
     assert.equal(api.audit.queryProvider.getChildren()[0]?.kind, "interactive-trace", "Traces exposes a Source to Sink stepper");
     const finalStep = api.audit.queryProvider.selectTraceStep(tracePath.steps.length - 1);
     assert.equal(finalStep.kind, "sink", "interactive traces can move directly to the Sink step");
+    const callees = await api.audit.session.queryAudit(smokeUri, 1, "find-callees");
+    api.audit.queryProvider.setResult(callees);
+    const interruptedTree = flattenTreeProvider(api.audit.queryProvider, api.audit.queryProvider.getChildren());
+    const interruption = interruptedTree.find(item => item.contextValue === "traceguard.modelableInterruption");
+    assert.ok(interruption, "unresolved calls expose an actionable interruption");
+    assert.equal(interruption.command.command, "traceguard.modelInterruptedCall");
+    assert.doesNotThrow(() => JSON.stringify(interruption.command.arguments), "modeling command arguments are serializable");
     api.audit.queryProvider.setResult(query);
 
     const debug = await api.audit.session.debugAnalysisForUri(smokeUri, query);
