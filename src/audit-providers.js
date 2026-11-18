@@ -3,6 +3,7 @@
 const path = require("path");
 const vscode = require("vscode");
 const { findingPaths, findingPool, pathVerificationStatus } = require("./review/finding-pool");
+const { TraceReviewState } = require("./review/trace-review");
 
 // Visual system: one canonical declaration for severity, priority, proof status
 // and step-kind presentation, so every view speaks the same visual language.
@@ -160,7 +161,7 @@ class ScopeOverviewItem extends vscode.TreeItem {
       : hypotheses.length
         ? new vscode.ThemeIcon("question", new vscode.ThemeColor("editorInfo.foreground"))
         : new vscode.ThemeIcon("pass-filled", new vscode.ThemeColor("testing.iconPassed"));
-    this.tooltip = new vscode.MarkdownString();
+    this.tooltip = createMarkdownTooltip();
     this.tooltip.appendMarkdown("$(shield) **Audit posture**\n\n");
     this.tooltip.appendMarkdown(
       verified.length
@@ -288,7 +289,7 @@ class AttackEntryItem extends vscode.TreeItem {
     this.description = `${framework} · ${path.basename(entry.relativePath || entry.absolutePath || "unknown")}:${entry.line}`
       + (this.openFindingCount ? ` · ${this.openFindingCount} open flow${this.openFindingCount === 1 ? "" : "s"}` : "");
     this.iconPath = new vscode.ThemeIcon("globe", worst ? new vscode.ThemeColor(worst.color) : undefined);
-    this.tooltip = new vscode.MarkdownString();
+    this.tooltip = createMarkdownTooltip();
     this.tooltip.appendMarkdown(`$(globe) **${md(label)}**\n\n`);
     this.tooltip.appendMarkdown(`Handler: ${md(entry.title)}\n\n`);
     this.tooltip.appendCodeblock(`${entry.relativePath}:${entry.line}`);
@@ -373,6 +374,7 @@ class CodeTreeProvider extends SessionTreeProvider {
     super(session);
     this._tree = undefined;
     this.filter = { id: "priority", label: "P0 / P1 first" };
+    this.searchQuery = "";
   }
 
   invalidate() {
@@ -383,6 +385,24 @@ class CodeTreeProvider extends SessionTreeProvider {
     this.filter = filter || { id: "priority", label: "P0 / P1 first" };
     this._tree = undefined;
     this._changed.fire(undefined);
+  }
+
+  setSearchQuery(query) {
+    const normalized = String(query || "").trim();
+    if (normalized === this.searchQuery) return;
+    this.searchQuery = normalized;
+    this._tree = undefined;
+    this._changed.fire(undefined);
+  }
+
+  getFilterState() {
+    const snapshot = this.session.snapshot;
+    return {
+      filterId: this.filter?.id || "priority",
+      filterLabel: this.filter?.label || "P0 / P1 first",
+      searchQuery: this.searchQuery || "",
+      totalTargets: (snapshot.items || []).length,
+    };
   }
 
   getChildren(element) {
@@ -415,22 +435,25 @@ class CodeTreeProvider extends SessionTreeProvider {
     const currentEndpointIds = currentTarget?.kind === "endpoint"
       ? [currentTarget.functionId]
       : currentTarget?.entryFunctionIds || [];
+    const queryLower = this.searchQuery.toLowerCase();
     const visibleTargets = (snapshot.items || [])
       .filter(item => !hideReviewed || item.status !== "reviewed")
-      .filter(item => reviewTargetMatchesFilter(item, this.filter.id, activeFile, currentEndpointIds));
+      .filter(item => reviewTargetMatchesFilter(item, this.filter.id, activeFile, currentEndpointIds))
+      .filter(item => !queryLower || targetMatchesSearch(item, queryLower));
+    const filterLabel = queryLower ? `${this.filter.label} · "${this.searchQuery}"` : this.filter.label;
     const roots = [
       new ManualCoverageItem(snapshot.manualReviewCoverage || { reviewed: snapshot.statusCounts.reviewed, total: snapshot.items.length }),
-      new QueueFilterItem(this.filter.label, visibleTargets.length, snapshot.items.length),
+      new QueueFilterItem(filterLabel, visibleTargets.length, snapshot.items.length),
     ];
     const priorities = [
-      ["P0", "Entry reaches dangerous operation", vscode.TreeItemCollapsibleState.Expanded],
-      ["P1", "Entry with unresolved cross-file calls", vscode.TreeItemCollapsibleState.Expanded],
-      ["P2", "Security-sensitive helper", vscode.TreeItemCollapsibleState.Collapsed],
-      ["Backlog", "Ordinary reachable functions", vscode.TreeItemCollapsibleState.Collapsed],
+      ["P0", "Entry → Sink", vscode.TreeItemCollapsibleState.Expanded],
+      ["P1", "Unresolved calls", vscode.TreeItemCollapsibleState.Expanded],
+      ["P2", "Sensitive helpers", vscode.TreeItemCollapsibleState.Collapsed],
+      ["Backlog", "Other reachable", vscode.TreeItemCollapsibleState.Collapsed],
     ];
     for (const [priority, label, state] of priorities) {
       const childNodes = visibleTargets.filter(item => item.priority === priority).map(item => new AuditItem(item));
-      if (childNodes.length || ["P0", "P1"].includes(priority)) {
+      if (childNodes.length || (!queryLower && ["P0", "P1"].includes(priority))) {
         roots.push(new ReviewQueueSection(priority, label, childNodes, state));
       }
     }
@@ -440,17 +463,49 @@ class CodeTreeProvider extends SessionTreeProvider {
       ["Dismissed / Resolved", "archive", "resolved"],
     ];
     for (const [label, icon, pool] of pools) {
+      if (this.filter.id === "verified" && pool !== "verified") continue;
+      if (this.filter.id === "hypothesis" && pool !== "review") continue;
       const childNodes = (snapshot.findings || [])
         .filter(finding => findingPool(finding) === pool)
+        .filter(finding => !queryLower || findingMatchesSearch(finding, queryLower))
         .sort((left, right) => findingSortRank(left) - findingSortRank(right))
         .map(finding => new FindingItem(finding));
-      if (childNodes.length) roots.push(new FileSectionItem(label, icon, `flows:${pool}`, childNodes));
+      if (childNodes.length) {
+        const expand = this.filter.id === "verified" || this.filter.id === "hypothesis" || Boolean(queryLower);
+        roots.push(new FileSectionItem(label, icon, `flows:${pool}`, childNodes, expand));
+      }
     }
     this._tree = { roots };
   }
 }
 
+function targetMatchesSearch(item, queryLower) {
+  const haystack = [
+    item.title,
+    item.relativePath,
+    item.priority,
+    item.route,
+    ...(item.reasons || []),
+  ].filter(Boolean).join(" ").toLowerCase();
+  return haystack.includes(queryLower);
+}
+
+function findingMatchesSearch(finding, queryLower) {
+  const haystack = [
+    finding.title,
+    finding.ruleId,
+    finding.cwe,
+    finding.relativePath,
+    finding.severity,
+    finding.sourceKind,
+    finding.sinkKind,
+  ].filter(Boolean).join(" ").toLowerCase();
+  return haystack.includes(queryLower);
+}
+
 function reviewTargetMatchesFilter(item, filter, activeFile, currentEndpointIds = []) {
+  if (filter === "verified") return (item.verifiedFindingIds?.length || 0) > 0 || item.priority === "P0";
+  if (filter === "hypothesis") return Boolean(item.containsUnresolvedCalls) || (item.reviewFindingIds?.length || 0) > 0 || item.priority === "P1";
   if (filter === "needs_review") return Boolean(item.needsReview);
   if (filter === "unreviewed") return item.status === "unreviewed";
   if (filter === "in_review") return item.status === "in_review";
@@ -535,8 +590,8 @@ function findingSortRank(finding) {
 }
 
 class FileSectionItem extends vscode.TreeItem {
-  constructor(label, icon, key, childNodes) {
-    super(label, vscode.TreeItemCollapsibleState.Collapsed);
+  constructor(label, icon, key, childNodes, expanded = false) {
+    super(label, expanded ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed);
     this.kind = "section";
     this.key = key;
     this.childNodes = childNodes;
@@ -592,7 +647,7 @@ function buildFindingTooltip(finding) {
   const missing = finding.missingGuards.length ? finding.missingGuards.join(", ") : "none from this rule";
   const observed = finding.observedGuards.length ? finding.observedGuards.join(", ") : "none observed";
   const pool = findingPool(finding) === "verified" ? "Verified Flow" : findingPool(finding) === "review" ? "Review Hypothesis" : "Dismissed / Resolved";
-  const markdown = new vscode.MarkdownString();
+  const markdown = createMarkdownTooltip();
   markdown.appendMarkdown(`$(debug-stackframe) **${pool}** · ${String(finding.severity).toUpperCase()} review impact · ${md(finding.confidence)} confidence\n\n`);
   markdown.appendMarkdown(`${md(finding.title)} (${md(finding.cwe)})\n\n`);
   markdown.appendMarkdown("TraceGuard has classified the data-flow evidence, not confirmed a vulnerability.\n\n");
@@ -622,12 +677,13 @@ function findingPathChildren(flow, findingId, pathIndex) {
 
 class FindingPathStep extends vscode.TreeItem {
   constructor(step, index, findingId, pathIndex = 0) {
-    super(`${index + 1}. ${step.label}`, vscode.TreeItemCollapsibleState.None);
+    const displayLabel = humanizeStepLabel(step);
+    super(`${index + 1}. ${displayLabel}`, vscode.TreeItemCollapsibleState.None);
     this.id = `traceguard:step:${findingId}:${pathIndex}:${index}`;
     const status = stepAnalysisStatus(step);
     this.description = `${QUERY_STATUS_META[status].label} · ${path.basename(step.relativePath)}:${step.line}`;
     const stepIcon = STEP_KIND_ICONS[step.kind] || "circle-small-filled";
-    this.tooltip = new vscode.MarkdownString();
+    this.tooltip = createMarkdownTooltip();
     this.tooltip.appendMarkdown(`$(${stepIcon}) **${String(step.kind).toUpperCase()} · ${index + 1}** — `);
     this.tooltip.appendText(step.label);
     if (step.code) this.tooltip.appendCodeblock(step.code);
@@ -656,7 +712,7 @@ class AuditItem extends vscode.TreeItem {
       needs_review: { icon: "refresh", color: "editorWarning.foreground" },
       unreviewed: { icon: priorityMeta.icon || "circle-outline", color: priorityMeta.color },
     }[item.status] || { icon: priorityMeta.icon || "circle-outline", color: priorityMeta.color };
-    this.tooltip = new vscode.MarkdownString();
+    this.tooltip = createMarkdownTooltip();
     this.tooltip.appendMarkdown(`$(${statusMeta.icon}) **${item.priority}** · `);
     this.tooltip.appendText(item.title);
     this.tooltip.appendMarkdown(`\n\n${item.reasons.map(reason => `- ${md(reason)}`).join("\n")}\n\nReview status: **${statusLabel(item.status)}**`);
@@ -705,7 +761,7 @@ class EvidenceItem extends vscode.TreeItem {
     this.id = `traceguard:evidence:${item.id}`;
     this.description = `${path.basename(item.relativePath)}:${item.line}`;
     const tone = { Source: "editorInfo.foreground", Sink: "errorForeground", Authorization: "testing.iconPassed", Validation: "charts.green", Controllability: "editorInfo.foreground", "Missing Context": "editorWarning.foreground", "Exploit Condition": "errorForeground", Remediation: "testing.iconPassed", Observation: "descriptionForeground" }[item.type] || "descriptionForeground";
-    this.tooltip = new vscode.MarkdownString();
+    this.tooltip = createMarkdownTooltip();
     this.tooltip.appendMarkdown(`$(bookmark) **${md(item.type)}** · ${path.basename(item.relativePath)}:${item.line}\n\n`);
     this.tooltip.appendCodeblock(item.code);
     if (item.note) { this.tooltip.appendMarkdown("\n\n"); this.tooltip.appendText(item.note); }
@@ -724,7 +780,8 @@ class EvidenceItem extends vscode.TreeItem {
 // --- Trace view -----------------------------------------------------------------
 
 class AuditQueryProvider {
-  constructor() {
+  constructor(reviewKeys = []) {
+    this.review = new TraceReviewState(reviewKeys);
     this.result = undefined;
     this.trace = undefined;
     this.traceCursor = 0;
@@ -733,6 +790,7 @@ class AuditQueryProvider {
   }
 
   setResult(result) {
+    this.review.setChain(result);
     this.result = result;
     this.trace = undefined;
     this.traceCursor = 0;
@@ -740,6 +798,7 @@ class AuditQueryProvider {
   }
 
   setTrace(flowPath, cursor = 0) {
+    this.review.setChain(flowPath);
     this.result = undefined;
     this.trace = flowPath;
     this.traceCursor = boundedTraceIndex(flowPath, cursor);
@@ -781,6 +840,28 @@ class AuditQueryProvider {
     return element;
   }
 
+  toggleReviewed(item) {
+    const node = item?.node || item?.step;
+    if (!node || item.inheritedReview) return undefined;
+    const keys = this.review.toggle(node);
+    this._changed.fire(undefined);
+    return keys;
+  }
+
+  isReviewed(node) { return this.review.has(node); }
+
+  reviewItem(item, inherited = false) {
+    const reviewed = inherited || this.isReviewed(item.node || item.step);
+    item.inheritedReview = inherited;
+    item.reviewed = reviewed;
+    if (reviewed) {
+      item.description = `Safe / Ignored · ${item.description || ""}`;
+      item.iconPath = new vscode.ThemeIcon("pass", new vscode.ThemeColor("disabledForeground"));
+      item.contextValue = inherited ? "traceguard.inheritedReviewedTraceNode" : "traceguard.reviewedTraceNode";
+    }
+    return item;
+  }
+
   getChildren(element) {
     if (!element) {
       if (this.trace) return [new InteractiveTraceItem(this.trace, this.traceCursor)];
@@ -788,14 +869,14 @@ class AuditQueryProvider {
       return [new AuditQueryResultItem(this.result)];
     }
     if (element.kind === "interactive-trace") {
-      const children = (element.flowPath.steps || []).map((step, index) => new InteractiveTraceStepItem(step, index, element.cursor));
+      const children = (element.flowPath.steps || []).map((step, index) => this.reviewItem(new InteractiveTraceStepItem(step, index, element.cursor)));
       const interruption = traceInterruption(element.flowPath);
       if (interruption) children.push(new TraceInterruptionItem(interruption, `interactive:${element.flowPath.id || "selected"}`));
       return children;
     }
-    if (element.kind === "query-result") return (element.result.roots || []).map(node => new AuditQueryNodeItem(node, true));
+    if (element.kind === "query-result") return (element.result.roots || []).map(node => this.reviewItem(new AuditQueryNodeItem(node, true)));
     if (element.kind === "query-node") {
-      const children = (element.node.children || []).map(node => new AuditQueryNodeItem(node));
+      const children = (element.node.children || []).map(node => this.reviewItem(new AuditQueryNodeItem(node), element.reviewed));
       if (element.interruption) children.push(new TraceInterruptionItem(element.interruption, `query:${element.node.id}`));
       return children;
     }
@@ -815,8 +896,10 @@ function boundedTraceIndex(flowPath, index) {
 class InteractiveTraceItem extends vscode.TreeItem {
   constructor(flowPath, cursor) {
     const steps = flowPath.steps || [];
-    const source = flowPath.source?.label || steps.find(step => step.kind === "source")?.label || "Source";
-    const sink = flowPath.sink?.label || [...steps].reverse().find(step => step.kind === "sink")?.label || "Sink";
+    const sourceStep = steps.find(step => step.kind === "source") || flowPath.source;
+    const sinkStep = [...steps].reverse().find(step => step.kind === "sink") || flowPath.sink;
+    const source = humanizeStepLabel(sourceStep) || "Source";
+    const sink = humanizeStepLabel(sinkStep) || "Sink";
     super(`${source} → ${sink}`, vscode.TreeItemCollapsibleState.Expanded);
     this.kind = "interactive-trace";
     this.flowPath = flowPath;
@@ -824,7 +907,7 @@ class InteractiveTraceItem extends vscode.TreeItem {
     this.id = `traceguard:interactive-trace:${flowPath.id || "selected"}`;
     this.description = `Step ${Math.min(cursor + 1, steps.length)}/${steps.length} · ${pathVerificationStatus(flowPath)}`;
     this.iconPath = new vscode.ThemeIcon("debug-stackframe", new vscode.ThemeColor("editorInfo.foreground"));
-    this.tooltip = new vscode.MarkdownString();
+    this.tooltip = createMarkdownTooltip();
     this.tooltip.appendMarkdown(`$(debug-stackframe) **Interactive Source → Sink trace**\n\n`);
     this.tooltip.appendText(`${steps.length} steps across ${flowPath.files?.length || new Set(steps.map(step => step.relativePath).filter(Boolean)).size} files.`);
     this.tooltip.appendMarkdown("\n\nUse the previous and next buttons in the view title, or select any step below.");
@@ -835,7 +918,8 @@ class InteractiveTraceItem extends vscode.TreeItem {
 class InteractiveTraceStepItem extends vscode.TreeItem {
   constructor(step, index, cursor) {
     const current = index === cursor;
-    super(`${index + 1}. ${step.label}`, vscode.TreeItemCollapsibleState.None);
+    const displayLabel = humanizeStepLabel(step);
+    super(`${index + 1}. ${displayLabel}`, vscode.TreeItemCollapsibleState.None);
     this.kind = "interactive-trace-step";
     this.step = step;
     this.index = index;
@@ -844,7 +928,7 @@ class InteractiveTraceStepItem extends vscode.TreeItem {
     this.description = `${current ? "CURRENT · " : ""}${QUERY_STATUS_META[status].label} · ${path.basename(step.relativePath || step.absolutePath || "unknown")}:${step.line || "?"}`;
     const icon = current ? "debug-stackframe" : stepKindIcon(step.kind);
     this.iconPath = new vscode.ThemeIcon(icon, new vscode.ThemeColor(current ? "editorInfo.foreground" : QUERY_STATUS_META[status].color));
-    this.tooltip = new vscode.MarkdownString();
+    this.tooltip = createMarkdownTooltip();
     const heading = current ? "$(debug-stackframe) **Current step**" : `**Step ${index + 1}**`;
     this.tooltip.appendMarkdown(`${heading} · **${md(step.kind || "flow")}** · \`${status}\`\n\n`);
     this.tooltip.appendText(step.label || "Analysis step");
@@ -865,7 +949,7 @@ class TraceInterruptionItem extends vscode.TreeItem {
     this.id = `traceguard:interruption:${identity}`;
     this.description = interruption.status;
     this.iconPath = new vscode.ThemeIcon("debug-disconnect", new vscode.ThemeColor("editorWarning.foreground"));
-    this.tooltip = new vscode.MarkdownString();
+    this.tooltip = createMarkdownTooltip();
     this.tooltip.appendMarkdown(`$(debug-disconnect) **Why the path stopped**\n\n${md(interruption.reason)}\n\n`);
     this.tooltip.appendMarkdown(`**Suggested manual check**\n\n${md(interruption.next)}`);
     if (interruption.location?.absolutePath) {
@@ -938,7 +1022,7 @@ class AuditQueryResultItem extends vscode.TreeItem {
     this.result = result;
     const nodes = Number(result.summary?.nodes) || countQueryNodes(result.roots || []);
     this.description = `${nodes} step${nodes === 1 ? "" : "s"}${result.truncated ? " · truncated" : ""}`;
-    this.tooltip = new vscode.MarkdownString();
+    this.tooltip = createMarkdownTooltip();
     this.tooltip.appendMarkdown(`**${md(result.title)}**\n\n`);
     this.tooltip.appendText(`${nodes} analysis steps${result.truncated ? "; the configured query limit was reached" : ""}.`);
     this.iconPath = new vscode.ThemeIcon(result.truncated ? "warning" : "list-tree");
@@ -960,9 +1044,9 @@ class AuditQueryNodeItem extends vscode.TreeItem {
     const locationLabel = location?.relativePath
       ? `${path.basename(location.relativePath)}:${location.line}`
       : location?.absolutePath ? `${path.basename(location.absolutePath)}:${location.line}` : "no source location";
-    this.description = `${locationLabel} · $(${meta.icon})`;
-    this.tooltip = new vscode.MarkdownString();
-    this.tooltip.appendMarkdown(`**${meta.label} · ${md(node.kind || "step")}**\n\n`);
+    this.description = `${locationLabel} · ${meta.label}`;
+    this.tooltip = createMarkdownTooltip();
+    this.tooltip.appendMarkdown(`$(${meta.icon}) **${meta.label} · ${md(node.kind || "step")}**\n\n`);
     this.tooltip.appendText(node.reason || "No connection explanation was produced.");
     if (interruption) this.tooltip.appendMarkdown(`\n\n**Suggested manual check**\n\n${md(interruption.next)}`);
     if (location?.code) this.tooltip.appendCodeblock(location.code);
@@ -974,7 +1058,7 @@ class AuditQueryNodeItem extends vscode.TreeItem {
     this.iconPath = new vscode.ThemeIcon(STEP_KIND_ICONS[node.kind] || meta.icon, new vscode.ThemeColor(meta.color));
     this.contextValue = "traceguard.auditQueryNode";
     if (location?.absolutePath && location?.line) {
-      this.command = { command: "traceguard.openAuditLocation", title: "Open analysis step", arguments: [location] };
+      this.command = { command: "traceguard.selectQueryNode", title: "Open analysis step", arguments: [node] };
     }
   }
 }
@@ -1025,7 +1109,7 @@ class AuditHoverProvider {
   provideHover(document, position) {
     const signals = this.session.signalsAt(document.uri, position.line);
     if (!signals.length) return undefined;
-    const markdown = new vscode.MarkdownString();
+    const markdown = createMarkdownTooltip();
     markdown.appendMarkdown(`### $(references) TraceGuard audit signal${signals.length === 1 ? "" : "s"}\n\n`);
     for (const signal of signals) {
       markdown.appendMarkdown(`- $(eye) **${String(signal.kind).toUpperCase()}** · ${md(signal.label)}\n`);
@@ -1036,6 +1120,27 @@ class AuditHoverProvider {
 }
 
 // --- Shared helpers ---------------------------------------------------------------
+
+function createMarkdownTooltip() {
+  const markdown = new vscode.MarkdownString();
+  markdown.supportThemeIcons = true;
+  return markdown;
+}
+
+function humanizeStepLabel(step) {
+  const raw = String(step?.label || "").trim();
+  const isInternalRuleId = /^[a-z0-9_-]+\.[a-z0-9_.-]+$/.test(raw) && !raw.includes(" ") && !raw.includes("(");
+  if (isInternalRuleId) {
+    const code = String(step?.code || "").replace(/\s+/g, " ").trim();
+    if (code && code.length <= 54) return code;
+    if (code) return `${code.slice(0, 51)}…`;
+    const accessPath = String(step?.outputAccessPath || step?.inputAccessPath || step?.accessPaths?.[0] || "").trim();
+    if (accessPath) return accessPath;
+    const tail = raw.split(".").slice(-2).join(" · ").replaceAll("-", " ");
+    return tail || raw;
+  }
+  return raw;
+}
 
 function countQueryNodes(nodes) {
   return nodes.reduce((count, node) => count + 1 + countQueryNodes(node.children || []), 0);
@@ -1066,5 +1171,14 @@ module.exports = {
   AuditQueryProvider,
   CodeTreeProvider,
   EvidenceProvider,
+  SEVERITY_META,
+  QUERY_STATUS_META,
+  findingStatusLabel,
+  findingsTouchingEntry,
+  flowTruncationDescription,
+  humanizeStepLabel,
+  queryNodeInterruption,
   statusLabel,
+  stepAnalysisStatus,
+  traceInterruption,
 };

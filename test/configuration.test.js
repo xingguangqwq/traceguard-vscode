@@ -10,3 +10,10 @@ test("dataflow settings invalidate the analysis model", () => {
   }
   assert.equal(affectsAnalysisModel({ affectsConfiguration: key => key === "traceguard.showFlowCodeLens" }), false);
 });
+
+test("every contributed flow budget invalidates cached analysis", () => {
+  const properties = require("../package.json").contributes.configuration.properties;
+  for (const key of Object.keys(properties).filter(key => key.startsWith("traceguard.flow"))) {
+    assert.ok(MODEL_CONFIGURATION_KEYS.includes(key), `${key} must invalidate stale flow results`);
+  }
+});

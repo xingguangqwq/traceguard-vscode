@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": false,
+    "strict": true,
+    "noEmit": true,
+    "target": "ES2022",
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "types": [
+      "node",
+      "vscode"
+    ],
+    "skipLibCheck": false
+  },
+  "include": [
+    "src/ir/contracts.d.ts",
+    "src/ir/schema.js",
+    "src/ir/access-path.js",
+    "src/dataflow/call-bindings.js",
+    "src/ai/locale.js",
+    "test/types/contracts.ts",
+    "src/frontends/call-arguments.js",
+    "src/frontends/accessor-summary.js",
+    "src/dataflow/guard-versions.js"
+  ]
+}

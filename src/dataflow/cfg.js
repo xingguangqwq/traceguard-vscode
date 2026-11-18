@@ -30,7 +30,12 @@ function buildOperationCFG(operations) {
     const conditionBlocks = blocksInRange(ordered, branch.conditionRange).filter(candidate => candidate !== blockId);
     const ranges = [branch.thenRange, branch.elseRange].filter(Boolean);
     const branchEnd = ranges.reduce((current, range) => laterRangeEnd(current, range), operation.location);
-    const join = ordered.find(candidate => isAfterRange(candidate.location, branchEnd));
+    // An expression branch rejoins its enclosing call/assignment/return. Its
+    // parent starts before the ternary, so a start-offset-only search would
+    // skip that consumer and incorrectly jump straight to the function exit.
+    const join = branch.expressionBranch ? ordered.slice(index + 1).find(candidate =>
+      isAfterRange(candidate.location, branchEnd) || candidate.kind !== "branch" && containsLocation(candidate.location, operation.location)) :
+      ordered.find(candidate => isAfterRange(candidate.location, branchEnd));
     const joinId = join ? `op:${join.id}` : "exit";
     removeOutgoing(edges, blockId);
     const decisionBlock = conditionBlocks.at(-1) || blockId;

@@ -1,0 +1,21 @@
+{
+  "repository": "https://github.com/OWASP-Benchmark/BenchmarkJava",
+  "commit": "2734ae486356765ea4e45393a28e20bcb5047f8c",
+  "expectedResults": "expectedresults-1.2beta.csv",
+  "expectedResultsSha256": "ae8e9386b13ec0164500f1a6fa3d0fa981495911a0f29e88a611e9a9df1b4567",
+  "sourceSha256": "c55e1a66c14d726594e817d2414dcda38f29529979d8b9962e592d5d8bc38284",
+  "cases": 1537,
+  "categories": {
+    "cmdi": "CWE-78",
+    "sqli": "CWE-89",
+    "pathtraver": "CWE-22",
+    "xss": "CWE-79",
+    "ldapi": "CWE-90"
+  },
+  "options": {
+    "maxAnalysisMs": 3000,
+    "maxDepth": 6,
+    "maxCfgPathsPerFunction": 24,
+    "maxFlowStatesPerRoot": 32
+  }
+}

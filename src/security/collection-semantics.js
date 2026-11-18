@@ -1,6 +1,6 @@
 "use strict";
 
-const { normalizeAccessPath } = require("../ir/access-path");
+const { normalizeAccessPath, appendAccessPath } = require("../ir/access-path");
 const { COLLECTION_SEMANTIC_MODELS } = require("./collection-models");
 
 /**
@@ -10,6 +10,14 @@ const { COLLECTION_SEMANTIC_MODELS } = require("./collection-models");
  * list-slot tracking.
  */
 function interpretCollectionCall(call, output, language, states, context = {}) {
+  if (language === "java" && isJavaMap(call)) {
+    const slot = mapKeyPath(call.receiver, call.arguments?.[0]);
+    if (call.function === "get" && call.arguments.length === 1) return { receiverInputs: [slot] };
+    if (call.function === "put" && call.arguments.length === 2) return { writes: [{
+      inputs: call.argumentInputs?.[1] || [], output: slot,
+      reason: `Map.put() writes the selected key slot ${slot}.`,
+    }] };
+  }
   const models = COLLECTION_SEMANTIC_MODELS.filter(model => model.languages.includes(language));
   registerConstruction(models, call, output, states);
 
@@ -32,6 +40,19 @@ function interpretCollectionCall(call, output, language, states, context = {}) {
     model.operations?.[String(call.function || "")]);
   if (!generic) return {};
   return applyStatelessOperation(generic.operations[String(call.function || "")], call, receiver);
+}
+
+function isJavaMap(call) {
+  const type = String(call?.symbol?.receiverType || "").replace(/<.*>/g, "");
+  return !call?.symbol?.shadowed && /^java\.util\.(?:(?:Map|HashMap|LinkedHashMap|TreeMap|SortedMap|NavigableMap)|concurrent\.(?:ConcurrentMap|ConcurrentHashMap|ConcurrentSkipListMap))$/.test(type);
+}
+
+function mapKeyPath(receiver, expression) {
+  const raw = String(expression || "").trim();
+  let key = "*";
+  if (/^"[^"\\]*"$/.test(raw)) key = raw.slice(1, -1);
+  else if (/^\d+$/.test(raw)) key = Number(raw);
+  return appendAccessPath(normalizeAccessPath(receiver), [key]);
 }
 
 function registerConstruction(models, call, output, states) {
@@ -135,4 +156,4 @@ function numericArgument(call, index) {
 function handled(result) { return { handled: true, result }; }
 function unhandled() { return { handled: false, result: {} }; }
 
-module.exports = { interpretCollectionCall, receiverTypeMatches, simpleTypeName };
+module.exports = { interpretCollectionCall, isJavaMap, mapKeyPath, receiverTypeMatches, simpleTypeName };

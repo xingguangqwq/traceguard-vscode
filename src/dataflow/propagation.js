@@ -39,6 +39,7 @@ function assignmentFact(event, input, output) {
 }
 
 function eventConsumes(event, value) {
+  if (event?.accessorModeled) return false;
   return (event?.variables || []).some(candidate => pathsOverlap(value, candidate)) ||
     (event?.argumentVariables || []).flat().some(candidate => pathsOverlap(value, candidate));
 }

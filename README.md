@@ -1,5 +1,15 @@
 # TraceGuard White-box Audit
 
+Version 1.5 adds a visual Scope dashboard and Trace Inspector. Search the full endpoint list, follow a trace in source code, and read or stop its AI report in the Inspector. The [1.4 engineering notes](docs/engineering-1.4.md) document engine coverage and benchmarks.
+
+Version 1.3 binds Python keyword and PHP named arguments to the declared parameters of indexed project functions and methods. Calls such as `service.dispatch(command=value, prefix="fixed")` and `$service->dispatch(command: $value, prefix: "fixed")` retain the command flow even when arguments are reordered. Scanning, forward/backward queries, project return values and named setter writes use the same binding engine.
+
+Omitted scalar defaults appear in backward traces. Python positional-only/keyword-only parameters and explicit variadic tuple indexes/dictionary keys remain distinct. Unknown unpacking stays an explained review candidate; invalid argument layouts and calls exceeding 128 arguments/parameters or 512 mappings expose a gap. This does not infer missing external-library signatures, evaluate nonliteral defaults or execute the target project. Binding follows the [Python call rules](https://docs.python.org/3/reference/expressions.html#calls) and [PHP named-argument rules](https://www.php.net/manual/en/functions.arguments.php#functions.named-arguments).
+
+Version 1.2 follows object fields through simple Java, PHP and Python setters/getters across files. For example, input → `box.store(input)` → `box.fetch()` → Sink now retains the actual accessor bodies as evidence. Constant overwrites, different instances and sibling fields use the same rules in scanning and interactive traces.
+
+Accessor inference requires a unique resolved call target and a complete method body containing a direct field return or parameter-to-field assignment, optionally returning the receiver. Java's declared implicit instance fields are supported. Named arguments use the shared parameter bindings. Conditional logic, extra calls, static/decorated/async methods and unresolved unpacking keep the existing fallback; dynamic properties and automatic accessor generation are outside this inference.
+
 Version 1.1 adds **Changed since review** filtering and **Needs re-review** decisions when code, resolved dependencies or analysis settings change. Previous decisions remain visible until reconfirmed. Fingerprints cover files and their dependencies, so other edits in the same file may also trigger review; legacy decisions without fingerprints require reconfirmation.
 
 Trace interruptions now offer callee inspection and project Source, Sink or argument-to-return Propagator modeling, followed by query recomputation. Unknown identities retain their unverified proof status.
@@ -15,6 +25,41 @@ It does not decide whether a vulnerability exists. Whether input is externally c
 ![TraceGuard reviewing the project](docs/images/traceguard-audit-flow.gif)
 
 ## The basic workflow
+
+Select a variable or place the cursor on a property path, then press **Ctrl+Alt+Up** to trace backward or **Ctrl+Alt+Down** to trace forward (**Cmd+Option+Up/Down** on macOS). Both actions are also directly available in the editor's **TraceGuard** context menu.
+
+Variable query results retain their branches in the **Trace** tree. Click a located node to open its code in a preview tab and highlight the selected line. Source, propagation and Sink locations in the active file receive distinct highlights; hover for the analysis status and connection explanation. Use **Clear Audit Query** in the Trace toolbar to remove the result and its highlights. Keyboard shortcuts can be reassigned in VS Code's Keyboard Shortcuts settings.
+
+Press **Esc** or use **Clear Trace Highlights** to remove trace colors while keeping the tree. Selecting another node or running a new trace enables highlights again. Esc leaves completion, find, rename and snippet interactions alone. Cross-file preview navigation repaints the newly active editor.
+
+Use the inline check on a trace node to toggle **Safe / Ignored**. Query branches include their descendants; a finding path marks the individual step. Reviewed nodes lose their trace highlights. Decisions persist in this workspace for the same result and are invalidated when its evidence changes. This is a manual review label and does not change the analyzer's proof status.
+
+Select a call and choose **Mark Selected Call as Sink / Sanitizer** from the TraceGuard context menu. Select its effect or guarantee; single-argument calls need no further input, while multi-argument calls ask which arguments apply. The model is saved to the owning workspace's `.traceguard.json` and reloaded immediately. Unsaved configuration edits are protected.
+
+The copy button on a Trace root exports Markdown with file locations, code, branch arrows, analysis status and review decisions. `buildSliceContext(chain, options)` in `src/query/slice-context.js` also attaches complete enclosing functions parsed with Tree-sitter and deduplicates shared functions. Missing files, incomplete syntax and size limits are reported as missing context. Extraction is capped at 40 files, 100 functions and 512 KiB of function text, with a 1 MiB per-file parsing limit. Markdown export does not call an LLM.
+
+### AI chain verification
+
+The Trace root and toolbar offer two actions:
+
+- **Copy AI Prompt** copies the slice and a focused audit prompt to the clipboard. It needs no API configuration and makes no LLM request. Paste it into your preferred chat or local model.
+- **Verify Chain with AI** sends that slice to your configured OpenAI-compatible Chat Completions endpoint. A read-only Markdown report opens beside the code and updates at most every 100 ms. Cancel from the progress notification or close the report. Partial output remains labeled as incomplete on cancellation, errors or the 120-second deadline. AI results never automatically mark a branch safe or execute a PoC.
+
+Only three machine-level settings are exposed:
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `traceguard.ai.baseUrl` | `http://localhost:11434/v1` | API base URL, including the provider's API prefix; `/chat/completions` is appended. |
+| `traceguard.ai.model` | `qwen2.5-coder:14b` | Exact model name served by your endpoint; install local models separately. |
+| `traceguard.ai.apiKey` | Empty | Optional plaintext fallback; prefer the secure command below. |
+
+Run **TraceGuard: Set AI API Key (Secure Storage)** to store a key in VS Code SecretStorage. It takes precedence over the plaintext setting and is bound to the endpoint; changing endpoints does not reuse another endpoint's stored key. **Clear Stored AI API Key** removes the current endpoint's stored key. Local services can run without a key. The client uses native `fetch`, SSE and `AbortController`, with no additional SDK dependencies. It follows the [Chat Completions streaming contract](https://developers.openai.com/api/reference/resources/chat); a native Claude Messages endpoint requires an OpenAI-compatible proxy.
+
+Only an explicit Verify action sends source code to the selected endpoint. Reports live in memory until closed, and source, prompts and keys are not written to the extension log. Tests use a local mock server, including fragmented UTF-8/SSE, cancellation, stalled responses, HTTP errors and secret handling; compatibility with a particular remote deployment depends on its implementation.
+
+For local acceptance, run `npm.cmd run test:extension-host` on Windows, or launch **Run TraceGuard Extension** with F5. The automated test starts a real VS Code 1.90.0 Extension Host and verifies command registration, preview navigation, clearing/reviewing highlights, clipboard export and persistent Sanitizer modeling. A success marker prevents a clean process exit from masquerading as a completed test. Failed runs retain their log directory; set `TRACEGUARD_KEEP_TEST_LOGS=1` to retain successful runs too, or `TRACEGUARD_TEST_LOG_LEVEL=trace` for detailed logs. GUI startup requires an environment that permits launching desktop processes.
+
+The smoke test captures clipboard output in memory, validating the generated Markdown and AI prompts without changing the system clipboard. Accessor checks also verify Worker findings, backward queries, definition navigation and complete method-body exports.
 
 Start with **Scope** and check that the entry points and index coverage look complete.
 
@@ -96,12 +141,14 @@ C# and Go currently cover framework entries, call relationships, and local data 
 
 Java, PHP, and Python parser assets are built in for offline backend review. Other language assets are installed on first use and can also be served from a private mirror.
 
+For a local build, publish the generated `dist-assets` packs alongside the matching release or serve them from a mirror configured with `traceguard.languageAssetBaseUrl` before using deferred languages on a fresh installation. Java/PHP/Python need no additional packs. Building locally does not publish these files.
+
 ## Install
 
-Download `traceguard-vscode-1.1.0.vsix` from [Releases](https://github.com/xingguangqwq/traceguard-vscode/releases/latest), then run **Extensions: Install from VSIX** in VS Code.
+Install the locally built `traceguard-vscode-1.5.0.vsix` using **Extensions: Install from VSIX** in VS Code. Published builds are available from [Releases](https://github.com/xingguangqwq/traceguard-vscode/releases/latest).
 
 ```powershell
-code --install-extension .\traceguard-vscode-1.1.0.vsix
+code --install-extension .\traceguard-vscode-1.5.0.vsix
 ```
 
 Open a source folder you trust. Do not use the extension as a reason to execute unknown code.

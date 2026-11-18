@@ -286,7 +286,7 @@ function defaultTaintArguments(role) {
 }
 
 function lastCallName(value) { return String(value).split(/(?:\.|::|->|#)/).filter(Boolean).at(-1); }
-function sinkCategory(kind) { return { SQL_QUERY: "database", COMMAND_EXEC: "command", DYNAMIC_EXEC: "expression", FILE_ACCESS: "file", HTTP_REQUEST: "network", REDIRECT: "redirect", RESPONSE_OUTPUT: "output", DESERIALIZATION: "deserialization", DIRECTORY_LOOKUP: "directory" }[kind] || "sensitive"; }
+function sinkCategory(kind) { return { SQL_QUERY: "database", COMMAND_EXEC: "command", DYNAMIC_EXEC: "expression", FILE_ACCESS: "file", HTTP_REQUEST: "network", REDIRECT: "redirect", RESPONSE_OUTPUT: "output", DESERIALIZATION: "deserialization", DIRECTORY_LOOKUP: "directory", LDAP_QUERY: "ldap", TEMPLATE_RENDER: "template" }[kind] || "sensitive"; }
 function boundedString(value, maximum) { return typeof value === "string" && value.trim() && value.length <= maximum ? value.trim() : undefined; }
 function optionalString(value, maximum, source, configPath, issues) {
   if (value === undefined) return undefined;

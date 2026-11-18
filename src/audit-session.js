@@ -36,6 +36,7 @@ class AuditSession {
     this.context = context;
     this.output = output;
     this.evidenceWrite = Promise.resolve();
+    this.pendingRemovals = Promise.resolve();
     this.reviewWrite = Promise.resolve();
     this.analyses = [];
     this.model = emptyModel();
@@ -575,22 +576,29 @@ class AuditSession {
   }
 
   async removeFiles(uris, options = {}) {
+    const pending = this.pendingRemovals.then(() => this._removeFiles(uris, options));
+    this.pendingRemovals = pending.catch(() => {});
+    return pending;
+  }
+
+  async _removeFiles(uris, options) {
     if (!options.bypassIndexQueue && this.activeIndexDirtyQueue) {
       for (const uri of uris) this._queueIndexChange({ kind: "delete", uri });
       return true;
     }
     if (options.coverageLost) this.workspaceCoverageComplete = false;
     const removed = new Set(uris.map(uri => normalizePath(uri.fsPath)));
-    const analyses = this.analyses.filter(item => !removed.has(normalizePath(item.absolutePath)));
-    if (analyses.length === this.analyses.length) {
+    const targets = this.analyses.filter(item => removed.has(normalizePath(item.absolutePath)));
+    if (!targets.length) {
       if (options.coverageLost) this._changed.fire(this.snapshot);
       return false;
     }
+    for (const item of targets) await this.dataflowWorker.removeFile(item.absolutePath, { reanalyze: false });
+    const result = await this.dataflowWorker.reanalyzeAffectedFunctions(this._flowOptions());
     const previousAnalyses = this.analyses;
+    const removedAnalyses = new Set(targets);
+    this.analyses = previousAnalyses.filter(item => !removedAnalyses.has(item));
     try {
-      for (const uri of uris) await this.dataflowWorker.removeFile(uri.fsPath, { reanalyze: false });
-      const result = await this.dataflowWorker.reanalyzeAffectedFunctions(this._flowOptions());
-      this.analyses = analyses;
       this._applyWorkerResult(result);
     } catch (error) {
       this.analyses = previousAnalyses;
@@ -745,6 +753,8 @@ class AuditSession {
         maxAsyncDepth: scoped.get("flowMaxAsyncDepth", 8),
         maxTraceSteps: scoped.get("flowMaxSteps", 30),
         maxAnalysisMs: scoped.get("flowTimeoutMs", 3000),
+        maxCfgPathsPerFunction: scoped.get("flowMaxCfgPathsPerFunction", 24),
+        maxFlowStatesPerRoot: scoped.get("flowMaxStatesPerRoot", 32),
         maxPaths: Math.min(400, Math.max(80, scoped.get("flowMaxPaths", 40) * 5)),
         maxSourceBytes: this._maxSourceBytes(resource),
       };
@@ -762,6 +772,8 @@ class AuditSession {
       projectConfigurationsByRoot: effective.projectConfigurationsByRoot,
       projectIdentitiesByRoot: this.projectIdentitiesByRoot,
       languageAssets: {
+        runtimeWasmPath: this.context.asAbsolutePath?.("node_modules/web-tree-sitter/web-tree-sitter.wasm"),
+        assetManifestPath: this.context.asAbsolutePath?.("resources/language-assets.json"),
         assetCacheRoot: this.languageAssetCacheRoot,
         assetBaseUrl: configuration.get("languageAssetBaseUrl", "") || undefined,
         allowAssetDownloads: configuration.get("languageAssetDownloads", true),

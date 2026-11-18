@@ -4,6 +4,7 @@ const path = require("path");
 const { normalizePath } = require("../identity");
 const { composerPathsForType } = require("../config/project-identity");
 const { buildSemanticSymbolIndex, semanticCandidates } = require("../analysis/semantic-symbol-index");
+const { bindCallArguments } = require("./call-bindings");
 
 const javaRelationIndexes = new WeakMap();
 
@@ -50,7 +51,14 @@ function resolveCandidates(index, event, caller) {
   if (!scored.length) return storeResolution(index, event, caller, []);
   const executable = scored.filter(item => item.fn.executable !== false);
   const executablePrecise = executable.filter(item => item.precise);
-  const pool = executablePrecise.length ? executable : scored;
+  const available = executablePrecise.length ? executable : scored;
+  // Argument names refine candidates only after receiver/import identity. An
+  // invalid call on a known receiver must not jump to an unrelated homonym
+  // merely because that method happens to accept the supplied keyword.
+  const preciseIdentity = available.filter(item => item.precise);
+  const bindingScope = preciseIdentity.length ? preciseIdentity : available;
+  const validBindings = bindingScope.filter(item => item.binding.valid);
+  const pool = validBindings.length ? validBindings : bindingScope;
   const strong = pool.filter(item => item.strong);
   const precise = pool.filter(item => item.precise);
   const bestScore = pool[0].score;
@@ -63,7 +71,8 @@ function resolveCandidates(index, event, caller) {
   // import, explicit target, same-file, or semantic-index evidence the edge is
   // useful for navigation only and must remain heuristic.
   return storeResolution(index, event, caller,
-    selected.map(item => ({ ...item, quality: ambiguous || !item.strong ? "review" : "high" })));
+    selected.map(item => ({ ...item, quality: ambiguous || !item.strong || item.binding.status !== "verified" ? "review" : "high",
+      reason: item.binding.special ? `${item.reason}; ${item.binding.reason}` : item.reason })));
 }
 
 function cachedResolution(index, event, caller) {
@@ -102,8 +111,12 @@ function scoreCandidate(candidate, caller, event, reference, semanticIndexed = f
   const typeResolution = languageTypeResolution(candidate, caller, event, reference);
   const callableParameters = implicitParameterOffset(candidate, event) ? candidate.parameters.slice(1) : candidate.parameters;
   const callableParameterDetails = implicitParameterOffset(candidate, event) ? candidate.parameterDetails.slice(1) : candidate.parameterDetails;
-  const arityMatch = !event.arguments?.length && !callableParameters?.length || event.arguments?.length === callableParameters?.length;
-  const argumentTypeScore = matchingArgumentTypeScore(event.argumentTypes, callableParameterDetails);
+  const binding = bindCallArguments(candidate, event);
+  const arityMatch = binding.strict ? binding.valid && binding.status === "verified" :
+    !event.arguments?.length && !callableParameters?.length || event.arguments?.length === callableParameters?.length;
+  const argumentTypeScore = binding.strict ? binding.bindings.reduce((score, bound) => score + matchingArgumentTypeScore(
+    [event.argumentTypes?.[bound.argumentIndex]], [candidate.parameterDetails[bound.parameterIndex]]), 0) :
+    matchingArgumentTypeScore(event.argumentTypes, callableParameterDetails);
   const sameDirectory = directory(candidate.relativePath) === directory(caller.relativePath);
   const strong = Boolean(semanticIndexed || exactTarget || sameFile || typeResolution.match || referenceMatch === "exact" || receiverTypeMatch || receiverMatch);
   const semanticReason = semanticIndexed && ["csharp", "go"].includes(caller.language);
@@ -116,6 +129,7 @@ function scoreCandidate(candidate, caller, event, reference, semanticIndexed = f
     precise: Boolean(semanticIndexed || exactTarget || typeResolution.match || receiverTypeMatch || referenceMatch === "exact" || receiverMatch),
     compatible: typeResolution.compatible,
     reason,
+    binding,
   };
 }
 

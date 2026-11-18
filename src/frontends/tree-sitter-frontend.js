@@ -10,8 +10,11 @@ const { extractFileReferences, extractIdentifiers, splitArguments } = require(".
 const { runtime } = require("./tree-sitter-runtime");
 const { classifyFrameworkCall, dedupeFrameworkEntries, frameworkEntry, frameworkParameterRoles, inferParameterRoles, mergeFrameworkEntries, stringLiterals } = require("./framework-entries");
 const { resolveSemanticCall, resolveStructuralSemantic, SemanticRole } = require("../security/catalog");
-const { interpretCollectionCall } = require("../security/collection-semantics");
+const { interpretCollectionCall, isJavaMap, mapKeyPath } = require("../security/collection-semantics");
 const { expressionInputs, javaBeanGetterRead } = require("./expression-inputs");
+const { pythonBindingAssignments } = require("./python-bindings");
+const { inferAccessorSummary } = require("./accessor-summary");
+const { callArgumentFacts, callableParameters } = require("./call-arguments");
 const { fixedNumericCollectionJoinFact } = require("./collection-predicates");
 
 const FUNCTION_TYPES = Object.freeze({
@@ -277,7 +280,8 @@ function describeFunction(node, language, text, input) {
   const parametersNode = node.childForFieldName("parameters");
   const parametersText = stripParens(nodeText(parametersNode, text));
   const rawParameters = splitParameters(parametersText);
-  const descriptors = parameterDescriptors(parametersText, language).map((descriptor, index) => ({ ...descriptor, raw: rawParameters[index] || "" }));
+  const descriptors = callableParameters(node, language, parameterDescriptors(parametersText, language)
+    .map((descriptor, index) => ({ ...descriptor, raw: rawParameters[index] || "" })));
   const name = nodeText(nameNode, text) || anonymousName(node, text);
   const enclosingScope = enclosingScopeFor(node, language, text);
   const discriminator = anonymousDiscriminator(node, language, text);
@@ -326,12 +330,14 @@ function buildFunction(record, input, lines, references, text) {
     implementedTypes: record.implementedTypes || [],
     declarationKind: record.declarationKind,
     executable: record.executable,
+    accessorSummary: inferAccessorSummary(record, input.language),
     signature: `${record.name}(${record.parameterDescriptors.map(parameter => parameter.type).join(",")})`,
     location: location({ ...input, ...treeSourceLocation(record.node), code: lines[record.line - 1] }),
     parameters: record.parameterDescriptors.map(parameter => {
       const annotations = input.language === "java" ? javaParameterAnnotationNames(parameter.raw) : [];
       return symbol(parameter.name, parameter.type, parameter.role, {
         annotations,
+        callBinding: parameter.callBinding,
         cascadedValidation: annotations.some(name => ["Valid", "Validated"].includes(name)),
       });
     }),
@@ -393,7 +399,12 @@ function buildOperations(record, input, lines, text, references = []) {
       const left = node.childForFieldName("left") || node.childForFieldName("name") || node.namedChildren?.[0];
       const explicitRight = node.childForFieldName("right") || node.childForFieldName("value");
       const right = explicitRight || node.namedChildren?.at(-1);
-      const target = assignmentTarget(nodeText(left, text));
+      const bindings = input.language === "python" ? pythonBindingAssignments(left, right) : undefined;
+      for (const binding of bindings || []) add(OperationKind.ASSIGNMENT, node, {
+        inputs: binding.inputs.map(name => symbol(name)), output: symbol(binding.target),
+        metadata: { assignmentMode: binding.mode, propagationReason: "Python positional tuple/list binding preserves the element Access Path.", propagationStatus: "verified" },
+      });
+      const target = bindings ? undefined : assignmentTarget(nodeText(left, text));
       if (target && right && right !== left) {
         const inputs = assignmentExpressionInputs(right, text, input.language);
         const constant = constantExpressionValue(right, text, constantValues);
@@ -406,9 +417,10 @@ function buildOperations(record, input, lines, text, references = []) {
         const literalString = ["string", "encapsed_string"].includes(right.type) &&
           (right.namedChildren || []).every(child => ["string_start", "string_end", "string_content", "escape_sequence"].includes(child.type));
         if (!uninitializedSelfReference && (inputs.length || explicitRight && (constant !== NO_CONSTANT || literalString))) add(OperationKind.ASSIGNMENT, node, {
-          inputs: inputs.map(symbol),
+          inputs: inputs.map(name => symbol(name)),
           output: symbol(target),
-          metadata: { assignmentMode: inputs.length ? (normalizeAccessPath(nodeText(right, text)) ? "alias" : "aggregate") : "constant" },
+          metadata: { assignmentMode: inputs.length ? (normalizeAccessPath(nodeText(right, text)) ? "alias" : "aggregate") : "constant",
+            valueExpression: right.endIndex - right.startIndex <= 8192 ? nodeText(right, text) : undefined, valueStartOffset: right.startIndex },
         });
         const guardFact = fixedNumericCollectionJoinFact(node, input.language, text, {
           parseCall: genericCall,
@@ -417,7 +429,7 @@ function buildOperations(record, input, lines, text, references = []) {
         });
         const guardModel = guardFact && resolveStructuralSemantic("fixed-numeric-collection-join", input.language);
         if (guardFact && guardModel) add(OperationKind.GUARD, node, {
-          inputs: guardFact.inputs.map(symbol),
+          inputs: guardFact.inputs.map(name => symbol(name)),
           output: symbol(guardFact.output),
           semantic: {
             modelId: guardModel.id,
@@ -458,15 +470,15 @@ function buildOperations(record, input, lines, text, references = []) {
     }
     if (CALL_TYPES.has(node.type)) {
       const call = genericCall(node, text);
-      call.argumentInputs = call.arguments.map(argument => expressionInputs(argument, input.language).map(symbol));
+      call.argumentInputs = (call.argumentValues || call.arguments).map(argument => genericExpressionInputs(argument, input.language, record, references, inferredTypes).map(name => symbol(name)));
       call.receiverInputs = genericReceiverInputs(call, input.language);
-      call.argumentTypes = call.arguments.map(argument => inferExpressionType(argument, record, references));
+      call.argumentTypes = (call.argumentValues || call.arguments).map(argument => inferExpressionType(argument, record, references));
       attachGenericCallIdentity(call, record, references, input.language, inferredTypes);
       const output = enclosingCallOutput(node, text, input.language);
       const collectionAccess = interpretCollectionCall(call, output, input.language, collectionStates, {
         controlScope: input.language === "java" ? javaControlScope(node, record.node) : "",
       });
-      if (collectionAccess.receiverInputs) call.receiverInputs = collectionAccess.receiverInputs.map(symbol);
+      if (collectionAccess.receiverInputs) call.receiverInputs = collectionAccess.receiverInputs.map(name => symbol(name));
       const modeled = genericModeledCall(call, input.language, output, input.options?.semanticModels);
       if (output?.name && modeled?.returnType) inferredTypes.set(canonicalSymbolName(output.name), modeled.returnType);
       const operationCall = serializableGenericCall(call);
@@ -496,6 +508,7 @@ function buildOperations(record, input, lines, text, references = []) {
           assignmentMode: "alias",
           propagationReason: `${call.function}() reads JavaBean property ${beanRead.input}.`,
           propagationStatus: "verified",
+          javaBeanGetter: true,
         },
       });
       for (const effect of collectionAccess.writes || []) {
@@ -510,18 +523,22 @@ function buildOperations(record, input, lines, text, references = []) {
         });
       }
     }
-    if (node.type === "return_statement") add(OperationKind.RETURN, node, {
-      inputs: normalizedIdentifiers(nodeText(node, text).replace(/^\s*return\b/, "")).map(symbol),
-    });
+    if (node.type === "return_statement") {
+      const valueExpression = nodeText(node, text).replace(/^\s*return\b/, "").replace(/;\s*$/, "").trim();
+      add(OperationKind.RETURN, node, {
+        inputs: expressionInputs(valueExpression, input.language).map(name => symbol(name)),
+        metadata: { valueExpression: valueExpression.length <= 8192 ? valueExpression : undefined, valueStartOffset: node.namedChildren?.[0]?.startIndex },
+      });
+    }
     if (THROW_TYPES.has(node.type)) add(OperationKind.THROW, node, {
-      inputs: normalizedIdentifiers(nodeText(node, text).replace(/^\s*(?:throw|raise)\b/, "")).map(symbol),
+      inputs: normalizedIdentifiers(nodeText(node, text).replace(/^\s*(?:throw|raise)\b/, "")).map(name => symbol(name)),
     });
     if (node.type === "break_statement") add(OperationKind.BREAK, node);
     if (node.type === "continue_statement") add(OperationKind.CONTINUE, node);
     if (BRANCH_TYPES.has(node.type)) {
       const branch = genericBranchMetadata(node, text, LOOP_TYPES.has(node.type) ? "loop" : "branch", constantValues);
       add(OperationKind.BRANCH, node, {
-        inputs: normalizedIdentifiers(branch.condition).map(symbol),
+        inputs: normalizedIdentifiers(branch.condition).map(name => symbol(name)),
         metadata: { branch },
       });
     }
@@ -569,7 +586,8 @@ function signalOperations(record, input, lines, text, references = []) {
     const signalSemantic = semanticForSignal(signal);
     const call = semantic.node && CALL_TYPES.has(semantic.node.type) ? genericCall(semantic.node, text) : undefined;
     if (call) {
-      call.argumentInputs = call.arguments.map(argument => expressionInputs(argument, input.language).map(symbol));
+      call.argumentInputs = (call.argumentValues || call.arguments).map(argument => genericExpressionInputs(argument, input.language, record, references).map(name => symbol(name)));
+      call.argumentTypes = (call.argumentValues || call.arguments).map(argument => inferExpressionType(argument, record, references));
       call.receiverInputs = genericReceiverInputs(call, input.language);
       call.symbol = genericCallIdentity(call, record, references, input.language);
     }
@@ -593,6 +611,8 @@ function signalOperations(record, input, lines, text, references = []) {
       modelResolution = resolveSemanticCall(input.language, modeledCall, input.options?.semanticModels, expectedRole);
     }
     const matchingModel = Boolean(expectedRole && modelResolution.model?.role === expectedRole);
+    if (signalSemantic.requiresReceiverIdentity &&
+      (modelResolution.model?.id !== signalSemantic.modelId || !["verified", "syntax"].includes(modelResolution.status))) return [];
     if (modelResolution.status === "rejected" && expectedRole) return [];
     if (matchingModel && ["verified", "syntax"].includes(modelResolution.status)) {
       const model = modelResolution.model;
@@ -643,7 +663,7 @@ function signalOperations(record, input, lines, text, references = []) {
         ...(semantic.node ? treeSourceLocation(semantic.node) : { line: signal.line }),
         code,
       }),
-      inputs: operationInputs.map(symbol),
+      inputs: operationInputs.map(name => symbol(name)),
       output: semantic.output ? symbol(semantic.output) : signal.kind === "source" && assignment?.target ? symbol(assignment.target) : undefined,
       call: serializableGenericCall(modeledCall),
       semantic: signalSemantic,
@@ -704,16 +724,19 @@ function genericCall(node, text) {
   const parts = callable.split(/(?:\.|->|::)/).filter(Boolean);
   const argumentNode = node.childForFieldName("arguments") || node.namedChildren?.find(child => /argument/.test(child.type));
   const rawArguments = stripParens(nodeText(argumentNode, text));
-  const args = splitArguments(rawArguments);
   const argumentNodes = argumentNode?.namedChildren || [];
+  const args = argumentNode ? argumentNodes.filter(argument => argument.type !== "comment").map(argument => nodeText(argument, text)) : splitArguments(rawArguments);
+  const { valueNodes, ...argumentFacts } = callArgumentFacts(node, argumentNodes, args);
   return {
     function: nodeText(nameNode, text) || parts.at(-1) || callable,
+    expression: !args.length && node.endIndex - node.startIndex <= 8192 ? nodeText(node, text) : undefined,
     form: node.type === "object_creation_expression" ? "constructor" : callFormFromReceiver(objectNode),
     receiver: nodeText(objectNode, text) || (parts.length > 1 ? parts.slice(0, -1).join(".") : undefined),
     arguments: args,
-    argumentInputs: args.map(argument => normalizedIdentifiers(argument).map(symbol)),
-    argumentTypes: args.map(inferExpressionType),
-    argumentConstants: args.map((expression, index) => genericArgumentConstant(argumentNodes[index], text, expression, index)),
+    ...argumentFacts,
+    argumentInputs: (argumentFacts.argumentValues || args).map(argument => normalizedIdentifiers(argument).map(name => symbol(name))),
+    argumentTypes: (argumentFacts.argumentValues || args).map(inferExpressionType),
+    argumentConstants: (argumentFacts.argumentValues || args).map((expression, index) => genericArgumentConstant(valueNodes[index], text, expression, index)),
     receiverCall: objectNode && CALL_TYPES.has(objectNode.type) ? genericCall(objectNode, text) : undefined,
     receiverCallNode: objectNode && CALL_TYPES.has(objectNode.type) ? objectNode : undefined,
   };
@@ -744,7 +767,12 @@ function genericCallIdentity(call, record, references = [], language, inferredTy
     : language === "java" && call.receiver === "super" && record.superClassType
       ? resolveDeclaredJavaType(record.superClassType, javaPackage, references)
       : undefined;
-  const parameterType = inferredReceiverType || (receiverRoot && !["this", "self", "$this"].includes(receiverRoot)
+  // A nested call's modeled return belongs to its result, not its receiver.
+  // In particular, response.getWriter().write(...) must retain response origin
+  // without treating unrelated PrintWriter instances as HTTP output.
+  const receiverResult = call.receiverCall && resolveSemanticCall(language, call.receiverCall, [], SemanticRole.PROPAGATOR);
+  const receiverReturnType = receiverResult && ["verified", "syntax"].includes(receiverResult.status) ? receiverResult.model?.returnType : undefined;
+  const parameterType = receiverReturnType || inferredReceiverType || (receiverRoot && !["this", "self", "$this"].includes(receiverRoot)
     ? record.parameterDescriptors?.find(parameter => canonicalSymbolName(parameter.name) === canonicalSymbolName(receiverRoot))?.type
     : undefined) || javaSpecialReceiverType || call.receiverCall?.symbol?.receiverType;
   const sameLocal = (reference, value) => canonicalSymbolName(reference.local) === canonicalSymbolName(value);
@@ -1078,14 +1106,16 @@ function stabilizeDuplicateSymbols(records) {
 }
 
 function genericBranchMetadata(node, text, controlKind = "branch", constantValues = new Map()) {
+  const expressionBranch = node.type === "conditional_expression";
   const conditionNode = node.type === "enhanced_for_statement"
     ? node.childForFieldName("value")
-    : node.childForFieldName("condition") || node.childForFieldName("condition_clause") || node.namedChildren?.[0];
-  const thenNode = node.childForFieldName("consequence") || node.childForFieldName("body");
-  const elseNode = node.childForFieldName("alternative");
+    : node.childForFieldName("condition") || node.childForFieldName("condition_clause") || node.namedChildren?.[expressionBranch ? 1 : 0];
+  const thenNode = node.childForFieldName("consequence") || node.childForFieldName("body") || (expressionBranch ? node.namedChildren?.[0] : undefined);
+  const elseNode = node.childForFieldName("alternative") || (expressionBranch ? node.namedChildren?.[2] : undefined);
   const constant = controlKind === "branch" ? constantExpressionValue(conditionNode, text, constantValues) : NO_CONSTANT;
   return {
     controlKind,
+    expressionBranch,
     condition: nodeText(conditionNode, text),
     constantOutcome: typeof constant === "boolean" ? constant : undefined,
     conditionRange: treeNodeRange(conditionNode),
@@ -1536,9 +1566,16 @@ function assignSignals(records, signals, lines) {
 
 function nodeText(node, text) { return node ? String(node.text ?? String(text).slice(node.startIndex, node.endIndex)) : ""; }
 function normalizedIdentifiers(value) { return extractIdentifiers(value).map(name => normalizeAccessPath(name) || name); }
+function genericExpressionInputs(value, language, record, references, inferredTypes) {
+  return expressionInputs(value, language, { mapRead: (receiver, key) => {
+    const call = { receiver, function: "get", arguments: [key] };
+    call.symbol = genericCallIdentity(call, record, references, language, inferredTypes);
+    return isJavaMap(call) ? mapKeyPath(receiver, key) : undefined;
+  } });
+}
 function genericReceiverInputs(call, language) {
   if (call?.receiverCall) return (call.receiverCall.argumentInputs || []).flat();
-  return expressionInputs(call?.receiver || "", language).map(symbol);
+  return expressionInputs(call?.receiver || "", language).map(name => symbol(name));
 }
 
 function assignmentExpressionInputs(right, text, language) {

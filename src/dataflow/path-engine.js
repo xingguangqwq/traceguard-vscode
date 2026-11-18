@@ -1,5 +1,7 @@
 "use strict";
 
+const { advanceValueVersion, captureGuardVersions, guardVersionChanged } = require("./guard-versions");
+
 const { normalizePath, stableHash } = require("../identity");
 const { GuardCapability, SourceExposure, SourceKind, sourceExposureForKind } = require("../security/semantics");
 const callResolver = require("./call-resolver");
@@ -15,6 +17,7 @@ const { functionsFromAnalyses } = require("./ir-adapter");
 const catalog = require("../security/catalog");
 const { assignmentFact, isReachableEvent } = require("./propagation");
 const { applyAssignment } = require("./taint-kernel");
+const { argumentValue, bindCallArguments, implicitReceiverOffset, parameterValue } = require("./call-bindings");
 const { eventSequences } = require("./control-flow");
 
 const SOURCE_TOKEN = "<source>";
@@ -138,6 +141,8 @@ function findSourceSinkPaths(analyses, options = {}) {
         maxHigherOrderDepth: limits.maxHigherOrderDepth,
         maxAsyncDepth: limits.maxAsyncDepth,
         maxAnalysisMs: limits.maxAnalysisMs,
+        maxCfgPathsPerFunction: limits.maxCfgPathsPerFunction,
+        maxStatesPerRoot: limits.maxStatesPerRoot,
         timedOut: limits.reasons.has("analysis-timeout"),
         totalRoots: roots.length,
         processedRoots,
@@ -256,6 +261,7 @@ function walkLinearFlow(state) {
       continue;
     }
     if (event.type === "call") {
+      if (event.accessorModeled) continue;
       if (event.target && !guardDefinesSameValue(state.events, event)) advanceValueVersion(versions, event.target);
       const directlyTaintedArguments = [];
       event.argumentVariables.forEach((variables, index) => {
@@ -560,6 +566,7 @@ function findTaintedReturnOnPath(fn, events, incoming, index, visited, depth, ma
       continue;
     }
     if (event.type === "call" && event.target) {
+      if (event.accessorModeled) continue;
       const nextBoundaries = nextCallBoundaries(event, boundaries, limits);
       if (!nextBoundaries) continue;
       const directlyTaintedArguments = [];
@@ -961,6 +968,10 @@ function makeStep(kind, label, fn, event, extra = {}) {
     line: event.line || fn.line,
     code: event.code || "",
     accessPaths,
+    ...(event.accessorEvidence ? {
+      ...event.accessorEvidence,
+      callSite: { absolutePath: fn.absolutePath, relativePath: fn.relativePath, line: event.line, code: event.code },
+    } : {}),
     ...extra,
   };
 }
@@ -1168,7 +1179,7 @@ function assignmentEvidence(event, tainted, evidence, fn) {
       const output = rebaseTaint(taintedPath, input, event.target, mode);
       if (!output) continue;
       const fact = assignmentFact(event, taintedPath, output);
-      const step = makeStep("propagation", `${taintedPath} → ${output}`, fn, event, {
+      const step = makeStep("propagation", event.propagationLabel || `${taintedPath} → ${output}`, fn, event, {
         analysisStatus: fact.status,
         propagationKind: mode,
         propagationReason: fact.reason,
@@ -1230,19 +1241,26 @@ function precedingCallDefinesSameValue(fn, assignment, tainted) {
 
 function incomingParameterVariables(fn, event, tainted) {
   const incoming = [];
-  const parameterOffset = fn.language === "python" && event.receiver && ["self", "cls"].includes(fn.parameters[0]) ? 1 : 0;
-  for (let index = parameterOffset; index < fn.parameters.length; index += 1) {
-    const argumentIndex = index - parameterOffset;
-    if (event.taintArgumentIndexes && !event.taintArgumentIndexes.includes(argumentIndex)) continue;
-    const variables = event.argumentVariables[argumentIndex] || [];
-    const root = fn.parameters[index];
-    const bindings = parameterAccessBindings(fn, index);
+  const parameterOffset = implicitReceiverOffset(fn, event);
+  for (const bound of bindCallArguments(fn, event).bindings) {
+    if (bound.kind !== "explicit") continue;
+    const index = bound.parameterIndex;
+    if (event.taintArgumentIndexes && !event.taintArgumentIndexes.includes(index - parameterOffset)) continue;
+    const value = argumentValue(event, bound);
+    const variables = value.variables;
+    const root = parameterValue(fn, bound);
+    if (bound.uncertain) { if (intersects(variables, tainted)) incoming.push(root); continue; }
+    const bindings = parameterAccessBindings(fn, index).flatMap(binding => {
+      if (!bound.parameterPath.length) return [binding];
+      if (bound.parameterPath.some((part, slot) => part !== "*" && binding.path[slot] !== "*" && part !== binding.path[slot])) return [];
+      return [{ ...binding, path: binding.path.slice(bound.parameterPath.length) }];
+    });
     const wholeArgumentTainted = variables.some(value => [...tainted].some(taintedPath => pathFeeds(taintedPath, value)));
     if (wholeArgumentTainted) {
       incoming.push(root, ...bindings.map(binding => binding.name));
       continue;
     }
-    const argumentRoot = argumentAccessPath(event.arguments?.[argumentIndex]);
+    const argumentRoot = argumentAccessPath(value.expression);
     if (!argumentRoot) continue;
     if (!bindings.length && [...tainted].some(taintedPath => pathsOverlap(argumentRoot, taintedPath))) {
       incoming.push(root);
@@ -1257,17 +1275,18 @@ function incomingParameterVariables(fn, event, tainted) {
 }
 
 function callAccessPathTransition(fn, event, tainted, incoming) {
-  const parameterOffset = fn.language === "python" && event.receiver && ["self", "cls"].includes(fn.parameters[0]) ? 1 : 0;
-  for (let argumentIndex = 0; argumentIndex < (event.argumentVariables || []).length; argumentIndex += 1) {
-    const input = (event.argumentVariables[argumentIndex] || [])
+  const binding = bindCallArguments(fn, event);
+  for (const bound of binding.bindings) {
+    if (bound.kind !== "explicit") continue;
+    const input = argumentValue(event, bound).variables
       .find(value => [...tainted].some(taintedPath => pathsOverlap(value, taintedPath)));
     if (!input) continue;
-    const parameter = fn.parameters[argumentIndex + parameterOffset];
+    const parameter = parameterValue(fn, bound);
     const output = incoming.find(value => value === parameter || value.startsWith(`${parameter}.`) || value.startsWith(`${parameter}[`));
     return {
       inputAccessPath: normalizeAccessPath(input),
       outputAccessPath: normalizeAccessPath(output || parameter),
-      propagationReason: `argument ${argumentIndex} maps to parameter ${parameter}`,
+      propagationReason: binding.special ? binding.reason : `argument ${bound.argumentIndex} maps to parameter ${parameter}`,
     };
   }
   return {};
@@ -1418,19 +1437,6 @@ function guardCapabilityFailures(scope, binding, target, versions, options = {})
   return [...new Set(reasons)];
 }
 
-function advanceValueVersion(versions, value) {
-  const key = normalizeAccessPath(value);
-  if (!key) return;
-  versions.set(key, (versions.get(key) || 0) + 1);
-}
-
-function captureGuardVersions(binding, versions) {
-  return Object.fromEntries([...(binding.inputs || []), ...(binding.protectedOutputs || []), binding.output]
-    .map(normalizeAccessPath)
-    .filter(Boolean)
-    .map(value => [value, versions.get(value) || 0]));
-}
-
 function propagateOutputGuardAssignments(controls, assignment, tainted, versions) {
   const target = normalizeAccessPath(assignment.target);
   const taintedInputs = unique((assignment.variables || []).filter(value => intersects([value], tainted)));
@@ -1445,12 +1451,6 @@ function propagateOutputGuardAssignments(controls, assignment, tainted, versions
     binding.valueVersions ||= {};
     binding.valueVersions[target] = versions.get(target) || 0;
   }
-}
-
-function guardVersionChanged(binding, value, versions) {
-  const key = normalizeAccessPath(value);
-  if (!key || !binding.valueVersions || binding.valueVersions[key] === undefined) return false;
-  return binding.valueVersions[key] !== (versions.get(key) || 0);
 }
 
 function effectiveControlStep(step, relation) {

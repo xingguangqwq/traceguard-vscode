@@ -2,7 +2,7 @@
   "name": "traceguard-vscode",
   "displayName": "TraceGuard White-box Audit",
   "description": "Local white-box audit navigation: entry discovery, explainable data-flow traces, prioritized review queues and evidence notes.",
-  "version": "1.1.0",
+  "version": "1.5.0",
   "publisher": "traceguard",
   "license": "MIT",
   "repository": {
@@ -111,13 +111,13 @@
       },
       {
         "command": "traceguard.traceBackward",
-        "title": "Backward",
+        "title": "Trace Selected Variable Backward",
         "category": "TraceGuard",
         "icon": "$(arrow-left)"
       },
       {
         "command": "traceguard.traceForward",
-        "title": "Forward",
+        "title": "Trace Selected Variable Forward",
         "category": "TraceGuard",
         "icon": "$(arrow-right)"
       },
@@ -210,6 +210,12 @@
         "title": "TraceGuard: Inspect Flow Path",
         "category": "TraceGuard",
         "icon": "$(git-compare)"
+      },
+      {
+        "command": "traceguard.openTraceInspector",
+        "title": "TraceGuard: Open Visual Trace Inspector",
+        "category": "TraceGuard",
+        "icon": "$(inspect)"
       },
       {
         "command": "traceguard.previousTraceStep",
@@ -378,6 +384,53 @@
         "title": "Remove Audit Note",
         "category": "TraceGuard",
         "icon": "$(trash)"
+      },
+      {
+        "command": "traceguard.selectQueryNode",
+        "title": "TraceGuard: Open Variable Trace Step",
+        "category": "TraceGuard"
+      },
+      {
+        "command": "traceguard.clearTraceHighlights",
+        "title": "Clear Trace Highlights",
+        "category": "TraceGuard",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "traceguard.toggleTraceReviewed",
+        "title": "Toggle Safe / Ignored",
+        "category": "TraceGuard",
+        "icon": "$(check)"
+      },
+      {
+        "command": "traceguard.markSelectionAsSanitizer",
+        "title": "Mark Selected Call as Sanitizer",
+        "category": "TraceGuard",
+        "icon": "$(verified)"
+      },
+      {
+        "command": "traceguard.copyAiPrompt",
+        "title": "TraceGuard: Copy AI Prompt",
+        "category": "TraceGuard",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "traceguard.verifyChainWithAi",
+        "title": "TraceGuard: Verify Chain with AI",
+        "category": "TraceGuard",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "traceguard.setAiApiKey",
+        "title": "TraceGuard: Set AI API Key (Secure Storage)",
+        "category": "TraceGuard",
+        "icon": "$(key)"
+      },
+      {
+        "command": "traceguard.clearAiApiKey",
+        "title": "TraceGuard: Clear Stored AI API Key",
+        "category": "TraceGuard",
+        "icon": "$(clear-all)"
       }
     ],
     "submenus": [
@@ -432,7 +485,8 @@
       "traceguard": [
         {
           "id": "traceguard.summary",
-          "name": "Scope"
+          "name": "Scope",
+          "type": "webview"
         },
         {
           "id": "traceguard.code",
@@ -450,10 +504,6 @@
     },
     "viewsWelcome": [
       {
-        "view": "traceguard.summary",
-        "contents": "Build the analysis scope to inventory endpoints, indexed files and explicit coverage gaps.\n[Build Scope](command:traceguard.startAudit)"
-      },
-      {
         "view": "traceguard.code",
         "contents": "Build the review queue to order entry-reachable and security-sensitive code for human review.\n[Build Review Queue](command:traceguard.startAudit)"
       },
@@ -469,6 +519,11 @@
     "menus": {
       "view/title": [
         {
+          "command": "traceguard.openTraceInspector",
+          "when": "view == traceguard.auditQueries",
+          "group": "navigation@0"
+        },
+        {
           "command": "traceguard.previousTraceStep",
           "when": "view == traceguard.auditQueries && traceguard.hasTracePath",
           "group": "navigation@1"
@@ -480,7 +535,7 @@
         },
         {
           "command": "traceguard.copyAuditQueryMarkdown",
-          "when": "view == traceguard.auditQueries && traceguard.hasAuditQuery",
+          "when": "view == traceguard.auditQueries && (traceguard.hasAuditQuery || traceguard.hasTracePath)",
           "group": "navigation@3"
         },
         {
@@ -537,6 +592,21 @@
           "command": "traceguard.addEvidence",
           "when": "view == traceguard.evidence",
           "group": "navigation@1"
+        },
+        {
+          "command": "traceguard.clearTraceHighlights",
+          "when": "view == traceguard.auditQueries && traceguard.hasTraceHighlights",
+          "group": "navigation@5"
+        },
+        {
+          "command": "traceguard.copyAiPrompt",
+          "when": "view == traceguard.auditQueries && (traceguard.hasAuditQuery || traceguard.hasTracePath)",
+          "group": "ai@3"
+        },
+        {
+          "command": "traceguard.verifyChainWithAi",
+          "when": "view == traceguard.auditQueries && (traceguard.hasAuditQuery || traceguard.hasTracePath)",
+          "group": "ai@4"
         }
       ],
       "view/item/context": [
@@ -604,6 +674,26 @@
           "command": "traceguard.removeEvidence",
           "when": "view == traceguard.evidence && viewItem == traceguard.evidence",
           "group": "inline"
+        },
+        {
+          "command": "traceguard.copyAuditQueryMarkdown",
+          "when": "view == traceguard.auditQueries && (viewItem == traceguard.auditQueryResult || viewItem == traceguard.interactiveTrace)",
+          "group": "inline@1"
+        },
+        {
+          "command": "traceguard.toggleTraceReviewed",
+          "when": "view == traceguard.auditQueries && (viewItem == traceguard.auditQueryNode || viewItem == traceguard.traceStep || viewItem == traceguard.currentTraceStep || viewItem == traceguard.reviewedTraceNode)",
+          "group": "inline@2"
+        },
+        {
+          "command": "traceguard.copyAiPrompt",
+          "when": "view == traceguard.auditQueries && (viewItem == traceguard.auditQueryResult || viewItem == traceguard.interactiveTrace)",
+          "group": "inline@3"
+        },
+        {
+          "command": "traceguard.verifyChainWithAi",
+          "when": "view == traceguard.auditQueries && (viewItem == traceguard.auditQueryResult || viewItem == traceguard.interactiveTrace)",
+          "group": "inline@4"
         }
       ],
       "editor/context": [
@@ -614,6 +704,14 @@
         }
       ],
       "traceguard.editor": [
+        {
+          "command": "traceguard.traceBackward",
+          "group": "trace@0"
+        },
+        {
+          "command": "traceguard.traceForward",
+          "group": "trace@1"
+        },
         {
           "command": "traceguard.explainAnalysisHere",
           "group": "trace@1"
@@ -641,6 +739,11 @@
         {
           "submenu": "traceguard.advancedModeling",
           "group": "advanced@1"
+        },
+        {
+          "command": "traceguard.clearTraceHighlights",
+          "when": "traceguard.hasTraceHighlights",
+          "group": "trace@9"
         }
       ],
       "traceguard.traceOrigin": [
@@ -717,6 +820,10 @@
         {
           "command": "traceguard.markSelectionAsSink",
           "group": "model@2"
+        },
+        {
+          "command": "traceguard.markSelectionAsSanitizer",
+          "group": "model@3"
         }
       ],
       "commandPalette": [
@@ -742,6 +849,10 @@
         },
         {
           "command": "traceguard.selectTraceStep",
+          "when": "false"
+        },
+        {
+          "command": "traceguard.selectQueryNode",
           "when": "false"
         }
       ]
@@ -876,9 +987,62 @@
           "maximum": 3600,
           "scope": "window",
           "description": "Timeout for full workspace initialization and Worker replay. Use 0 to disable the hard timeout; interactive queries keep their independent 30-second timeout."
+        },
+        "traceguard.ai.baseUrl": {
+          "type": "string",
+          "default": "http://localhost:11434/v1",
+          "scope": "machine",
+          "description": "OpenAI-compatible API base URL, including /v1 when required. Verify Chain with AI sends the selected code slice to this endpoint. Copy AI Prompt does not call the LLM."
+        },
+        "traceguard.ai.model": {
+          "type": "string",
+          "default": "qwen2.5-coder:14b",
+          "scope": "machine",
+          "description": "Model name available at your endpoint. Local models must already be installed."
+        },
+        "traceguard.ai.apiKey": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "markdownDescription": "Optional plaintext API key. Prefer **TraceGuard: Set AI API Key (Secure Storage)**. A stored key takes precedence and is bound to the endpoint. Leave empty for local endpoints without authentication."
+        },
+        "traceguard.flowMaxCfgPathsPerFunction": {
+          "type": "integer",
+          "default": 24,
+          "minimum": 1,
+          "maximum": 96,
+          "scope": "resource",
+          "description": "Advanced: maximum CFG paths explored per function. Increase for branch-heavy code at a CPU cost; budget exhaustion remains explicit in the result."
+        },
+        "traceguard.flowMaxStatesPerRoot": {
+          "type": "integer",
+          "default": 32,
+          "minimum": 1,
+          "maximum": 500,
+          "scope": "resource",
+          "description": "Advanced: maximum flow states explored for each source root. Increase for deeper call graphs at a CPU cost; this does not resolve reflection or dynamic proxies."
         }
       }
-    }
+    },
+    "keybindings": [
+      {
+        "command": "traceguard.traceBackward",
+        "key": "ctrl+alt+up",
+        "mac": "cmd+alt+up",
+        "when": "editorTextFocus && !inDebugMode && (editorLangId == java || editorLangId == php || editorLangId == javascript || editorLangId == javascriptreact || editorLangId == typescript || editorLangId == typescriptreact || editorLangId == python || editorLangId == csharp || editorLangId == go)"
+      },
+      {
+        "command": "traceguard.traceForward",
+        "key": "ctrl+alt+down",
+        "mac": "cmd+alt+down",
+        "when": "editorTextFocus && !inDebugMode && (editorLangId == java || editorLangId == php || editorLangId == javascript || editorLangId == javascriptreact || editorLangId == typescript || editorLangId == typescriptreact || editorLangId == python || editorLangId == csharp || editorLangId == go)"
+      },
+      {
+        "command": "traceguard.clearTraceHighlights",
+        "key": "escape",
+        "when": "editorTextFocus && traceguard.hasTraceHighlights && !suggestWidgetVisible && !findWidgetVisible && !renameInputVisible && !inSnippetMode"
+      }
+    ]
   },
   "scripts": {
     "test": "node --test test/*.test.js",
@@ -895,9 +1059,14 @@
     "verify:release-version": "node scripts/verify-release-version.js",
     "build:assets": "node scripts/build-language-assets.js",
     "package": "npm run build:assets && vsce package",
-    "benchmark:review": "node scripts/performance-baseline.js --fixture=java-backend --files=1000 --max-incremental-ms=500 --max-rss-mib=500 --compact"
+    "benchmark:review": "node scripts/performance-baseline.js --fixture=java-backend --files=1000 --max-incremental-ms=500 --max-rss-mib=500 --compact",
+    "typecheck": "node scripts/typecheck.js",
+    "eval:owasp": "node scripts/evaluate-owasp.js",
+    "clean:artifacts": "node scripts/cleanup-artifacts.js"
   },
   "devDependencies": {
+    "@types/node": "20.19.0",
+    "@types/vscode": "1.90.0",
     "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^3.6.0",
     "yauzl": "^3.4.0"

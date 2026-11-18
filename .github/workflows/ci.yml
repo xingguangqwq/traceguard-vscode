@@ -32,7 +32,7 @@ jobs:
             exit 1
           fi
 
-      - name: Check JavaScript syntax
+      - name: Check JavaScript syntax and strict core types
         run: npm run check
 
       - name: Enforce editor review fingerprint baseline

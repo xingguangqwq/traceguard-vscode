@@ -3,9 +3,8 @@ node_modules/
 .vscode-test/
 .npm-cache/
 .target-labs/
-.tmp-vsix-verify*/
-.tmp-vsix-installed-audit/
-.tmp-vsix-whitebox-ui-audit/
+.tmp-vsix*/
+eval-corpus/owasp-latest-report.json
 dist-assets/
 coverage/
 *.log

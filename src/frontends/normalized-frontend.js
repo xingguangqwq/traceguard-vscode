@@ -82,7 +82,7 @@ function normalizeOperation(event, scope, file, occurrence = 0) {
     kind,
     functionId: scope.id,
     location: eventLocation,
-    inputs: (event.variables || []).map(symbol),
+    inputs: (event.variables || []).map(name => symbol(name)),
     output: event.target ? symbol(event.target) : undefined,
     semantic: ["source", "sink", "control"].includes(event.type) ? semanticForSignal(semanticSignal) : {},
     certainty: kind === OperationKind.SINK ? Certainty.LOW : Certainty.MEDIUM,
@@ -90,7 +90,7 @@ function normalizeOperation(event, scope, file, occurrence = 0) {
       function: event.callee,
       receiver: event.receiver,
       arguments: event.arguments,
-      argumentInputs: event.argumentVariables.map(group => group.map(symbol)),
+      argumentInputs: event.argumentVariables.map(group => group.map(name => symbol(name))),
     } : undefined,
     metadata: {
       category: event.category,

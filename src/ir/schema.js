@@ -1,4 +1,12 @@
 "use strict";
+// @ts-check
+
+/** @typedef {import('./contracts').SymbolValue} SymbolValue */
+/** @typedef {import('./contracts').SymbolMetadata} SymbolMetadata */
+/** @typedef {import('./contracts').SourceLocation} SourceLocation */
+/** @typedef {import('./contracts').Operation} Operation */
+/** @typedef {import('./contracts').FunctionIR} FunctionIR */
+/** @typedef {import('./contracts').FileIR} FileIR */
 
 const IR_VERSION = 2;
 const MAX_LOCATION_CODE_CHARACTERS = 1_000;
@@ -46,10 +54,12 @@ const ParameterRole = Object.freeze({
   UNKNOWN: "unknown",
 });
 
+/** @param {string} name @param {string} [type] @param {import('./contracts').ParameterRole} [role] @param {SymbolMetadata} [metadata] @returns {SymbolValue} */
 function symbol(name, type = "?", role, metadata = {}) {
+  /** @type {SymbolValue} */
   const value = { kind: ValueKind.SYMBOL, name: String(name || ""), type: String(type || "?") };
-  if (role) value.role = String(role);
-  if (Number.isInteger(metadata.parameterIndex) && metadata.parameterIndex >= 0) value.parameterIndex = metadata.parameterIndex;
+  if (role) value.role = role;
+  if (typeof metadata.parameterIndex === "number" && Number.isInteger(metadata.parameterIndex) && metadata.parameterIndex >= 0) value.parameterIndex = metadata.parameterIndex;
   if (Array.isArray(metadata.bindings)) {
     value.bindings = metadata.bindings.map(binding => ({
       name: String(binding.name || ""),
@@ -59,10 +69,13 @@ function symbol(name, type = "?", role, metadata = {}) {
   if (metadata.captured) value.captured = true;
   if (Array.isArray(metadata.annotations)) value.annotations = metadata.annotations.map(String).filter(Boolean);
   if (metadata.cascadedValidation) value.cascadedValidation = true;
+  if (metadata.callBinding) value.callBinding = { ...metadata.callBinding };
   return value;
 }
 
+/** @param {Pick<SourceLocation, 'absolutePath' | 'relativePath'> & Partial<SourceLocation>} input @returns {SourceLocation} */
 function location(input) {
+  /** @type {SourceLocation} */
   const value = {
     absolutePath: input.absolutePath,
     relativePath: input.relativePath,
@@ -70,12 +83,14 @@ function location(input) {
     endLine: Math.max(1, Number(input.endLine || input.line) || 1),
     code: boundedCodeExcerpt(input.code),
   };
-  for (const key of ["startColumn", "endColumn", "startOffset", "endOffset"]) {
-    if (Number.isFinite(input[key]) && input[key] >= 0) value[key] = Number(input[key]);
+  for (const key of /** @type {const} */ (["startColumn", "endColumn", "startOffset", "endOffset"])) {
+    const offset = input[key];
+    if (typeof offset === "number" && Number.isFinite(offset) && offset >= 0) value[key] = offset;
   }
   return value;
 }
 
+/** @param {unknown} code @returns {string} */
 function boundedCodeExcerpt(code) {
   const value = String(code || "");
   if (value.length <= MAX_LOCATION_CODE_CHARACTERS) return value;
@@ -83,6 +98,7 @@ function boundedCodeExcerpt(code) {
   return `${value.slice(0, half)} ... ${value.slice(-half)}`;
 }
 
+/** @param {Pick<Operation, 'id' | 'kind' | 'functionId' | 'location'> & Partial<Operation>} input @returns {Operation} */
 function operation(input) {
   return {
     id: input.id,
@@ -98,6 +114,7 @@ function operation(input) {
   };
 }
 
+/** @param {Pick<FunctionIR, 'id' | 'name' | 'language' | 'location'> & Partial<FunctionIR>} input @returns {FunctionIR} */
 function functionIR(input) {
   return {
     id: input.id,
@@ -111,6 +128,7 @@ function functionIR(input) {
     implementedTypes: input.implementedTypes || [],
     declarationKind: input.declarationKind || "function",
     executable: input.executable !== false,
+    accessorSummary: input.accessorSummary,
     signature: input.signature || `${input.name || "<anonymous>"}(${(input.parameters || []).map(parameter => parameter.type || "?").join(",")})`,
     location: input.location,
     parameters: input.parameters || [],
@@ -123,7 +141,9 @@ function functionIR(input) {
   };
 }
 
+/** @param {Pick<FileIR, 'language' | 'absolutePath' | 'relativePath' | 'lines'> & Partial<FileIR>} input @returns {FileIR} */
 function fileIR(input) {
+  /** @type {FileIR} */
   const value = {
     schema: "traceguard-ir",
     version: IR_VERSION,
@@ -141,6 +161,7 @@ function fileIR(input) {
   return value;
 }
 
+/** @param {Partial<FileIR> | null | undefined} value @returns {string[]} */
 function validateFileIR(value) {
   const errors = [];
   if (value?.schema !== "traceguard-ir") errors.push("schema must be traceguard-ir");

@@ -1,6 +1,49 @@
 # TraceGuard 白盒审计
 
+1.5 版加入可视化 Scope 和 Trace Inspector。可以搜索全部已索引路由、逐步查看源码和审计笔记，在 Inspector 中查看或停止当前链路的 AI 报告。引擎覆盖范围和评测数据见 [1.4 工程更新](docs/engineering-1.4.md)。
+
 [English](README.md)
+
+## 1.3 命名参数与可变参数
+
+对已索引的 Python／PHP 项目函数和方法，扫描、正反向追踪、返回值传播及 setter 字段传播现在共用参数绑定规则。`service.dispatch(command=value, prefix="fixed")` 和 `$service->dispatch(command: $value, prefix: "fixed")` 即使重排参数，也会追到声明中的 `command`，不会把名称标签当作变量读取。
+
+支持混合位置／命名实参、跳过可选参数、Python 仅限位置／仅限关键字参数，以及显式可变参数的下标／键隔离。反向追踪显示省略参数的标量默认值；显式 `None`／`null` 仍按已传入的值处理。非字面量默认值不会从调用者的同名变量补取。
+
+未知展开内容保留为带原因的 Review Hypothesis；重复名称、未知名称、缺少必填参数及超出预算的调用会显示绑定缺口。每次绑定上限为 128 个实参／形参、512 个候选映射。该能力不补猜未索引的外部库签名，也不执行默认表达式或项目代码。规则参考 [Python 调用语义](https://docs.python.org/3/reference/expressions.html#calls)和 [PHP 命名参数](https://www.php.net/manual/en/functions.arguments.php#functions.named-arguments)。
+
+## 1.2 字段传播增强
+
+Java、PHP、Python 现在能根据简单实例方法的真实方法体，跨文件追踪 `输入 → box.store(input) → box.fetch() → Sink`。扫描、正向追踪、反向追踪共用字段传播规则，常量覆盖会终止对应字段的旧路径，条件覆盖保留其他分支；不同实例和相邻字段分别追踪。路径证据及 Markdown／AI 切片会附上实际 setter、getter 方法体，修改方法后会重新计算受影响调用者。
+
+推断要求调用目标唯一、方法体完整，且只包含直接返回字段，或将参数写入字段（可追加返回自身）。Java 也支持已声明实例字段的省略 `this` 写法；命名实参使用共享参数绑定。有条件逻辑、其他调用、静态／装饰器／异步方法，以及无法解析的展开实参时，继续使用原有分析；动态属性和自动生成的访问器暂不在该推断范围内。
+
+## 变量追踪与路径复核
+
+- 选中变量或属性路径，按 `Ctrl+Alt+↑/↓` 向上／向下追踪；macOS 使用 `Cmd+Option+↑/↓`。
+- 点击 Trace 树节点，用预览标签页跳转；跨文件自动重绘追踪高亮。按 `Esc` 或右键选择 **Clear Trace Highlights** 清除染色并保留树，再点节点可恢复。
+- 节点行内勾选按钮切换 **Safe / Ignored**。查询节点连同子分支隐藏追踪染色；单条路径按步骤标记。同一结果的决定保存在工作区，结果证据变化后需重新排查。人工标记不代表引擎已证明安全。
+- 选中调用，右键 **Mark Selected Call as Sink / Sanitizer**，选择类别或消毒能力后写入所属工作区的 `.traceguard.json` 并热重载。单参数自动选中，多参数需要选择作用位置；配置文件有未保存修改时不会覆盖。
+- 根节点的复制按钮导出带位置、代码、分支箭头、分析状态和人工标记的 Markdown，同时附上 Tree-sitter 提取的完整函数体。缺失源码、语法错误和超出预算的部分会明确列出。
+
+共享的 `buildSliceContext(chain, options)` 为 Markdown 和 AI 研判提供结构化输入。每次最多提取 40 个文件、100 个函数、512 KiB 函数文本，单文件解析上限为 1 MiB。
+
+## AI 链路研判
+
+Trace 根节点和工具栏提供两个按钮：
+
+- **Copy AI Prompt**：零配置复制切片与审计 Prompt，可粘贴到网页版或本地模型；不会调用 LLM。
+- **Verify Chain with AI**：将切片发送至配置的兼容接口，右侧打开只读 Markdown 报告，每 100ms 批量刷新。可在进度通知中取消，关闭报告也会停止请求。超时（120 秒）、取消或失败时保留部分输出并标注未完成。不会自动打安全标记，也不会执行 PoC。
+
+仅有三个机器级设置：`traceguard.ai.baseUrl`（默认 `http://localhost:11434/v1`）、`traceguard.ai.model`（默认 `qwen2.5-coder:14b`，模型须自行安装）、`traceguard.ai.apiKey`（可选明文 Key）。Base URL 应包含服务的 API 前缀，客户端自动追加 `/chat/completions`。
+
+推荐运行 **TraceGuard: Set AI API Key (Secure Storage)** 将密钥保存在 SecretStorage。密钥绑定当前接口地址并优先于明文设置；换地址不会复用另一接口的已存密钥。**Clear Stored AI API Key** 删除当前地址的已存密钥。本地免认证服务可不配 Key。
+
+客户端使用原生 fetch / SSE / AbortController。Inspector 可展示流式报告、修复建议和回归验收条件。远程服务需支持 OpenAI Chat Completions 流式协议。仅点击 Verify 才发送源码，报告只驻留内存，源码、Prompt 和密钥不写日志。测试使用本地 Mock 服务。
+
+本地验收可运行 `npm.cmd run test:extension-host`，或按 F5 启动 **Run TraceGuard Extension**。自动测试使用真实 VS Code 1.90.0 宿主，并验证完成标记；失败时会输出保留日志的目录。`TRACEGUARD_KEEP_TEST_LOGS=1` 可保留成功日志，`TRACEGUARD_TEST_LOG_LEVEL=trace` 可打开详细日志。宿主需要在允许启动桌面进程的环境运行。
+
+宿主测试使用内存剪贴板验证命令导出的 Markdown 和 AI Prompt，不改动系统剪贴板；字段传播用例同时检查 Worker 结果、反向查询、方法定义跳转与完整方法体导出。
 
 TraceGuard 是一个给白盒审计用的 VS Code 插件。它帮你理清接口入口、排出该先看哪些代码、把变量在函数之间怎么传的搞清楚,再把审计过程里的判断记在代码旁边,省得回头去另一个文档里翻。
 
@@ -70,7 +113,7 @@ Reviewed、False Positive、Accepted Risk、Suppressed、Needs Context 这些是
 
 项目自己的 Source、Sink、Sanitizer、Propagator 定义,以及规则开关和要排除的路径,都写在 `.traceguard.json` 里,自己配。
 
-整个过程在本地跑,代码不离开 VS Code,插件也不会去执行被审计的项目。
+索引、扫描和变量追踪在本地运行，插件不会执行被审计的项目。只有主动点击 **Verify Chain with AI** 才会将切片发送到你配置的接口。
 
 ## 结果怎么理解
 
@@ -96,12 +139,14 @@ C# 和 Go 目前到框架入口、调用关系、局部数据流这一层,比前
 
 Java、PHP、Python 的语法解析资源内置,离线就能审后端代码。其他语言首次使用时会去装,也可以自己配私有镜像源。
 
+本地构建后，其他语言在全新安装中使用前，需要将 `dist-assets` 中同版本资源包发布到匹配的 Release，或放到私有镜像并配置 `traceguard.languageAssetBaseUrl`。Java／PHP／Python 不需要额外资源包；本地打包不会自动发布这些文件。
+
 ## 安装
 
-去 [Releases](https://github.com/xingguangqwq/traceguard-vscode/releases/latest) 页下 `traceguard-vscode-1.1.0.vsix`,在 VS Code 里跑 **Extensions: Install from VSIX** 就行。
+本地生成的 `traceguard-vscode-1.5.0.vsix` 可在 VS Code 中通过 **Extensions: Install from VSIX** 安装。已发布版本可从 [Releases](https://github.com/xingguangqwq/traceguard-vscode/releases/latest) 获取。
 
 ```powershell
-code --install-extension .\traceguard-vscode-1.1.0.vsix
+code --install-extension .\traceguard-vscode-1.5.0.vsix
 ```
 
 打开一个你信得过的源码目录,别拿来跑不明来源的代码。

@@ -11,9 +11,9 @@ function normalizedIdentifiers(value) {
   return extractIdentifiers(value).map(name => normalizeAccessPath(name) || name);
 }
 
-function expressionInputs(value, language) {
+function expressionInputs(value, language, options = {}) {
   if (language === "php") {
-    return [...new Set([...normalizedIdentifiers(value), ...[...String(value || "").matchAll(/\$[A-Za-z_]\w*/g)].map(match => match[0])])];
+    return phpExpressionInputs(String(value || ""));
   }
   if (language === "python") {
     const source = String(value || "");
@@ -29,7 +29,13 @@ function expressionInputs(value, language) {
   }
   if (language !== "java") return normalizedIdentifiers(value);
   const accessPaths = [];
-  const source = String(value || "");
+  let source = String(value || "");
+  if (options.mapRead) source = source.replace(/\b([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\.get\s*\(\s*("[^"\\]*"|\d+|[A-Za-z_$][\w$]*)\s*\)/g, (match, receiver, key) => {
+    const slot = options.mapRead(receiver, key);
+    if (!slot) return match;
+    accessPaths.push(slot);
+    return " ".repeat(match.length);
+  });
   for (const match of source.matchAll(/\b([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\.(?:get|is)([A-Z][A-Za-z0-9_$]*)\s*\(\s*\)/g)) {
     const property = javaBeanProperty(match[2]);
     const path = normalizeAccessPath(`${match[1]}.${property}`);
@@ -43,6 +49,37 @@ function expressionInputs(value, language) {
     !accessPaths.some(path => path === identifier || path.startsWith(`${identifier}.`)) &&
     !/^get[A-Z]|^is[A-Z]/.test(identifier));
   return [...new Set([...accessPaths, ...identifiers])];
+}
+
+function phpExpressionInputs(source) {
+  const paths = [];
+  let quote = "";
+  for (let index = 0; index < source.length;) {
+    const character = source[index];
+    if (quote && character === "\\") { index += 2; continue; }
+    if (character === quote) { quote = ""; index++; continue; }
+    if (!quote && (character === "'" || character === '"')) { quote = character; index++; continue; }
+    if (quote === "'" || character !== "$") { index++; continue; }
+    const root = /^\$[A-Za-z_]\w*/.exec(source.slice(index))?.[0];
+    if (!root) { index++; continue; }
+    let end = index + root.length;
+    let raw = root;
+    for (;;) {
+      const member = /^\s*(?:->|\?->)\s*([A-Za-z_]\w*)/.exec(source.slice(end));
+      if (member && !/^\s*\(/.test(source.slice(end + member[0].length))) {
+        raw += `.${member[1]}`;
+        end += member[0].length;
+        continue;
+      }
+      const subscript = /^\s*\[\s*(?:'[^'\\]*'|"[^"\\]*"|[^\[\]'"\r\n]+)\s*\]/.exec(source.slice(end));
+      if (!subscript) break;
+      raw += subscript[0].trimStart();
+      end += subscript[0].length;
+    }
+    paths.push(normalizeAccessPath(raw) || root);
+    index = end;
+  }
+  return [...new Set(paths)];
 }
 
 function pythonFormattedStringExpressions(value) {

@@ -71,6 +71,8 @@ function mergePathMetadata(results, pathCount) {
     flowHigherOrderDepthBudget: Math.max(0, ...explorations.map(item => item.maxHigherOrderDepth || 0)),
     flowAsyncDepthBudget: Math.max(0, ...explorations.map(item => item.maxAsyncDepth || 0)),
     flowTimeoutMs: Math.max(0, ...explorations.map(item => item.maxAnalysisMs || 0)),
+    flowCfgPathBudget: Math.max(0, ...explorations.map(item => item.maxCfgPathsPerFunction || 0)),
+    flowPerRootStateBudget: Math.max(0, ...explorations.map(item => item.maxStatesPerRoot || 0)),
     flowTimedOut: explorations.some(item => item.timedOut),
     totalFlowRoots: explorations.reduce((sum, item) => sum + (item.totalRoots || 0), 0),
     processedFlowRoots: explorations.reduce((sum, item) => sum + (item.processedRoots || 0), 0),

@@ -65,15 +65,22 @@ async function main() {
   const results = [];
   try {
     const { analyzeTextAsync } = require(path.join(extensionRoot, "src", "audit-analyzer.js"));
+    const { buildSliceContext } = require(path.join(extensionRoot, "src", "query", "slice-context.js"));
     for (const sample of samples) {
       const absolutePath = path.join(extensionRoot, `.traceguard-runtime-${sample.label}${sample.extension}`);
       const coreOffline = ["java", "python", "php"].includes(sample.language);
       const analysis = await analyzeTextAsync(sample.text, sample.language, absolutePath, path.basename(absolutePath), {
         languageAssets: coreOffline ? offlineCoreAssetOptions : deferredLanguageAssetOptions,
       });
-      assert.equal(analysis.frontend?.mode, "ast", `${sample.label} did not load its deferred AST frontend`);
+      assert.equal(analysis.frontend?.mode, "ast", `${sample.label} AST frontend: ${analysis.frontend?.degradedReason || "unavailable"}`);
       assert.ok(analysis.functions.length > 0, `${sample.label} produced no function IR`);
       assert.equal(analysis.frontend.treeHasErrors, false, `${sample.label} grammar recovered from a valid smoke sample`);
+      const slice = await buildSliceContext({ steps: [{ kind: "flow", absolutePath, line: analysis.functions[0].line }] }, {
+        languageAssets: coreOffline ? offlineCoreAssetOptions : deferredLanguageAssetOptions,
+        readSource: async () => ({ text: sample.text, language: sample.language }),
+      });
+      assert.equal(slice.functions.length, 1, `${sample.label} packaged function slicing failed: ${slice.omissions.join("; ")}`);
+      assert.equal(slice.omissions.length, 0);
       results.push(`${sample.label}:${analysis.frontend.id}`);
     }
     const { DataflowWorkerClient } = require(path.join(extensionRoot, "src", "dataflow", "worker-client.js"));
@@ -85,17 +92,69 @@ async function main() {
       packagedFile("CommandController.java", "java", "class CommandController { void run(HttpServletRequest request) { Runtime.getRuntime().exec(request.getParameter(\"cmd\")); } }"),
       packagedFile("command.php", "php", "<?php function run() { system($_GET[\"cmd\"]); }"),
       packagedFile("command.py", "python", "import os\ndef run(request):\n    os.system(request.args.get(\"cmd\"))\n"),
+      packagedFile("AccessorFlow.java", "java", `class CommandBox {
+  private String command;
+  void store(String value) { this.command = value; }
+  String fetch() { return this.command; }
+}
+class AccessorFlow {
+  void run(HttpServletRequest request) {
+    CommandBox box = new CommandBox();
+    String value = request.getParameter("cmd");
+    box.store(value);
+    String selected = box.fetch();
+    Runtime.getRuntime().exec(selected);
+  }
+}`),
     ];
+    const namedFiles = [
+      packagedFile("named_service.py", "python", 'import os\nclass NamedRunnerService:\n    def dispatch(self, prefix="ok", command="fixed"):\n        os.system(command)\n'),
+      packagedFile("named_entry.py", "python", 'from named_service import NamedRunnerService\ndef named_handle(request):\n    service = NamedRunnerService()\n    value = request.args.get("cmd")\n    service.dispatch(command=value, prefix="fixed")\n    service.dispatch(prefix=value)\n'),
+      packagedFile("NamedService.php", "php", '<?php\nnamespace PackageNamed;\nclass NamedRunnerService {\n  function dispatch($prefix="ok", $command="fixed") { system($command); }\n}'),
+      packagedFile("NamedEntry.php", "php", '<?php\nnamespace PackageNamed;\nfunction named_handle() {\n  $service = new NamedRunnerService();\n  $value = $_GET["cmd"];\n  $service->dispatch(command: $value, prefix: "fixed");\n  $service->dispatch(prefix: $value);\n}'),
+    ];
+    backendFiles.push(...namedFiles);
+    backendFiles.push(
+      packagedFile("ResponseLdap.java", "java", 'import javax.servlet.http.HttpServletRequest;\nimport javax.servlet.http.HttpServletResponse;\nimport javax.naming.directory.DirContext;\nclass ResponseLdap { void handle(HttpServletRequest request, HttpServletResponse response, DirContext directory) { String value = request.getParameter("q"); directory.search("ou=users", value, controls); response.getWriter().write(value); } }'),
+      packagedFile("template_source.py", "python", 'from flask import request, render_template_string\ndef template_handle():\n    value = request.args.get("template")\n    return render_template_string(value)\n'),
+    );
     try {
       const initialized = await worker.initializeWorkspace(backendFiles, { maxDepth: 6, maxPaths: 80, languageAssets: offlineCoreAssetOptions });
       const findings = initialized.findingDelta.upsert;
+      for (const [relativePath, cwe] of [["ResponseLdap.java", "CWE-90"], ["ResponseLdap.java", "CWE-79"], ["template_source.py", "CWE-1336"]]) {
+        assert.ok(findings.some(finding => finding.relativePath === relativePath && finding.cwe === cwe), `Packaged Worker misses ${cwe} in ${relativePath}`);
+      }
       assert.ok(findings.some(finding => finding.relativePath === "CommandController.java"));
       assert.ok(findings.some(finding => finding.relativePath === "command.php"));
       assert.ok(findings.some(finding => finding.relativePath === "command.py"));
+      const accessorFinding = findings.find(finding => finding.relativePath === "AccessorFlow.java");
+      assert.ok(accessorFinding, "packaged Worker preserves setter/getter field effects");
+      assert.ok(accessorFinding.paths.some(path => path.steps.some(step => step.functionName === "store") && path.steps.some(step => step.functionName === "fetch")), "packaged accessor paths retain method-body evidence");
+      const backward = await worker.queryAudit({ kind: "trace-backward", absolutePath: backendFiles[3].absolutePath, identifier: "selected", line: 12 });
+      const flatten = nodes => nodes.flatMap(node => [node, ...flatten(node.children || [])]);
+      assert.ok(flatten(backward.roots).some(node => node.kind === "source"), "packaged Worker traces accessor fields backward to their Source");
+      for (const [entry, service, identifier] of [[namedFiles[1], namedFiles[0], "command"], [namedFiles[3], namedFiles[2], "$command"]]) {
+        const finding = findings.find(item => item.relativePath === service.relativePath);
+        assert.ok(finding, `${entry.language}: packaged named arguments reach the cross-file sink`);
+        const namedBackward = await worker.queryAudit({ kind: "trace-backward", absolutePath: service.absolutePath, identifier, line: 4 });
+        assert.ok(flatten(namedBackward.roots).some(node => node.kind === "source"), `${entry.language}: packaged named arguments trace backward`);
+        assert.ok(flatten(namedBackward.roots).some(node => node.details?.argumentBinding?.status === "verified"), "binding explanations survive Worker serialization");
+        assert.ok(flatten(namedBackward.roots).some(node => node.kind === "default-argument" && node.status === "verified"), "declared scalar defaults survive Worker serialization");
+        const safe = { ...entry, version: "package-named-2", text: entry.language === "python" ?
+          entry.text.replace('command=value, prefix="fixed"', 'command="fixed", prefix=value') :
+          entry.text.replace('command: $value, prefix: "fixed"', 'command: "fixed", prefix: $value') };
+        const updated = await worker.updateFile(safe);
+        assert.ok(updated.findingDelta.removedIds.includes(finding.id), `${entry.language}: safe named arguments remove stale packaged findings`);
+      }
+      const safeAccessor = { ...backendFiles[3], version: "package-smoke-2", text: backendFiles[3].text.replace("box.store(value);", 'box.store("fixed");') };
+      const changed = await worker.updateFile(safeAccessor);
+      assert.ok(changed.findingDelta.removedIds.includes(accessorFinding.id), "packaged Worker removes stale accessor findings after a constant write");
       const query = await worker.queryPaths({ absolutePath: backendFiles[0].absolutePath });
       assert.ok(Array.isArray(query.paths));
       assert.ok(query.metadata.workerRssBytes > 0);
       results.push("worker:java/php/python");
+      results.push("worker:accessor-fields/queries/updates");
+      results.push("worker:named-arguments/defaults/updates");
     } finally {
       await worker.dispose();
     }

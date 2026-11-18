@@ -25,6 +25,8 @@ const SinkKind = Object.freeze({
   RESPONSE_OUTPUT: "RESPONSE_OUTPUT",
   DESERIALIZATION: "DESERIALIZATION",
   DIRECTORY_LOOKUP: "DIRECTORY_LOOKUP",
+  LDAP_QUERY: "LDAP_QUERY",
+  TEMPLATE_RENDER: "TEMPLATE_RENDER",
   SENSITIVE_OPERATION: "SENSITIVE_OPERATION",
 });
 
@@ -39,6 +41,7 @@ const GuardCapability = Object.freeze({
   PATH_CONFINEMENT: "PATH_CONFINEMENT",
   OUTPUT_ENCODING: "OUTPUT_ENCODING",
   SQL_PARAMETERIZATION: "SQL_PARAMETERIZATION",
+  LDAP_FILTER_ESCAPE: "LDAP_FILTER_ESCAPE",
   SHELL_ESCAPE: "SHELL_ESCAPE",
   AUTHENTICATION: "AUTHENTICATION",
   AUTHORIZATION: "AUTHORIZATION",
@@ -59,6 +62,8 @@ const SINK_BY_CATEGORY = Object.freeze({
   output: SinkKind.RESPONSE_OUTPUT,
   deserialization: SinkKind.DESERIALIZATION,
   directory: SinkKind.DIRECTORY_LOOKUP,
+  ldap: SinkKind.LDAP_QUERY,
+  template: SinkKind.TEMPLATE_RENDER,
 });
 
 const GUARD_SINK_KINDS = Object.freeze({
@@ -70,6 +75,7 @@ const GUARD_SINK_KINDS = Object.freeze({
   [GuardCapability.PATH_CONFINEMENT]: [SinkKind.FILE_ACCESS],
   [GuardCapability.OUTPUT_ENCODING]: [SinkKind.RESPONSE_OUTPUT],
   [GuardCapability.SQL_PARAMETERIZATION]: [SinkKind.SQL_QUERY],
+  [GuardCapability.LDAP_FILTER_ESCAPE]: [SinkKind.LDAP_QUERY],
   [GuardCapability.SHELL_ESCAPE]: [SinkKind.COMMAND_EXEC],
   [GuardCapability.DESERIALIZATION_ALLOWLIST]: [SinkKind.DESERIALIZATION],
   [GuardCapability.NUMERIC_ONLY]: [SinkKind.COMMAND_EXEC, SinkKind.SQL_QUERY],
@@ -79,6 +85,7 @@ const GUARD_SINK_KINDS = Object.freeze({
 
 const OUTPUT_SCOPED_GUARDS = new Set([
   GuardCapability.OUTPUT_ENCODING,
+  GuardCapability.LDAP_FILTER_ESCAPE,
   GuardCapability.PATH_CANONICALIZATION,
   GuardCapability.SHELL_ESCAPE,
   GuardCapability.NUMERIC_ONLY,
@@ -88,6 +95,7 @@ const OUTPUT_SCOPED_GUARDS = new Set([
 const RECEIVER_SCOPED_GUARDS = new Set([GuardCapability.SQL_PARAMETERIZATION]);
 const TRUSTED_OPERAND_GUARDS = new Set([GuardCapability.PATH_CONFINEMENT]);
 const SEMANTIC_PROOF_GUARDS = new Set([
+  GuardCapability.LDAP_FILTER_ESCAPE,
   GuardCapability.URL_POLICY,
   GuardCapability.OUTPUT_ENCODING,
   GuardCapability.SQL_PARAMETERIZATION,

@@ -7,12 +7,14 @@ const {
   normalizeAccessPath,
   pathFeeds,
   pathsOverlap,
+  removeAssignedTaint,
   relativeAccessPath,
 } = require("../ir/access-path");
 const { normalizePath, stableHash } = require("../identity");
 const { assignmentFact, assignmentInputs, assignmentOutputs, eventConsumes, isReachableEvent } = require("../dataflow/propagation");
 const { eventSequences, targetBlocksAtLine } = require("../dataflow/control-flow");
 const { applyAssignment, applyCallOutput, applySource } = require("../dataflow/taint-kernel");
+const { argumentValue, bindCallArguments, bindingMatchesParameterPath, calleeValuesForBinding, callerValuesForBinding } = require("../dataflow/call-bindings");
 
 const QueryKind = Object.freeze({
   TRACE_BACKWARD: "trace-backward",
@@ -30,6 +32,8 @@ const QueryStatus = Object.freeze({
   HEURISTIC: "heuristic",
   UNRESOLVED: "unresolved",
 });
+
+const sourceAssignmentCache = new WeakMap();
 
 function runAuditQuery(analyses, request = {}) {
   const context = createContext(analyses, request);
@@ -143,13 +147,13 @@ function selectFunction(functions, request) {
     matches.sort((left, right) => Math.abs(left.line - request.line) - Math.abs(right.line - request.line))[0];
 }
 
-function backwardVariable(context, fn, variable, beforeLine, visiting, depth, limits) {
+function backwardVariable(context, fn, variable, beforeLine, visiting, depth, limits, beforeEventId) {
   if (!reserve(limits)) return [truncatedNode(fn)];
-  const key = `back:${fn.id}:${variable}:${beforeLine}`;
+  const key = `back:${fn.id}:${variable}:${beforeLine}:${beforeEventId || ""}`;
   if (visiting.has(key) || depth > limits.maxDepth) return [cycleNode(fn, variable, depth > limits.maxDepth)];
   const nextVisiting = new Set(visiting);
   nextVisiting.add(key);
-  const definitions = latestDefinitions(fn, variable, beforeLine);
+  const definitions = latestDefinitions(fn, variable, beforeLine, beforeEventId);
   if (definitions.length) return definitions.map(event => {
     const children = [];
     if (event.type === "source") {
@@ -157,7 +161,7 @@ function backwardVariable(context, fn, variable, beforeLine, visiting, depth, li
       if (fn.isEntry) children.push(...entryNodes(fn, variable));
     } else if (event.type === "assignment") {
       for (const input of assignmentInputs(event, variable)) {
-        children.push(...backwardVariable(context, fn, input, event.line, nextVisiting, depth + 1, limits));
+        children.push(...backwardVariable(context, fn, input, event.line, nextVisiting, depth + 1, limits, event.id));
       }
     } else if (event.type === "call") {
       const callees = context.outgoing.get(fn.id)?.filter(edge => edge.event.id === event.id) || [];
@@ -203,9 +207,8 @@ function backwardVariable(context, fn, variable, beforeLine, visiting, depth, li
       const callerValues = callerValuesForParameter(edge.event, parameter, edge.callee);
       const children = callerValues.length
         ? callerValues.flatMap(value => backwardVariable(context, edge.caller, value, edge.event.line, nextVisiting, depth + 1, limits))
-        : [queryNode({ kind: "argument", label: `Argument ${parameter.index + 1} was not resolved`, status: QueryStatus.UNRESOLVED,
-          reason: "The call was resolved, but the argument expression could not be converted to an Access Path.", fn: edge.caller, event: edge.event })];
-      return callNode(edge, children, `Parameter ${variable} is supplied by argument ${parameter.index + 1}.`);
+        : [parameterArgumentNode(edge, parameter)];
+      return callNode(edge, children, `Parameter ${variable}: ${bindCallArguments(edge.callee, edge.event).reason}`);
     });
   }
   return [queryNode({
@@ -232,7 +235,7 @@ function forwardVariable(context, fn, variable, afterLine, visiting, depth, limi
       const outputs = assignmentOutputs(event, [variable]);
       for (const output of outputs) roots.push(queryNode({
         kind: "assignment",
-        label: `${variable} → ${output}`,
+        label: event.propagationLabel || `${variable} → ${output}`,
         status: eventStatus(event),
         reason: assignmentFact(event, variable, output).reason,
         fn,
@@ -444,7 +447,20 @@ function explainHere(context, fn, request, limits) {
   })];
 }
 
-function latestDefinitions(fn, variable, beforeLine) {
+function latestDefinitions(fn, variable, beforeLine, beforeEventId) {
+  const cutoff = beforeEventId ? fn.events.findIndex(event => event.id === beforeEventId) : -1;
+  const allowed = cutoff < 0 ? undefined : new Set(fn.events.slice(0, cutoff).map(event => event.id));
+  const sourceAssignments = sourceAssignmentIds(fn);
+  const candidates = events => events.filter(event => !event.accessorModeled && !sourceAssignments.has(event.id) &&
+    (!allowed || allowed.has(event.id)) && event.line <= beforeLine && event.target && pathFeeds(event.target, variable));
+  const reaching = events => {
+    const definitions = [];
+    for (const event of [...events].reverse()) {
+      definitions.push(event);
+      if (!removeAssignedTaint([variable], event.target).has(variable)) break;
+    }
+    return definitions;
+  };
   const targetBlocks = targetBlocksAtLine(fn, beforeLine);
   const sequences = eventSequences(fn, {
     startLine: fn.line,
@@ -455,15 +471,26 @@ function latestDefinitions(fn, variable, beforeLine) {
   });
   const definitions = [];
   for (const events of sequences) {
-    const matches = events.filter(event => event.line <= beforeLine && event.target && pathFeeds(event.target, variable));
-    if (matches.length) definitions.push(matches.at(-1));
+    definitions.push(...reaching(candidates(events)));
   }
   const uniqueDefinitions = new Map(definitions.map(event => [event.id, event]));
   if (uniqueDefinitions.size) return [...uniqueDefinitions.values()];
-  const fallback = fn.events.filter(event => event.line <= beforeLine && isReachableEvent(event) && event.target && pathFeeds(event.target, variable));
+  const fallback = candidates(fn.events.filter(isReachableEvent));
   if (!fallback.length) return [];
-  const line = Math.max(...fallback.map(event => event.line));
-  return fallback.filter(event => event.line === line);
+  return reaching(fallback);
+}
+
+function sourceAssignmentIds(fn) {
+  if (sourceAssignmentCache.has(fn)) return sourceAssignmentCache.get(fn);
+  const sources = new Map();
+  for (const source of fn.events.filter(event => event.type === "source" && event.target)) {
+    if (!sources.has(source.target)) sources.set(source.target, []);
+    sources.get(source.target).push(source);
+  }
+  const ids = new Set(fn.events.filter(event => event.type === "assignment" && Number.isFinite(event.startOffset) &&
+    (sources.get(event.target) || []).some(source => source.startOffset >= event.startOffset && source.endOffset <= event.endOffset)).map(event => event.id));
+  sourceAssignmentCache.set(fn, ids);
+  return ids;
 }
 
 function parameterForVariable(fn, variable) {
@@ -480,29 +507,32 @@ function parameterForVariable(fn, variable) {
 }
 
 function callerValuesForParameter(event, parameter, callee) {
-  const offset = callee?.language === "python" && event.receiver && ["self", "cls"].includes(callee.parameters?.[0]) ? 1 : 0;
-  const argumentIndex = parameter.index - offset;
-  if (argumentIndex < 0) return [];
-  const argument = normalizeAccessPath(event.arguments?.[argumentIndex]);
-  const variables = event.argumentVariables?.[argumentIndex] || [];
-  if (parameter.path.length && argument) return [appendAccessPath(argument, parameter.path)];
-  if (parameter.path.length) return variables.map(value => appendAccessPath(value, parameter.path));
-  return variables.length ? variables : argument ? [argument] : [];
+  return unique(bindCallArguments(callee, event).bindings.filter(binding => binding.parameterIndex === parameter.index)
+    .flatMap(binding => callerValuesForBinding(event, binding, parameter.path)));
 }
 
 function calleeValuesForCallerVariable(edge, variable) {
-  const values = [];
-  const offset = edge.callee.language === "python" && edge.event.receiver && ["self", "cls"].includes(edge.callee.parameters?.[0]) ? 1 : 0;
-  edge.event.argumentVariables.forEach((variables, index) => {
-    const argument = normalizeAccessPath(edge.event.arguments?.[index]);
-    const parameter = edge.callee.parameters[index + offset];
-    if (!parameter) return;
-    if ((variables || []).some(value => pathFeeds(variable, value))) values.push(parameter);
-    else if (argument && pathFeeds(argument, variable)) {
-      values.push(appendAccessPath(parameter, relativeAccessPath(variable, argument) || []));
-    }
+  return unique(bindCallArguments(edge.callee, edge.event).bindings.flatMap(binding =>
+    calleeValuesForBinding(edge.callee, edge.event, binding, variable)));
+}
+
+function parameterArgumentNode(edge, parameter) {
+  const binding = bindCallArguments(edge.callee, edge.event);
+  const supplied = binding.bindings.filter(item => item.parameterIndex === parameter.index && bindingMatchesParameterPath(item, parameter.path));
+  const fallback = edge.callee.parameterDetails[parameter.index]?.callBinding;
+  if (supplied.some(item => item.kind === "default")) return queryNode({
+    kind: "default-argument", label: `Default value · ${parameter.root}`,
+    status: fallback?.defaultConstant ? QueryStatus.VERIFIED : QueryStatus.UNRESOLVED,
+    reason: fallback?.defaultConstant ? `The omitted parameter uses the declared scalar default ${fallback.defaultExpression}.` :
+      "The parameter uses a default expression whose value requires definition-scope or runtime context; it is not taken from a same-named caller variable.",
+    fn: edge.callee, details: { expression: fallback?.defaultExpression, truncated: fallback?.defaultTruncated },
   });
-  return unique(values);
+  const constant = supplied.find(item => argumentValue(edge.event, item).constant);
+  return queryNode({ kind: "argument", label: constant ? `Constant argument · ${parameter.root}` : `Argument unresolved · ${parameter.root}`,
+    status: constant ? QueryStatus.VERIFIED : QueryStatus.UNRESOLVED,
+    reason: constant ? `This parameter receives the scalar literal ${argumentValue(edge.event, constant).expression}.` :
+      binding.status !== "verified" ? binding.reason : "The argument expression could not be converted to an Access Path.",
+    fn: edge.caller, event: edge.event });
 }
 
 function inferVariable(fn, line) {
@@ -531,7 +561,8 @@ function callNode(edge, children = [], reason) {
     fn: edge.caller,
     event: edge.event,
     children,
-    details: { candidateMatch: edge.resolution.quality, candidateReason: edge.resolution.reason, calleePath: edge.callee.relativePath },
+    details: { candidateMatch: edge.resolution.quality, candidateReason: edge.resolution.reason, calleePath: edge.callee.relativePath,
+      argumentBinding: edge.resolution.binding },
   });
 }
 
@@ -549,13 +580,17 @@ function unresolvedCallNode(fn, event) {
 function queryNode(input) {
   const location = input.event ? eventLocation(input.fn, input.event) : input.fn ? functionLocation(input.fn) : undefined;
   const node = {
-    id: `query_${stableHash(JSON.stringify([input.kind, input.label, location?.absolutePath, location?.line, input.reason]))}`,
+    id: `query_${stableHash(JSON.stringify([input.kind, input.label, location?.absolutePath, location?.line, input.reason,
+      ...(input.event?.accessorEvidence ? [input.event.id] : [])]))}`,
     kind: input.kind || "step",
     label: input.label || "Analysis step",
     status: input.status || QueryStatus.HEURISTIC,
     reason: input.reason || "No connection explanation was produced.",
     location,
-    details: input.details || {},
+    details: { ...(input.details || {}), ...(input.event?.accessorEvidence ? {
+      accessor: input.event.accessorEvidence,
+      callSite: { absolutePath: input.fn.absolutePath, relativePath: input.fn.relativePath, line: input.event.line, code: input.event.code },
+    } : {}) },
     children: dedupeNodes(input.children || []),
   };
   return node;
@@ -573,12 +608,14 @@ function eventStatus(event) {
 }
 
 function callStatus(resolution) {
+  if (resolution?.binding?.status && resolution.binding.status !== "verified") return QueryStatus.UNRESOLVED;
   if (resolution?.quality === "high") return QueryStatus.VERIFIED;
   if (resolution?.quality === "medium") return QueryStatus.SYNTAX_ONLY;
   return resolution ? QueryStatus.HEURISTIC : QueryStatus.UNRESOLVED;
 }
 
 function definitionLabel(event, variable) {
+  if (event.propagationLabel) return event.propagationLabel;
   if (event.type === "source") return `${event.label || "Source"} → ${event.target || variable}`;
   if (event.type === "assignment") return `${(event.variables || []).join(" + ") || "value"} → ${event.target}`;
   if (event.type === "call") return `${event.callee || "call"}() → ${event.target || variable}`;
@@ -618,6 +655,7 @@ function frontendReason(frontend) {
 }
 
 function eventLocation(fn, event) {
+  if (event.accessorEvidence) return event.accessorEvidence;
   return { absolutePath: fn.absolutePath, relativePath: fn.relativePath, line: event.line || fn.line, endLine: event.line || fn.line, code: event.code || "" };
 }
 

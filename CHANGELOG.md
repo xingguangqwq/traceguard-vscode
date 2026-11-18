@@ -1,6 +1,54 @@
 # Changelog
 
+## 1.5.0 - 2026-11-18
+
+- Open the visual Trace Inspector from the Trace toolbar to inspect code, review each step and record notes. Scope shows index coverage, review progress and searchable project endpoints.
+- Search all indexed routes and load additional matches in batches of 60. Progress bars use native controls compatible with the Webview content security policy.
+- Keep each AI report attached to its trace and cancel individual requests from the Inspector. Reports include remediation and regression checks. Older asynchronous refreshes can no longer overwrite the current trace.
+- Serialize overlapping file removals from the editor and filesystem watcher so the index can finish updating.
+
+## 1.4.0 - 2026-11-18
+
+- Add strict checked-JavaScript contracts for seven core modules and compile-time assertions for IR fields, accessor summaries, argument mappings and guard value versions. `npm run check` now enforces types as well as syntax. Fix frontend `Array.map(symbol)` callbacks leaking array indexes and arrays into symbol metadata.
+- Split semantic declarations into language catalogs and move command registration, diagnostics, decoration helpers, navigation and Markdown reporting into UI modules while retaining public command IDs and controller exports.
+- Add LDAP filter injection and server-side template injection rules with argument-specific Java/PHP/Python models, python-ldap filter escaping and paired safe/unsafe fixtures. Preserve HTTP response provenance in Java Servlet writer chains without treating file and logging writers as response sinks.
+- Expose CFG-path and per-root-state budgets, report their values in analysis metadata and invalidate cached results for all contributed flow settings. Existing DFS limits remain explicit.
+- Add a pinned 1,537-case OWASP BenchmarkJava evaluation with dataset/content checks, separate candidate/verified scores, parser-error accounting, per-case regression gates and a weekly/manual CI workflow. The external baseline exposes remaining misses, false positives and CFG truncation; it is not a real-world accuracy claim.
+- Follow the VS Code language for AI prompts, reports and request/key status messages, and move repeated sink/sanitizer commands into advanced modeling menus.
+- Remove the stray packaging entry, exclude development type files and add a dry-run-first artifact cleanup command that keeps the two newest packages and refuses paths through links.
+
+## 1.3.0 - 2026-11-17
+
+- Add AST-backed Python keyword and PHP named-argument binding for indexed project functions and methods. Reordered arguments, mixed positional/named calls and omitted defaults now share the same mappings in scanning, forward/backward queries, return propagation and accessor field effects.
+- Preserve Python positional-only/keyword-only restrictions and implicit receiver offsets. Explicit variadic arguments retain tuple indexes or dictionary keys instead of contaminating unrelated elements.
+- Show scalar default values and explicit null arguments in backward traces. Nonliteral defaults retain their definition-scope uncertainty; caller variables with the same name do not supply omitted parameters.
+- Keep unknown unpacking as an explained review hypothesis. Duplicate, unknown and missing required arguments expose invalid bindings and cannot manufacture verified parameter flows or redirect a known receiver to an unrelated method.
+- Bound binding to 128 arguments/parameters and 512 possible mappings, with an explicit gap when the budget is exceeded. Signature/default changes invalidate cached summaries and dependent callers.
+- Read argument lists directly from AST nodes and reconnect conditional-expression CFG branches to their enclosing call/assignment/return, avoiding truncated traces for expressions inside call arguments.
+- Add paired propagation regressions and real Extension Host/packaged Worker checks for named calls and incremental updates.
+
+## 1.2.0 - 2026-11-17
+
+- Infer Java, PHP and Python field reads/writes from complete, simple instance-method bodies, including fluent setters and Java's declared implicit instance fields. Names alone do not define an accessor.
+- Apply uniquely resolved accessor effects in the caller's CFG so cross-file scanning and forward/backward queries share field isolation, constant overwrites and branch semantics. Static, decorated, async, conditional and side-effecting bodies retain the existing analysis fallback.
+- Preserve setter/getter bodies and call-site locations in path evidence, Markdown/AI slices and dependency invalidation. Inline reads retain their AST argument positions even when identical calls surround a mutation.
+- Include accessor summaries in incremental cache fingerprints, and keep ambiguous dispatch and other workspace roots out of verified field effects.
+- Fix backward PHP traces losing their Source behind the duplicate assignment generated for the same source expression.
+
+- Preserve constant-key Access Paths for typed Java Map get/put calls and PHP dictionary/property reads, preventing sibling keys from inheriting unrelated taint.
+- Model Python positional tuple/list bindings, nested literals and simultaneous swaps; keep starred patterns and unknown call-return shapes on the existing fallback.
+- Treat unknown-key writes as weak updates and retain earlier reaching definitions in backward queries, so ambiguous writes cannot erase known taint.
+- Added paired positive/negative propagation regressions covering scanning and interactive queries.
+
 ## 1.1.0 - 2026-09-11
+
+### Phase 1–3 iteration (2026-10-16)
+
+- Added direct variable trace shortcuts, preview navigation, trace-aware line highlights, Esc clearing, persistent branch review decisions, and project Sink/Sanitizer modeling.
+- Unified Markdown and AI context around bounded Tree-sitter function slices with explicit branch relationships, evidence status and missing-context notes.
+- Added zero-configuration Copy AI Prompt and optional BYOK streaming chain verification using native fetch, without SDK or Webview dependencies.
+- Added endpoint-bound SecretStorage keys, cancellable read-only Markdown reports, HTTP/SSE error handling, timeouts and explicit partial-result status. AI does not change review decisions or run generated tests.
+- Verified local mock HTTP streaming, cancellation and errors, real VS Code Extension Host integration, and packaged language runtimes.
 
 - Added dependency fingerprints for review decisions. Changed code, resolved dependencies or analysis configuration reopen affected decisions for review while preserving the original conclusion; older decisions without a fingerprint are explicitly marked for re-review.
 - Added a Changed since review queue filter, stale-decision explanations and serialized review-state writes. Reopened findings no longer retain active false-positive or accepted-risk suppression.

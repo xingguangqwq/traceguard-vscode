@@ -58,7 +58,7 @@ class TreeSitterRuntime {
     if (this.parsers.has(grammar)) return this.parsers.get(grammar);
     if (!GRAMMARS[grammar]) throw new Error(`No Tree-sitter WASM grammar is configured for ${grammar}.`);
     const initialization = this.initialized || (this.initialized = Parser.init({
-        locateFile: () => require.resolve("web-tree-sitter/web-tree-sitter.wasm"),
+        locateFile: () => assetOptions?.runtimeWasmPath || require.resolve("web-tree-sitter/web-tree-sitter.wasm"),
       }));
     try {
       await initialization;

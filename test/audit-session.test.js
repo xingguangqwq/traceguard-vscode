@@ -413,6 +413,22 @@ test("an invalid configuration freezes only its own workspace root", async () =>
   session.dispose();
 });
 
+test("overlapping watcher and editor removals apply once and preserve other indexed files", async () => {
+  const root = path.resolve("overlapping-removals");
+  const Session = loadAuditSession(root);
+  const session = new Session(contextWith({}), { warn() {}, info() {} });
+  const uri = { fsPath: path.join(root, "gone.js") };
+  const other = { fsPath: path.join(root, "keep.js") };
+  try {
+    for (const file of [uri, other]) {
+      await session.reindexDocument({ uri: file, getText: () => "function keep() { return 1; }" });
+    }
+    assert.deepEqual(await Promise.all([session.removeFiles([uri]), session.removeFiles([uri])]), [true, false]);
+    assert.equal(session.analysisForUri(uri), undefined);
+    assert.ok(session.analysisForUri(other));
+  } finally { session.dispose(); }
+});
+
 test("changes and deletions during a full index are replayed after its snapshot", async () => {
   const workspaceRoot = path.resolve("C:\\review-workspace");
   const changed = { fsPath: path.join(workspaceRoot, "changed.js") };

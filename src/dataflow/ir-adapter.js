@@ -4,6 +4,7 @@ const { OperationKind } = require("../ir/schema");
 const { GuardCapability } = require("../security/semantics");
 const { workspaceRootForAbsolutePath } = require("../config/configuration-scope");
 const { projectIdentityForAbsolutePath } = require("../config/project-identity");
+const { applyAccessorEffects } = require("./accessor-effects");
 
 function functionsFromAnalyses(analyses, options = {}) {
   const entriesByFunction = new Map();
@@ -25,7 +26,7 @@ function functionsFromAnalyses(analyses, options = {}) {
     const scoped = typeRelationsByRoot.get(key);
     for (const relation of analysis.ir?.typeRelations || []) scoped.push({ ...relation, workspaceRoot });
   }
-  return analyses.flatMap(analysis => {
+  const functions = analyses.flatMap(analysis => {
     const workspaceRoot = workspaceRootForAbsolutePath(options, analysis.absolutePath || analysis.ir?.absolutePath);
     const projectIdentity = projectIdentityForAbsolutePath(options, analysis.absolutePath || analysis.ir?.absolutePath);
     const scopedRelations = typeRelationsByRoot.get(workspaceRelationKey(workspaceRoot)) || [];
@@ -35,6 +36,7 @@ function functionsFromAnalyses(analyses, options = {}) {
       typeRelations: scopedRelations,
     }));
   });
+  return applyAccessorEffects(functions);
 }
 
 function workspaceRelationKey(workspaceRoot) {
@@ -54,6 +56,8 @@ function flowFunctionFromIR(fn, projectEntries = [], context = {}) {
     implementedTypes: fn.implementedTypes || [],
     declarationKind: fn.declarationKind || "function",
     executable: fn.executable !== false,
+    accessorSummary: fn.accessorSummary,
+    definitionLocation: fn.location,
     parameters: fn.parameters.map(value => value.name),
     parameterDetails: fn.parameters.map((value, index) => ({
       name: value.name,
@@ -64,6 +68,7 @@ function flowFunctionFromIR(fn, projectEntries = [], context = {}) {
       captured: Boolean(value.captured),
       annotations: value.annotations || [],
       cascadedValidation: Boolean(value.cascadedValidation),
+      callBinding: value.callBinding,
     })),
     line: fn.location.line,
     endLine: fn.location.endLine,
@@ -104,6 +109,7 @@ function operationFromIR(operation) {
     guardCapabilities: capabilities,
     controlKind: operation.kind === OperationKind.GUARD ? (isAuthorization ? "auth" : "sanitizer") : undefined,
     callee: operation.call?.function,
+    callExpression: operation.call?.expression,
     targetFunctionId: operation.call?.targetFunctionId,
     closure: Boolean(operation.call?.closure || operation.metadata.closure),
     asyncBoundary: Boolean(operation.metadata.asyncBoundary),
@@ -111,6 +117,11 @@ function operationFromIR(operation) {
     receiverVariables: (operation.call?.receiverInputs || []).map(value => value.name),
     receiverType: operation.call?.symbol?.receiverType,
     arguments: operation.call?.arguments || [],
+    argumentNames: operation.call?.argumentNames,
+    argumentKinds: operation.call?.argumentKinds,
+    argumentValues: operation.call?.argumentValues,
+    argumentConstantFlags: operation.call?.argumentConstantFlags,
+    argumentRanges: operation.call?.argumentRanges || [],
     argumentVariables: (operation.call?.argumentInputs || []).map(group => group.map(value => value.name)),
     argumentTypes: operation.call?.argumentTypes || [],
     certainty: operation.certainty,
@@ -122,6 +133,9 @@ function operationFromIR(operation) {
     assignmentMode: operation.metadata.assignmentMode,
     propagationReason: operation.metadata.propagationReason,
     propagationStatus: operation.metadata.propagationStatus,
+    javaBeanGetter: operation.metadata.javaBeanGetter,
+    valueExpression: operation.metadata.valueExpression,
+    valueStartOffset: operation.metadata.valueStartOffset,
     receiverPropagation: operation.metadata.receiverPropagation,
     blockId: operation.metadata.blockId,
     reachable: operation.metadata.reachable,

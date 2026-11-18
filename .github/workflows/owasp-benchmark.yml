@@ -1,0 +1,39 @@
+name: OWASP Benchmark baseline
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 2 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate-java:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Check out the pinned public benchmark source
+        uses: actions/checkout@v6
+        with:
+          repository: OWASP-Benchmark/BenchmarkJava
+          ref: 2734ae486356765ea4e45393a28e20bcb5047f8c
+          path: .target-labs/benchmark-java
+          persist-credentials: false
+      - name: Score supported CWEs and compare every case
+        run: npm run eval:owasp -- --baseline=eval-corpus/owasp-java.baseline.json --output=owasp-report.json
+      - name: Preserve scores, errors, truncation and case results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: owasp-java-report
+          path: owasp-report.json
+          if-no-files-found: error

@@ -16,6 +16,12 @@ function argumentConstraintRejection(model, call = {}) {
     if ((expectation.values || []).some(expected => expectedValueMatches(value, expected, expectation.matchMode))) continue;
     return expectation.reason || `Argument ${expectation.index} does not match the declared values.`;
   }
+  for (const exclusion of model.excludedArgumentTypes || []) {
+    const declared = String(call.argumentTypes?.[exclusion.index] || "").trim();
+    if ((exclusion.types || []).some(type => declared === type || declared.endsWith(`.${type}`))) {
+      return exclusion.reason || `Argument ${exclusion.index} uses an excluded overload type.`;
+    }
+  }
   for (const rejection of model.rejectWhen || []) {
     if (conditionMatches(rejection.when, args)) return rejection.reason || "The call matches a declared safe-call exclusion.";
   }

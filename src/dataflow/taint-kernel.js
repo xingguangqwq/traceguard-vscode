@@ -27,6 +27,7 @@ function applySource(taintedValues, event) {
 
 function applyCallOutput(taintedValues, event, propagates) {
   const current = new Set(taintedValues || []);
+  if (event?.accessorModeled) return current;
   if (!event?.target) return current;
   const next = removeAssignedTaint(current, event.target);
   if (propagates) next.add(event.target);

@@ -10,6 +10,9 @@ for (const file of files) {
   if (result.status !== 0) process.exit(result.status || 1);
 }
 process.stdout.write(`Checked ${files.length} JavaScript files.\n`);
+const types = spawnSync(process.execPath, [path.join(__dirname, "typecheck.js")], { stdio: "inherit" });
+if (types.error) throw types.error;
+if (types.status !== 0) process.exit(types.status || 1);
 
 function javascriptFiles(directory) {
   return fs.readdirSync(directory, { withFileTypes: true })

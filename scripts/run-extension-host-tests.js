@@ -23,26 +23,32 @@ async function main() {
   fs.mkdirSync(workspacePath);
   delete process.env.ELECTRON_RUN_AS_NODE;
   let failed = false;
+  const markerPath = path.join(userDataPath, "smoke-result.json");
   try {
     await runTests({
       version: process.env.VSCODE_TEST_VERSION || "1.90.0",
       ...(vscodeExecutablePath ? { vscodeExecutablePath } : {}),
       extensionDevelopmentPath,
       extensionTestsPath: path.join(extensionDevelopmentPath, "test", "extension-host-smoke.js"),
+      extensionTestsEnv: { TRACEGUARD_SMOKE_MARKER: markerPath },
       launchArgs: [
         `--user-data-dir=${userDataPath}`,
         "--disable-extensions",
+        "--disable-gpu",
         "--disable-workspace-trust",
+        `--log=${process.env.TRACEGUARD_TEST_LOG_LEVEL || "info"}`,
         workspacePath,
       ],
     });
+    if (!fs.existsSync(markerPath)) throw new Error("VS Code exited without completing the Extension Host assertions.");
+    process.stdout.write(`Extension Host verified: ${fs.readFileSync(markerPath, "utf8")}\n`);
   } catch (error) {
     failed = true;
     throw error;
   } finally {
     if (electronRunAsNode === undefined) delete process.env.ELECTRON_RUN_AS_NODE;
     else process.env.ELECTRON_RUN_AS_NODE = electronRunAsNode;
-    if (failed) process.stderr.write(`Extension Host logs retained at ${userDataPath}\n`);
+    if (failed || process.env.TRACEGUARD_KEEP_TEST_LOGS === "1") process.stderr.write(`Extension Host logs retained at ${userDataPath}\n`);
     else fs.rmSync(userDataPath, { recursive: true, force: true, maxRetries: 3 });
   }
 }

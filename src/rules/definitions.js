@@ -15,6 +15,26 @@ const STANDARD_PROPAGATORS = Object.freeze([
 
 const RULES = Object.freeze([
   {
+    id: "potential-ldap-injection",
+    title: "Potential LDAP filter injection",
+    sourceKinds: EXTERNAL_SOURCES,
+    propagators: STANDARD_PROPAGATORS,
+    sinkKinds: [SinkKind.LDAP_QUERY],
+    recommendedGuards: [GuardCapability.LDAP_FILTER_ESCAPE],
+    acceptsSanitizers: [GuardCapability.LDAP_FILTER_ESCAPE],
+    severity: "high", impact: "Directory query filter manipulation", cwe: "CWE-90", core: false,
+  },
+  {
+    id: "potential-template-injection",
+    title: "Potential server-side template injection",
+    sourceKinds: EXTERNAL_SOURCES,
+    propagators: STANDARD_PROPAGATORS,
+    sinkKinds: [SinkKind.TEMPLATE_RENDER],
+    recommendedGuards: [],
+    acceptsSanitizers: [],
+    severity: "high", impact: "Untrusted server-side template source", cwe: "CWE-1336", core: false,
+  },
+  {
     id: "potential-ssrf",
     title: "Potential server-side request forgery",
     sourceKinds: EXTERNAL_SOURCES,

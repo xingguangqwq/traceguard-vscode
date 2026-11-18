@@ -549,7 +549,7 @@ function operationsFor(record, compiler, input, lines, records = []) {
         const captureNames = (closure.captures || []).map(capture => capture.name);
         const callArguments = [...Array(explicit).fill(""), ...captureNames];
         add(OperationKind.CALL, node, {
-          inputs: captureNames.map(symbol),
+          inputs: captureNames.map(name => symbol(name)),
           call: {
             function: closure.name,
             arguments: callArguments,
@@ -678,7 +678,7 @@ function signalOperations(signals, symbolKey, functionId, input, lines, compiler
         ...(semantic.node ? tsSourceLocation(semantic.node, compiler.sourceFile) : { line: signal.line }),
         code,
       }),
-      inputs: signalInput.map(symbol),
+      inputs: signalInput.map(name => symbol(name)),
       output: semantic.output ? symbol(semantic.output) : signal.kind === "source" && assignment?.target ? symbol(assignment.target) : undefined,
       call,
       semantic: signalSemantic,
@@ -1412,7 +1412,7 @@ function symbolsFromNode(node, sourceFile, checker) {
     ts.forEachChild(current, visit);
   };
   visit(node);
-  return [...new Set(names)].map(symbol);
+  return [...new Set(names)].map(name => symbol(name));
 }
 
 function branchMetadata(node, sourceFile, controlKind = "branch") {

@@ -42,7 +42,8 @@ dist-assets/**
 .tmp-vsix*/**
 probe-*.js
 bench-owasp.js
-&;
+tsconfig*.json
+src/**/*.d.ts
 CONTRIBUTING.md
 SECURITY.md
 README.zh-CN.md

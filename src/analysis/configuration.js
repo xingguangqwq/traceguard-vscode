@@ -5,6 +5,10 @@ const MODEL_CONFIGURATION_KEYS = Object.freeze([
   "traceguard.flowMaxSteps",
   "traceguard.flowTimeoutMs",
   "traceguard.flowMaxPaths",
+  "traceguard.flowMaxCfgPathsPerFunction",
+  "traceguard.flowMaxStatesPerRoot",
+  "traceguard.flowMaxHigherOrderDepth",
+  "traceguard.flowMaxAsyncDepth",
   "traceguard.astDifferentialMode",
 ]);
 

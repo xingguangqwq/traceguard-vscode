@@ -47,6 +47,7 @@ function compileCatalogPatterns(models, language, options = {}) {
       semantic: {
         modelId: model.id,
         modelRole: model.role,
+        requiresReceiverIdentity: Boolean(model.requiresReceiverIdentity),
         sourceKind: model.sourceKind,
         sinkKind: model.sinkKind,
         category: model.category,

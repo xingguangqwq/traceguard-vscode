@@ -64,8 +64,10 @@ function buildFunctionSummary(fn, options = {}) {
     symbolKey: fn.symbolKey,
     name: fn.name,
     signature: fn.signature,
+    accessorSummary: fn.accessorSummary,
     relativePath: fn.location.relativePath,
     parameters: fn.parameters.map(parameter => parameter.name),
+    parameterBindings: fn.parameters.map(parameter => parameter.callBinding),
     sources: operations(scopedFn, OperationKind.SOURCE).map(operation => operation.semantic.sourceKind),
     sinks: operations(scopedFn, OperationKind.SINK).map(operation => operation.semantic.sinkKind),
     guards: operations(scopedFn, OperationKind.GUARD).flatMap(operation => operation.semantic.guardCapabilities || []),
@@ -159,7 +161,8 @@ function summaryCacheKey(fn) {
   const hash = crypto.createHash("sha256");
   hash.update(structuralDigest({
     symbolKey: fn.symbolKey,
-    parameters: fn.parameters.map(parameter => [parameter.name, parameter.type, parameter.role]),
+    accessorSummary: fn.accessorSummary,
+    parameters: fn.parameters.map(parameter => [parameter.name, parameter.type, parameter.role, parameter.callBinding]),
   }));
   for (const operation of fn.operations) {
     hash.update(structuralDigest({

@@ -16,12 +16,18 @@ class TraceGuardExtension {
 }
 
 function activate(context) {
-  const extension = new TraceGuardExtension(context);
+  let extension;
+  try {
+    extension = new TraceGuardExtension(context);
+  } catch (error) {
+    console.error("TraceGuard activation failed:", error?.stack || error);
+    throw error;
+  }
   context.subscriptions.push(extension);
   const version = context.extension?.packageJSON?.version || "development";
   extension.output.info(`TraceGuard ${version} activated from ${context.extensionPath || "development workspace"}.`);
   extension.audit.initialize().catch(error => {
-    extension.output.error(`Initial code index failed: ${firstLine(error?.message || error)}`);
+    extension.output.error(`Initial code index failed:\n${error?.stack || error}`);
   });
   return extension;
 }
